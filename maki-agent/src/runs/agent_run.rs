@@ -2460,6 +2460,65 @@ mod revive {
         revive_and_check(&rig, &script, a.id).await;
     }
 
+    /// Runs the real `send` tool as `main`.
+    async fn send_tool(rig: &Rig, to: &str, message: &str) -> Result<String, String> {
+        let tool = crate::tools::runs::all()
+            .into_iter()
+            .find(|t| t.name() == "send")
+            .unwrap();
+        let input = json!({"to": to, "message": message});
+        let invocation = tool.parse(&input).map_err(|e| e.to_string())?;
+        match invocation.execute(&rig.ctx).await.output? {
+            crate::ToolOutput::Plain(t) => Ok(t.text),
+            other => panic!("unexpected output {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn send_tool_revives_finished_and_evicted_agents() {
+        let script = Script::new(vec![
+            ("B-TASK", vec![Step::Reply(reply("b"))]),
+            (
+                CHILD,
+                vec![
+                    Step::Reply(reply("first answer")),
+                    Step::Reply(reply("second answer")),
+                    Step::Reply(reply("third answer")),
+                ],
+            ),
+        ]);
+        let limits = UnitLimits {
+            max_retained: 1,
+            ..UnitLimits::default()
+        };
+        let (rig, _dir) = journaled(&script, limits);
+        let ack = spawn(&rig, CHILD, json!({})).await;
+        settle(&rig, ack.id).await;
+        stop(&rig, ack.id).await;
+        // Stopped, so a finished run; by handle.
+        let out = send_tool(&rig, ack.handle.as_str(), "follow up please")
+            .await
+            .unwrap();
+        assert!(out.contains("revived"), "{out}");
+        assert_eq!(settle(&rig, ack.id).await.state.label(), "idle");
+        assert!(seen_text(&script, CHILD)[1].contains("first answer"));
+        // Evicted to a tombstone (a newer finished run pushes it out), then by name.
+        stop(&rig, ack.id).await;
+        let b = spawn(&rig, "B-TASK", json!({})).await;
+        settle(&rig, b.id).await;
+        stop(&rig, b.id).await;
+        rig.hub.sweep(); // the settle's own sweep may still be running
+        assert!(rig.hub.get(ack.id).is_none(), "tombstoned");
+        let name = rig.hub.tombstones(rig.hub.main())[0].name.to_string();
+        let out = send_tool(&rig, &name, "once more").await.unwrap();
+        assert!(out.contains("revived"), "{out}");
+        assert_eq!(settle(&rig, ack.id).await.state.label(), "idle");
+        assert!(seen_text(&script, CHILD)[2].contains("second answer"));
+        // A second send now goes to the live run, not another revive.
+        let out = send_tool(&rig, &name, "and again").await.unwrap();
+        assert!(!out.contains("revived"), "{out}");
+    }
+
     async fn revive_and_check(rig: &Rig, script: &Arc<Script>, id: UnitId) {
         // The route has no step left, so the revived run just hangs on its
         // request: it is live again, which is all this checks.

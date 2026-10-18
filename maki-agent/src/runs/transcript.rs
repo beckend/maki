@@ -43,21 +43,25 @@ pub(super) fn append(path: &Path, messages: &[Message]) -> io::Result<()> {
     }
     ensure_parent(path)?;
     let data = encode(messages)?;
+    trim_torn_tail(path)?;
     let mut file = private_options().append(true).open(path)?;
-    // A torn last line (a crash mid-write) must not swallow the next record.
-    if file.metadata()?.len() > 0 && !ends_with_newline(path)? {
-        file.write_all(b"\n")?;
-    }
     file.write_all(&data)
 }
 
-fn ends_with_newline(path: &Path) -> io::Result<bool> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut file = fs::File::open(path)?;
-    file.seek(SeekFrom::End(-1))?;
-    let mut last = [0u8; 1];
-    file.read_exact(&mut last)?;
-    Ok(last[0] == b'\n')
+/// Cuts a torn last line (a crash mid-write) so the next record does not
+/// follow garbage, which `load` would stop at.
+fn trim_torn_tail(path: &Path) -> io::Result<()> {
+    let Ok(bytes) = fs::read(path) else {
+        return Ok(());
+    };
+    if bytes.is_empty() || bytes.ends_with(b"\n") {
+        return Ok(());
+    }
+    let keep = bytes.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+    OpenOptions::new()
+        .write(true)
+        .open(path)?
+        .set_len(keep as u64)
 }
 
 /// Replaces the file: the history got shorter than what was saved (a repair
@@ -116,7 +120,7 @@ mod tests {
     }
 
     #[test]
-    fn torn_tail_is_skipped_and_not_glued_to_the_next_line() {
+    fn torn_tail_is_cut_before_the_next_append() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("ag-a.ndjson");
         append(&path, &[text(Role::User, "one")]).unwrap();
@@ -125,7 +129,8 @@ mod tests {
         assert_eq!(load(&path).unwrap().len(), 1);
         append(&path, &[text(Role::User, "three")]).unwrap();
         let got = load(&path).unwrap();
-        assert_eq!(got.len(), 1, "a corrupt line ends the read");
+        assert_eq!(got.len(), 2, "torn line cut, new record kept");
+        assert_eq!(got[1], text(Role::User, "three"));
     }
 
     #[test]
