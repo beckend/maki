@@ -19,6 +19,7 @@ use maki_providers::{
 use maki_storage::sessions::StoredThinking;
 use serde_json::{Value, json};
 
+use super::broker::{Begin, PermissionBroker};
 use super::inbox::{self, Inbox, InboxItem, Phase};
 use super::notice::BODY_FILE_SUFFIX;
 use super::{
@@ -27,6 +28,7 @@ use super::{
 use crate::agent::{LoadedInstructions, UNAVAILABLE_RESULT, load_instruction_text};
 use crate::cancel::{CancelMap, CancelToken, CancelTrigger};
 use crate::mcp::McpSession;
+use crate::permissions::PermissionManager;
 use crate::prompt::PromptId;
 use crate::tools::schema::sanitize_tool_input_schema;
 use crate::tools::{
@@ -310,6 +312,8 @@ pub(super) struct AgentRun {
     pub(super) info: SubagentInfo,
     /// What other runs and the user send to this agent.
     pub(super) inbox: Arc<Inbox>,
+    /// Where its permission prompts go and come back.
+    pub(super) broker: Arc<PermissionBroker>,
     /// Test hooks: a named point of the driver parks until released.
     #[cfg(test)]
     pub(super) pauses: Mutex<std::collections::HashMap<&'static str, PauseHook>>,
@@ -321,7 +325,11 @@ pub(super) struct AgentRun {
 pub(super) type PauseHook = (flume::Sender<()>, flume::Receiver<()>);
 
 impl AgentRun {
-    pub(super) fn new(root: &CancelToken, info: SubagentInfo) -> Arc<Self> {
+    pub(super) fn new(
+        root: &CancelToken,
+        info: SubagentInfo,
+        broker: Arc<PermissionBroker>,
+    ) -> Arc<Self> {
         let (trigger, token) = root.child();
         Arc::new(Self {
             token,
@@ -331,6 +339,7 @@ impl AgentRun {
             timed_out: AtomicBool::new(false),
             info,
             inbox: Arc::new(Inbox::new(Phase::Running)),
+            broker,
             #[cfg(test)]
             pauses: Mutex::default(),
             task: Mutex::new(None),
@@ -372,6 +381,11 @@ impl AgentRun {
     fn end_turn(&self) {
         let _ = lock(&self.turn).take();
     }
+
+    /// A turn is running and has not been cancelled.
+    fn turn_active(&self) -> bool {
+        lock(&self.turn).is_some() && !self.token.is_cancelled()
+    }
 }
 
 /// Starts the driver; the run keeps the task so the hub can drop it.
@@ -393,6 +407,7 @@ pub(super) fn start(
         id,
         run: Arc::clone(&run),
         clock,
+        permissions: Arc::clone(&launch.params.permissions),
         started: Instant::now(),
         turns: AtomicU32::new(0),
         staged: Mutex::default(),
@@ -406,6 +421,7 @@ struct Driver {
     id: UnitId,
     run: Arc<AgentRun>,
     clock: Arc<dyn Clock>,
+    permissions: Arc<PermissionManager>,
     started: Instant,
     turns: AtomicU32,
     /// Taken from the inbox to start or restart a turn, not yet in history.
@@ -540,6 +556,13 @@ impl Driver {
             }
             let mut nudges = 0;
             let (verdict, mut result) = loop {
+                // A nudge turn follows a finished one, but a turn must never
+                // start on a slot something else took, so ask again.
+                if !self.slot().await {
+                    self.finish(UnitDone::Killed, None, UnitResult::default())
+                        .await;
+                    return;
+                }
                 let end = self
                     .turn(
                         &launch, history, &mut gauge, &events, &rx, message, deadline,
@@ -744,6 +767,7 @@ impl Driver {
             .with_reauth(launch.reauth)
             .with_loaded_instructions(LoadedInstructions::new())
             .with_cancel(token)
+            .with_user_response_rx(self.run.broker.receiver())
             .with_mcp(launch.mcp.clone())
             .with_local_tools(Arc::clone(&launch.local_tools));
             let run = agent.run(input);
@@ -770,6 +794,9 @@ impl Driver {
         self.run.end_turn();
         while let Ok(envelope) = rx.try_recv() {
             self.forward(envelope);
+        }
+        if let Some(hub) = self.hub() {
+            self.run.broker.clear(&hub.events, &self.run.info);
         }
         if let Err(e) = &result
             && !matches!(e, AgentError::Cancelled)
@@ -851,11 +878,31 @@ impl Driver {
             | AgentEvent::StreamClosed => return,
             _ => {}
         }
+        if let AgentEvent::PermissionRequest { id, scopes, .. } = &envelope.event
+            && envelope.subagent.is_none()
+            && !(self.run.turn_active() && self.begin_prompt(&hub, id, scopes))
+        {
+            return;
+        }
         envelope.run_id = crate::BACKGROUND_RUN_ID;
         envelope
             .subagent
             .get_or_insert_with(|| self.run.info.clone());
         let _ = hub.events.send_envelope(envelope);
+    }
+
+    /// A prompt of this run's own turn is about to be shown: the broker gives
+    /// the slot up and starts the timeout. False when it answered at once.
+    fn begin_prompt(&self, hub: &Arc<UnitHub>, request: &str, scopes: &[String]) -> bool {
+        self.run.broker.begin(Begin {
+            hub,
+            run: self.id,
+            info: &self.run.info,
+            clock: &self.clock,
+            request,
+            scope: scopes.join("; "),
+            yolo: self.permissions.is_yolo(),
+        })
     }
 
     fn emit(&self, event: AgentEvent) {

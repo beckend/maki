@@ -125,6 +125,8 @@ struct Request {
     tool: ToolKey,
     scopes: Vec<String>,
     subagent_id: Option<String>,
+    /// Who is asking, for a background run: `name (handle)`.
+    label: Option<String>,
     allow_scopes: Vec<String>,
     project_trusted: bool,
     /// Set when a plugin escalated the call, so the user sees why they are
@@ -161,9 +163,11 @@ impl Overlay for PermissionPrompt {
     }
 
     /// Only reached when the run those asks belonged to is gone (cancel,
-    /// session switch), which is what unparks their tool calls anyway.
+    /// session switch), which is what unparks their tool calls anyway. A
+    /// background run outlives a cancelled turn and keeps waiting on its ask,
+    /// so those stay; [`PermissionPrompt::clear`] drops them too.
     fn close(&mut self) {
-        self.queue.clear();
+        self.queue.retain(|request| request.label.is_some());
         self.reset_entry();
     }
 }
@@ -197,10 +201,34 @@ impl PermissionPrompt {
             tool,
             scopes,
             subagent_id,
+            label: None,
             allow_scopes,
             project_trusted,
             reason,
         });
+    }
+
+    /// Drops every ask, background runs' included (a new session).
+    pub fn clear(&mut self) {
+        self.queue.clear();
+        self.reset_entry();
+    }
+
+    /// Names the run behind the ask that was just pushed.
+    pub fn label_last(&mut self, label: String) {
+        if let Some(request) = self.queue.back_mut() {
+            request.label = Some(label);
+        }
+    }
+
+    /// The ask `id` of `subagent_id` needs no answer any more (it timed out or
+    /// its run ended); it leaves the screen without being answered.
+    pub fn withdraw(&mut self, subagent_id: &str, id: &str) {
+        let is_it = |r: &Request| r.id == id && r.subagent_id.as_deref() == Some(subagent_id);
+        if self.queue.front().is_some_and(is_it) {
+            self.reset_entry();
+        }
+        self.queue.retain(|r| !is_it(r));
     }
 
     fn reset_entry(&mut self) {
@@ -216,6 +244,11 @@ impl PermissionPrompt {
             self.reset_entry();
         }
         self.queue.retain(|request| !owns(request));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn front_label(&self) -> Option<&str> {
+        self.queue.front().and_then(|r| r.label.as_deref())
     }
 
     pub(crate) fn tool(&self) -> Option<&ToolKey> {
@@ -237,6 +270,7 @@ impl PermissionPrompt {
         if !self.is_open() {
             return None;
         }
+        let background = self.queue.front().is_some_and(|r| r.label.is_some());
         let (state, buffer) = (&mut self.state, &mut self.buffer);
         if is_ctrl(&key) && key.code == KeyCode::Char('c') {
             return Some(PermissionAnswer::Deny);
@@ -286,6 +320,8 @@ impl PermissionPrompt {
             };
         }
         match key.code {
+            // Dismissing a background run's ask denies it; the run goes on.
+            KeyCode::Esc if background => Some(PermissionAnswer::Deny),
             KeyCode::Char('y') => Some(PermissionAnswer::AllowOnce),
             KeyCode::Char('n') => {
                 *state = PromptState::DenyEditing;
@@ -328,6 +364,7 @@ impl PermissionPrompt {
             tool,
             scopes,
             subagent_id,
+            label,
             allow_scopes,
             project_trusted,
             reason,
@@ -347,7 +384,15 @@ impl PermissionPrompt {
         }
         tool_spans.push(Span::styled(tool.to_string(), value_style));
 
-        let mut lines = vec![Line::raw(""), Line::from(tool_spans)];
+        let mut lines = vec![Line::raw("")];
+        if let Some(label) = label {
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled("agent ", label_style),
+                Span::styled(label.clone(), value_style),
+            ]));
+        }
+        lines.push(Line::from(tool_spans));
         if let Some(reason) = reason {
             lines.push(Line::from(vec![
                 Span::raw("  "),
@@ -533,6 +578,25 @@ mod tests {
             .flat_map(|line| line.spans.iter())
             .map(|span| span.content.as_ref())
             .collect()
+    }
+
+    #[test]
+    fn run_label_is_shown_and_withdraw_removes_only_that_ask() {
+        let mut prompt = PermissionPrompt::new();
+        push_subagent_ask(&mut prompt);
+        prompt.label_last("auditor (ag-k3x9ab)".into());
+        assert!(rendered(&prompt).contains("auditor (ag-k3x9ab)"));
+        open_trusted(&mut prompt, true);
+        prompt.withdraw("other", SUB_ID);
+        prompt.withdraw(SUB_AGENT, MAIN_ID);
+        assert_eq!(
+            prompt.queue.len(),
+            2,
+            "wrong run or wrong id removes nothing"
+        );
+        prompt.withdraw(SUB_AGENT, SUB_ID);
+        assert_eq!(prompt.queue.len(), 1);
+        assert_eq!(prompt.front_label(), None);
     }
 
     fn ctrl_c() -> KeyEvent {

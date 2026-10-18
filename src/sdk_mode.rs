@@ -595,6 +595,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         project_config,
         local_tools: Default::default(),
         wake_main: true,
+        attended_runs: false,
     });
 
     let (out_tx, out_rx) = flume::unbounded::<String>();
@@ -1073,6 +1074,7 @@ impl EventPump {
             | AgentEvent::RunStateChanged { .. }
             | AgentEvent::RunNotice { .. }
             | AgentEvent::RunFinished { .. }
+            | AgentEvent::PermissionWithdrawn { .. }
             | AgentEvent::StreamClosed => {}
             // A later kept message overwrites this with its own answer, so the
             // reason is the result only when every message was dropped.

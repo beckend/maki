@@ -36,6 +36,10 @@ enum Step {
 struct Script {
     routes: Mutex<Vec<(&'static str, VecDeque<Step>)>>,
     seen: Mutex<Vec<(String, Vec<Value>)>>,
+    /// Routes whose every request must come from a run that holds a slot.
+    watch: Mutex<Vec<(&'static str, Arc<UnitHub>, UnitId)>>,
+    /// Requests that came from a run holding none.
+    breaches: Mutex<Vec<String>>,
 }
 
 impl Script {
@@ -43,7 +47,22 @@ impl Script {
         Arc::new(Self {
             routes: Mutex::new(routes.into_iter().map(|(k, v)| (k, v.into())).collect()),
             seen: Mutex::default(),
+            watch: Mutex::default(),
+            breaches: Mutex::default(),
         })
+    }
+
+    /// From now on a request on `route` without a slot for `id` is a breach.
+    fn watch(&self, route: &'static str, hub: &Arc<UnitHub>, id: UnitId) {
+        self.watch
+            .lock()
+            .unwrap()
+            .push((route, Arc::clone(hub), id));
+    }
+
+    fn assert_slots_held(&self) {
+        let breaches = self.breaches.lock().unwrap();
+        assert!(breaches.is_empty(), "requests without a slot: {breaches:?}");
     }
 
     fn requests(&self, route: &str) -> usize {
@@ -100,6 +119,11 @@ impl Provider for Script {
                     .find(|(needle, _)| first.contains(needle))
                     .unwrap_or_else(|| panic!("no route for {first}"));
                 self.seen.lock().unwrap().push((route.0.to_owned(), values));
+                for (watched, hub, id) in self.watch.lock().unwrap().iter() {
+                    if *watched == route.0 && !hub.table().pool.holds(*id) {
+                        self.breaches.lock().unwrap().push(route.0.to_owned());
+                    }
+                }
                 route.1.pop_front().unwrap_or(Step::Hang)
             };
             match step {
@@ -1610,5 +1634,511 @@ mod admit {
         rig.hub.stop(rig.hub.main(), &[h.id], StopOpts::default());
         settle(&rig, h.id);
         assert_eq!(rig.hub.slots_in_use(), 0);
+    }
+}
+
+mod perm {
+    use std::path::{Path, PathBuf};
+
+    use maki_config::{PermissionsConfig, ProjectConfig, UnattendedMode};
+
+    use super::*;
+    use crate::permissions::{PermissionAnswer, PermissionManager, TaggedAnswer};
+
+    const SECS_120: Duration = Duration::from_secs(120);
+    const WAIT: Duration = Duration::from_secs(20);
+
+    fn manager(yolo: bool) -> Arc<PermissionManager> {
+        Arc::new(PermissionManager::new(
+            PermissionsConfig {
+                yolo,
+                ..PermissionsConfig::default()
+            },
+            PathBuf::from("/tmp"),
+            ProjectConfig::discover(Path::new("/tmp")),
+            Arc::default(),
+        ))
+    }
+
+    /// A rig whose runs have no rule for `spawn`, so a shell spawn prompts.
+    fn prompting(script: &Arc<Script>, limits: UnitLimits) -> Rig {
+        let mut rig = rig_with(script, limits);
+        rig.ctx.permissions = manager(false);
+        rig
+    }
+
+    fn shell_call(id: &str, command: &str) -> StreamResponse {
+        tool_use(
+            id,
+            "spawn",
+            json!({"kind": "shell", "description": "d", "command": command}),
+        )
+    }
+
+    struct Prompt {
+        id: String,
+        scopes: Vec<String>,
+        info: SubagentInfo,
+    }
+
+    impl Prompt {
+        fn answer(&self, answer: PermissionAnswer) {
+            let tx = self.info.answer_tx.as_ref().expect("an answer channel");
+            tx.send(TaggedAnswer::new(&self.id, answer).encode())
+                .unwrap();
+        }
+    }
+
+    fn next_event(rig: &Rig, mut hit: impl FnMut(&Envelope) -> bool) -> Envelope {
+        loop {
+            let envelope = rig
+                .events
+                .recv_timeout(WAIT)
+                .expect("the expected event never came");
+            if hit(&envelope) {
+                return envelope;
+            }
+        }
+    }
+
+    fn next_prompt(rig: &Rig) -> Prompt {
+        let envelope = next_event(rig, |e| {
+            matches!(e.event, AgentEvent::PermissionRequest { .. })
+        });
+        let AgentEvent::PermissionRequest { id, scopes, .. } = envelope.event else {
+            unreachable!()
+        };
+        Prompt {
+            id,
+            scopes,
+            info: envelope.subagent.expect("a run's prompt is stamped"),
+        }
+    }
+
+    fn withdrawn(rig: &Rig, id: &str) {
+        next_event(
+            rig,
+            |e| matches!(&e.event, AgentEvent::PermissionWithdrawn { id: got } if got == id),
+        );
+    }
+
+    fn last_text(script: &Script, route: &str, n: usize) -> String {
+        script
+            .messages_of(route, n)
+            .iter()
+            .map(Value::to_string)
+            .collect()
+    }
+
+    fn broker_of(rig: &Rig, id: UnitId) -> Arc<broker::PermissionBroker> {
+        Arc::clone(&rig.hub.table().agents.get(&id).unwrap().broker)
+    }
+
+    /// Nothing may be left behind once a run is settled, whatever happened.
+    fn assert_clean(rig: &Rig, ids: &[UnitId]) {
+        assert_eq!(rig.hub.slots_in_use(), 0, "slot leaked");
+        assert_eq!(rig.hub.prompts.load(Ordering::SeqCst), 0, "prompt leaked");
+        for id in ids {
+            assert_eq!(broker_of(rig, *id).pending_count(), 0);
+        }
+    }
+
+    fn one_prompt_script() -> Arc<Script> {
+        Script::new(vec![(
+            CHILD,
+            vec![
+                Step::Reply(shell_call("t1", "true")),
+                Step::Reply(reply("done")),
+            ],
+        )])
+    }
+
+    #[test]
+    fn background_prompt_reaches_ui_with_run_name() {
+        let script = one_prompt_script();
+        let rig = prompting(&script, UnitLimits::default());
+        let ack = spawn(&rig, CHILD, json!({"name": "auditor"}));
+        script.watch(CHILD, &rig.hub, ack.id);
+        let prompt = next_prompt(&rig);
+        assert_eq!(prompt.info.name, "auditor");
+        assert_eq!(prompt.info.parent_tool_use_id, ack.handle.to_string());
+        assert_eq!(prompt.scopes, ["true"]);
+        assert_eq!(rig.hub.slots_in_use(), 0, "the prompt pins no slot");
+        prompt.answer(PermissionAnswer::AllowOnce);
+        assert_eq!(done_state(&settle(&rig, ack.id)), "idle");
+        assert_eq!(script.requests(CHILD), 2);
+        assert!(
+            last_text(&script, CHILD, 1).contains("sh-"),
+            "the shell ran"
+        );
+        assert_clean(&rig, &[ack.id]);
+    }
+
+    fn done_state(view: &UnitView) -> &'static str {
+        match view.state {
+            UnitState::Idle => "idle",
+            _ => "other",
+        }
+    }
+
+    #[test]
+    fn denied_by_the_user_tells_the_run() {
+        let script = one_prompt_script();
+        let rig = prompting(&script, UnitLimits::default());
+        let ack = spawn(&rig, CHILD, json!({}));
+        let prompt = next_prompt(&rig);
+        prompt.answer(PermissionAnswer::Deny);
+        settle(&rig, ack.id);
+        let text = last_text(&script, CHILD, 1);
+        assert!(text.contains("rejected by the user"), "{text}");
+        assert!(!text.contains("sh-"), "the shell must not have run");
+        assert_clean(&rig, &[ack.id]);
+    }
+
+    #[test]
+    fn timeout_denies_and_run_continues() {
+        let script = one_prompt_script();
+        let rig = prompting(&script, UnitLimits::default());
+        let ack = spawn(&rig, CHILD, json!({}));
+        let prompt = next_prompt(&rig);
+        rig.clock.advance(SECS_120);
+        withdrawn(&rig, &prompt.id);
+        settle(&rig, ack.id);
+        let text = last_text(&script, CHILD, 1);
+        assert!(
+            text.contains("timed out after 120s; ask your parent via send if you need it"),
+            "{text}"
+        );
+        assert_clean(&rig, &[ack.id]);
+    }
+
+    #[test]
+    fn a_late_answer_cannot_allow_a_timed_out_call() {
+        let script = Script::new(vec![(
+            CHILD,
+            vec![
+                Step::Reply(shell_call("t1", "true")),
+                Step::Reply(shell_call("t1", "true")),
+                Step::Hang,
+            ],
+        )]);
+        let rig = prompting(&script, UnitLimits::default());
+        let ack = spawn(&rig, CHILD, json!({}));
+        let first = next_prompt(&rig);
+        rig.clock.advance(SECS_120);
+        withdrawn(&rig, &first.id);
+        // The user was a moment too late; the run asks again with the same id.
+        first.answer(PermissionAnswer::AllowOnce);
+        let second = next_prompt(&rig);
+        assert_eq!(second.id, first.id);
+        assert_eq!(
+            script.requests(CHILD),
+            2,
+            "the late allow did not carry over"
+        );
+        assert_eq!(broker_of(&rig, ack.id).pending_count(), 1);
+        rig.hub.stop(rig.hub.main(), &[ack.id], StopOpts::default());
+        settle(&rig, ack.id);
+        assert_clean(&rig, &[ack.id]);
+    }
+
+    #[test]
+    fn slot_released_while_prompt_pending() {
+        let (open_b, gate_b) = flume::bounded::<()>(1);
+        let script = Script::new(vec![
+            (
+                "AAA",
+                vec![
+                    Step::Reply(shell_call("t1", "true")),
+                    Step::Reply(reply("a")),
+                ],
+            ),
+            ("BBB", vec![Step::Gate(gate_b, reply("b"))]),
+            ("CCC", vec![Step::Reply(reply("c"))]),
+        ]);
+        let rig = prompting(
+            &script,
+            UnitLimits {
+                max_agents: 1,
+                ..UnitLimits::default()
+            },
+        );
+        let a = spawn(&rig, "AAA", json!({"one_shot": true}));
+        script.watch("AAA", &rig.hub, a.id);
+        let b = spawn(&rig, "BBB", json!({"one_shot": true}));
+        let c = spawn(&rig, "CCC", json!({"one_shot": true}));
+        let prompt = next_prompt(&rig);
+        // B got A's slot while A waits for the user.
+        await_requests(&script, "BBB", 1);
+        assert_eq!(script.requests("CCC"), 0);
+        prompt.answer(PermissionAnswer::AllowOnce);
+        // A is back in line ahead of C, which never started.
+        open_b.send(()).unwrap();
+        await_requests(&script, "AAA", 2);
+        assert_eq!(script.requests("CCC"), 0, "A resumes before C starts");
+        for id in [a.id, b.id, c.id] {
+            assert_eq!(done_reason(&settle(&rig, id)), DoneReason::Completed);
+        }
+        script.assert_slots_held();
+        assert_clean(&rig, &[a.id, b.id, c.id]);
+    }
+
+    #[test]
+    fn stop_while_prompt_pending_withdraws_it_and_leaks_nothing() {
+        let script = one_prompt_script();
+        let rig = prompting(&script, UnitLimits::default());
+        let ack = spawn(&rig, CHILD, json!({}));
+        let prompt = next_prompt(&rig);
+        rig.hub.stop(rig.hub.main(), &[ack.id], StopOpts::default());
+        withdrawn(&rig, &prompt.id);
+        assert_eq!(done_reason(&settle(&rig, ack.id)), DoneReason::Killed);
+        assert_clean(&rig, &[ack.id]);
+        // An answer after the stop reaches nothing that runs.
+        prompt.answer(PermissionAnswer::AllowOnce);
+        assert_eq!(script.requests(CHILD), 1);
+    }
+
+    #[test]
+    fn soft_stop_while_prompt_pending_leaves_the_run_idle_and_clean() {
+        let script = one_prompt_script();
+        let rig = prompting(&script, UnitLimits::default());
+        let ack = spawn(&rig, CHILD, json!({}));
+        let prompt = next_prompt(&rig);
+        rig.hub.stop(
+            rig.hub.main(),
+            &[ack.id],
+            StopOpts {
+                soft: true,
+                detach: false,
+            },
+        );
+        withdrawn(&rig, &prompt.id);
+        assert_eq!(done_state(&settle(&rig, ack.id)), "idle");
+        assert_clean(&rig, &[ack.id]);
+        rig.hub.stop(rig.hub.main(), &[ack.id], StopOpts::default());
+        settle(&rig, ack.id);
+    }
+
+    #[test]
+    fn answers_reach_only_the_run_that_asked() {
+        let script = Script::new(vec![
+            (
+                "AAA",
+                vec![Step::Reply(shell_call("same", "true")), Step::Hang],
+            ),
+            (
+                "BBB",
+                vec![Step::Reply(shell_call("same", "true")), Step::Hang],
+            ),
+        ]);
+        let rig = prompting(&script, UnitLimits::default());
+        let a = spawn(&rig, "AAA", json!({"name": "alpha"}));
+        let b = spawn(&rig, "BBB", json!({"name": "beta"}));
+        let first = next_prompt(&rig);
+        let second = next_prompt(&rig);
+        assert_eq!(first.id, second.id, "both runs used the same call id");
+        let (alpha, beta) = if first.info.name == "alpha" {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        alpha.answer(PermissionAnswer::AllowAlwaysProject);
+        await_requests(&script, "AAA", 2);
+        assert_eq!(script.requests("BBB"), 1, "beta is still waiting");
+        assert_eq!(broker_of(&rig, b.id).pending_count(), 1);
+        beta.answer(PermissionAnswer::Deny);
+        await_requests(&script, "BBB", 2);
+        for id in [a.id, b.id] {
+            rig.hub.stop(rig.hub.main(), &[id], StopOpts::default());
+            settle(&rig, id);
+        }
+        assert_clean(&rig, &[a.id, b.id]);
+    }
+
+    #[test]
+    fn unattended_deny_text_mentions_send() {
+        let script = one_prompt_script();
+        let rig = prompting(&script, UnitLimits::default());
+        rig.hub.set_attended(false);
+        let ack = spawn(&rig, CHILD, json!({}));
+        settle(&rig, ack.id);
+        let text = last_text(&script, CHILD, 1);
+        assert!(
+            text.contains("report this to your parent with send"),
+            "{text}"
+        );
+        assert!(
+            !rig.events
+                .try_iter()
+                .any(|e| matches!(e.event, AgentEvent::PermissionRequest { .. })),
+            "nothing is shown to a user who is not there"
+        );
+        assert_clean(&rig, &[ack.id]);
+    }
+
+    /// What the broker answers a prompt nobody can see, as the run reads it.
+    fn unattended_answer(unattended: UnattendedMode, yolo: bool) -> PermissionAnswer {
+        let script = Script::new(vec![]);
+        let rig = rig_with(
+            &script,
+            UnitLimits {
+                unattended,
+                ..UnitLimits::default()
+            },
+        );
+        rig.hub.set_attended(false);
+        let broker = broker::PermissionBroker::new(Arc::default());
+        let clock: Arc<dyn Clock> = rig.clock.clone();
+        let info = SubagentInfo {
+            parent_tool_use_id: "ag-test".into(),
+            name: "x".into(),
+            prompt: None,
+            model: None,
+            opts: None,
+            answer_tx: None,
+            inbox: None,
+        };
+        let shown = broker.begin(broker::Begin {
+            hub: &rig.hub,
+            run: rig.hub.main(),
+            info: &info,
+            clock: &clock,
+            request: "r1",
+            scope: "echo".into(),
+            yolo,
+        });
+        assert!(!shown, "an unattended prompt is answered, not shown");
+        let raw = broker.receiver().try_lock().unwrap().try_recv().unwrap();
+        let tagged = TaggedAnswer::decode(&raw).unwrap();
+        assert_eq!(tagged.request_id, "r1");
+        tagged.answer
+    }
+
+    #[test]
+    fn headless_inherit_yolo_allows() {
+        use UnattendedMode::{Deny, InheritYolo};
+        assert_eq!(
+            unattended_answer(InheritYolo, true),
+            PermissionAnswer::AllowOnce
+        );
+        for (mode, yolo) in [(Deny, true), (Deny, false), (InheritYolo, false)] {
+            assert!(
+                matches!(
+                    unattended_answer(mode, yolo),
+                    PermissionAnswer::Unavailable(_)
+                ),
+                "{mode:?} yolo={yolo}"
+            );
+        }
+    }
+
+    /// `maki -p --yolo` needs no policy: the rules already allow the call.
+    #[test]
+    fn yolo_run_is_allowed_without_a_prompt() {
+        let script = one_prompt_script();
+        let mut rig = rig_with(&script, UnitLimits::default());
+        rig.ctx.permissions = manager(true);
+        rig.hub.set_attended(false);
+        let ack = spawn(&rig, CHILD, json!({}));
+        settle(&rig, ack.id);
+        assert!(last_text(&script, CHILD, 1).contains("sh-"));
+    }
+
+    #[test]
+    fn too_many_pending_prompts_are_denied_not_queued() {
+        let total = broker::MAX_PENDING_PROMPTS;
+        let routes: Vec<&'static str> = [
+            "P00", "P01", "P02", "P03", "P04", "P05", "P06", "P07", "P08",
+        ]
+        .into_iter()
+        .collect();
+        let script = Script::new(
+            routes
+                .iter()
+                .map(|route| {
+                    (
+                        *route,
+                        vec![Step::Reply(shell_call("t1", "true")), Step::Hang],
+                    )
+                })
+                .collect(),
+        );
+        let rig = prompting(
+            &script,
+            UnitLimits {
+                max_agents: 16,
+                max_children_per_run: 16,
+                ..UnitLimits::default()
+            },
+        );
+        let acks: Vec<SpawnAck> = routes
+            .iter()
+            .map(|route| spawn(&rig, route, json!({})))
+            .collect();
+        let prompts: Vec<Prompt> = (0..total).map(|_| next_prompt(&rig)).collect();
+        // The ninth run is denied at once and goes on to its next request.
+        for _ in 0..50_000_000u64 {
+            let sent: usize = routes.iter().map(|r| script.requests(r)).sum();
+            if sent > routes.len() {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        let denied: Vec<&&str> = routes
+            .iter()
+            .filter(|route| script.requests(route) == 2)
+            .collect();
+        assert_eq!(denied.len(), 1, "exactly one run was refused a prompt");
+        let text = last_text(&script, denied[0], 1);
+        assert!(text.contains("too many permission prompts"), "{text}");
+        assert_eq!(rig.hub.prompts.load(Ordering::SeqCst), total);
+        for prompt in &prompts {
+            prompt.answer(PermissionAnswer::Deny);
+        }
+        for ack in &acks {
+            rig.hub.stop(rig.hub.main(), &[ack.id], StopOpts::default());
+            settle(&rig, ack.id);
+        }
+        let ids: Vec<UnitId> = acks.iter().map(|a| a.id).collect();
+        assert_clean(&rig, &ids);
+    }
+
+    #[test]
+    fn a_turn_never_runs_without_a_slot() {
+        // Idle, woken by a follow-up, and a prompt in between: every request
+        // of the run comes while it holds a slot.
+        let script = Script::new(vec![(
+            CHILD,
+            vec![
+                Step::Reply(shell_call("t1", "true")),
+                Step::Reply(reply("first")),
+                Step::Reply(reply("second")),
+            ],
+        )]);
+        let rig = prompting(
+            &script,
+            UnitLimits {
+                max_agents: 1,
+                ..UnitLimits::default()
+            },
+        );
+        let ack = spawn(&rig, CHILD, json!({}));
+        script.watch(CHILD, &rig.hub, ack.id);
+        let prompt = next_prompt(&rig);
+        prompt.answer(PermissionAnswer::AllowOnce);
+        assert_eq!(done_state(&settle(&rig, ack.id)), "idle");
+        assert_eq!(rig.hub.slots_in_use(), 0, "an idle agent holds no slot");
+        say(
+            &rig,
+            rig.hub.main(),
+            ack.id,
+            "again",
+            DeliveryKind::Followup,
+        );
+        await_requests(&script, CHILD, 3);
+        script.assert_slots_held();
+        rig.hub.stop(rig.hub.main(), &[ack.id], StopOpts::default());
+        settle(&rig, ack.id);
+        assert_clean(&rig, &[ack.id]);
     }
 }

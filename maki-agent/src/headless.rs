@@ -281,6 +281,7 @@ pub fn spawn(params: HeadlessParams) -> (HeadlessHandle, SessionEvents) {
         &params.config.runs,
         event_tx.clone(),
         params.resumed.id.id(),
+        false,
     );
     let session_ref = params.resumed.id.clone();
     let mailbox = SessionMailbox::register(session_ref.id());
@@ -403,6 +404,10 @@ pub struct InteractiveParams {
     /// Host-side overrides that shadow a registered tool's execution while
     /// keeping its advertised schema (e.g. ACP answers `question` via elicitation).
     pub local_tools: LocalTools,
+    /// Whether the client answers the permission prompts of background runs
+    /// (they arrive stamped, with their own `answer_tx`). Off, those prompts
+    /// get the `unattended_permissions` policy.
+    pub attended_runs: bool,
     /// Start a turn of `main` when a waking run notice arrives while it is
     /// idle. The turn ends with its own `Done`, which a client that pairs
     /// `Done` with its own prompt (ACP) would take for the answer to a prompt
@@ -452,8 +457,12 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
     let (cancel_tx, cancel_rx) = flume::bounded::<()>(1);
     let (model_tx, model_rx) = flume::unbounded::<Model>();
 
-    let runs =
-        crate::runs::start_session(&params.config.runs, base_tx.clone(), params.resumed.id.id());
+    let runs = crate::runs::start_session(
+        &params.config.runs,
+        base_tx.clone(),
+        params.resumed.id.id(),
+        params.attended_runs,
+    );
     let session_ref = params.resumed.id.clone();
     let mailbox = SessionMailbox::register(session_ref.id());
 

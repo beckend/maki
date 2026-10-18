@@ -881,6 +881,13 @@ impl App {
         }
     }
 
+    /// A run that ended or went idle has nothing left to answer.
+    fn drop_run_prompts(&mut self, handle: Option<&str>) {
+        if let Some(handle) = handle {
+            self.permission_prompt.drop_subagent(handle);
+        }
+    }
+
     fn send_answer(&self, answer: String) {
         if let Some(tx) = &self.answer_tx {
             let _ = tx.try_send(answer);
@@ -1517,7 +1524,8 @@ impl App {
         self.close_all_overlays();
         self.pending_input = PendingInput::None;
         self.finish_subagents(TaskOutcome::Error, CANCELLED_TEXT);
-        self.subagent_answers.clear();
+        // A background run outlives the turn, and so does its way to answer.
+        self.subagent_answers.retain(|id, _| is_run_handle(id));
         self.shell.cancel_all();
         for chat in self
             .chats
@@ -1651,6 +1659,14 @@ impl App {
             .as_ref()
             .map(|s| s.parent_tool_use_id.clone());
 
+        if let (AgentEvent::PermissionWithdrawn { id }, Some(owner)) =
+            (&envelope.event, &subagent_id)
+        {
+            self.permission_prompt.withdraw(owner, id);
+            return vec![];
+        }
+        let asker_name = envelope.subagent.as_ref().map(|s| s.name.clone());
+
         let is_plugin_task = plugin.is_some();
         let chat_idx = match envelope.subagent {
             Some(ref subagent) => self.resolve_or_create_chat(subagent, &plugin),
@@ -1673,9 +1689,13 @@ impl App {
             match &envelope.event {
                 AgentEvent::RunStateChanged { state, .. } => {
                     self.chats[chat_idx].idle = state == "idle";
+                    if state == "idle" {
+                        self.drop_run_prompts(subagent_id.as_deref());
+                    }
                     return vec![];
                 }
                 AgentEvent::RunFinished { reason, .. } => {
+                    self.drop_run_prompts(subagent_id.as_deref());
                     self.chats[chat_idx].cancel_in_progress();
                     let (outcome, text) = match reason.as_str() {
                         "completed" => (TaskOutcome::Done, DONE_TEXT),
@@ -1790,6 +1810,13 @@ impl App {
                 project_trusted,
                 reason,
             );
+            // A background run is named, so the user knows whose call it is.
+            if let (Some(handle), Some(name)) = (&subagent_id, &asker_name)
+                && is_run_handle(handle)
+            {
+                self.permission_prompt
+                    .label_last(format!("{name} ({handle})"));
+            }
             return vec![];
         }
 
@@ -2727,5 +2754,9 @@ fn sync_search_highlight(modal: &SearchModal, chat: &mut Chat) {
 /// turn, so cancelling or ending a turn leaves it alone; only its own
 /// `RunFinished` closes it.
 fn is_native_run(chat: &Chat) -> bool {
-    chat.task_id().is_some_and(|id| id.starts_with("ag-"))
+    chat.task_id().is_some_and(|id| is_run_handle(id))
+}
+
+fn is_run_handle(id: &str) -> bool {
+    id.starts_with("ag-")
 }
