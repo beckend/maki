@@ -376,12 +376,13 @@ impl Guard<'_> {
 
     /// Removes queued notices the test selects: this is the "still queued" half
     /// of the drained/queued cutoff, taken under the inbox lock.
-    pub(crate) fn remove_notices(&mut self, take: impl Fn(&InboxItem) -> bool) -> usize {
-        let before = self.state.items.len();
-        self.state
-            .items
-            .retain(|i| !(i.kind == DeliveryKind::Notice && take(i)));
-        before - self.state.items.len()
+    pub(crate) fn remove_notices(&mut self, take: impl Fn(&InboxItem) -> bool) -> Vec<InboxItem> {
+        let (gone, kept): (std::collections::VecDeque<_>, std::collections::VecDeque<_>) =
+            std::mem::take(&mut self.state.items)
+                .into_iter()
+                .partition(|i| i.kind == DeliveryKind::Notice && take(i));
+        self.state.items = kept;
+        gone.into()
     }
 
     pub(crate) fn queued_notices(&self) -> Vec<Notice> {

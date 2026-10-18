@@ -19,6 +19,8 @@ pub enum NoticeKind {
     Delivery,
     /// A run's permission prompt has waited a while for the user.
     Permission,
+    /// Runs that were still going when the previous process died.
+    Lost,
 }
 
 impl NoticeKind {
@@ -29,7 +31,21 @@ impl NoticeKind {
             Self::Overflow => "overflow",
             Self::Delivery => "delivery",
             Self::Permission => "permission",
+            Self::Lost => "lost",
         }
+    }
+
+    pub fn parse(kind: &str) -> Option<Self> {
+        [
+            Self::Settled,
+            Self::Guard,
+            Self::Overflow,
+            Self::Delivery,
+            Self::Permission,
+            Self::Lost,
+        ]
+        .into_iter()
+        .find(|k| k.as_str() == kind)
     }
 }
 
