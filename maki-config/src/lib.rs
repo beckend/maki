@@ -832,6 +832,7 @@ pub struct RunsFileConfig {
     pub max_depth: Option<u32>,
     pub max_children_per_run: Option<u32>,
     pub session_max_runs: Option<u32>,
+    pub siblings: Option<bool>,
 }
 
 impl RunsFileConfig {
@@ -842,7 +843,8 @@ impl RunsFileConfig {
             enabled,
             max_depth,
             max_children_per_run,
-            session_max_runs
+            session_max_runs,
+            siblings
         );
     }
 }
@@ -1575,6 +1577,12 @@ pub struct RunsConfig {
 
     #[config(default = DEFAULT_RUNS_SESSION_MAX, min = MIN_RUNS_LIMIT, desc = "Most runs one session may start in total")]
     pub session_max_runs: u32,
+
+    #[config(
+        default = false,
+        desc = "Let runs with the same parent message each other with `send`. Off: a run reaches only its parent, its children and `main`"
+    )]
+    pub siblings: bool,
 }
 
 impl RunsConfig {
@@ -1586,6 +1594,7 @@ impl RunsConfig {
                 .max_children_per_run
                 .unwrap_or(DEFAULT_RUNS_MAX_CHILDREN),
             session_max_runs: file.session_max_runs.unwrap_or(DEFAULT_RUNS_SESSION_MAX),
+            siblings: file.siblings.unwrap_or(false),
         }
     }
 }

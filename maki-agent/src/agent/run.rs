@@ -506,6 +506,10 @@ impl<'h> Agent<'h> {
         let now = LiveFacts {
             plan: self.mode.plan_path().map(Path::to_path_buf),
             prompt: self.prompt_facts.clone(),
+            topology: self
+                .runs
+                .as_ref()
+                .and_then(|runs| runs.hub.topology_facts(runs.self_run)),
         };
         if let Some(update) = self
             .history

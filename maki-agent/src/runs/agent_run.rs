@@ -83,7 +83,16 @@ impl Provider for Script {
                 .iter()
                 .map(|m| serde_json::to_value(m).unwrap())
                 .collect();
-            let first = values.first().map(Value::to_string).unwrap_or_default();
+            // The prompt, not a context update the host put ahead of it.
+            let first = values
+                .iter()
+                .find(|m| {
+                    m.get("kind")
+                        .and_then(|k| k.get("context_update"))
+                        .is_none()
+                })
+                .map(Value::to_string)
+                .unwrap_or_default();
             let step = {
                 let mut routes = self.routes.lock().unwrap();
                 let route = routes
@@ -146,6 +155,10 @@ struct Rig {
 }
 
 fn rig(script: &Arc<Script>) -> Rig {
+    rig_with(script, UnitLimits::default())
+}
+
+fn rig_with(script: &Arc<Script>, limits: UnitLimits) -> Rig {
     let mut ctx = stub_ctx(&AgentMode::Build);
     ctx.provider = script.clone();
     let registry = crate::tools::ToolRegistry::new();
@@ -160,7 +173,7 @@ fn rig(script: &Arc<Script>) -> Rig {
     let (tx, events) = flume::unbounded::<Envelope>();
     let dir = TempDir::new().unwrap();
     let hub = UnitHub::with_shell_options(
-        UnitLimits::default(),
+        limits,
         EventSender::new(tx, 0),
         Arc::new(ManualClock::default()),
         ShellOptions {
@@ -462,7 +475,8 @@ fn fork_excludes_inflight_turn() {
     settle(&rig, ack.id);
     let sent = script.messages_of("EARLIER-QUESTION", 0);
     let text = serde_json::to_string(&sent).unwrap();
-    assert_eq!(sent.len(), 3, "{text}");
+    // The fork prefix, the topology the child is told, then its task.
+    assert_eq!(sent.len(), 4, "{text}");
     assert!(text.contains("EARLIER-ANSWER") && text.contains("FORK-TASK"));
     assert!(
         !text.contains("toolu_spawn"),
@@ -797,6 +811,56 @@ mod hub {
         assert_eq!(err, UnitError::NotReachable);
     }
 
+    fn siblings(on: bool) -> (Rig, UnitId, UnitId) {
+        let script = Script::new(vec![("SIB-A", vec![]), ("SIB-B", vec![])]);
+        let rig = rig_with(
+            &script,
+            UnitLimits {
+                siblings: on,
+                ..UnitLimits::default()
+            },
+        );
+        let a = spawn(&rig, "SIB-A", json!({"name": "alpha"}));
+        let b = spawn(&rig, "SIB-B", json!({"name": "beta"}));
+        (rig, a.id, b.id)
+    }
+
+    #[test]
+    fn sibling_send_only_with_config() {
+        let (rig, a, b) = siblings(false);
+        let err = rig.hub.send(a, b, "hi".into(), DeliveryKind::Steer);
+        assert_eq!(err.unwrap_err(), UnitError::NotReachable);
+        let (rig, a, b) = siblings(true);
+        assert!(!say(&rig, a, b, "hi", DeliveryKind::Steer).held);
+        let items = rig.hub.inbox_of(b).unwrap().take_start();
+        assert_eq!(items[0].from, a);
+        assert_eq!(items[0].from_label, "alpha");
+        // Unrelated runs (a cousin under another parent) stay out of reach.
+        let cousin = spawn_as(&rig, a, agent_req("SIB-B", json!({"name": "cousin"})));
+        let err = rig.hub.send(b, cousin.id, "x".into(), DeliveryKind::Steer);
+        assert_eq!(err.unwrap_err(), UnitError::NotReachable);
+    }
+
+    #[test]
+    fn pingpong_guard_mandatory_with_siblings() {
+        let (rig, a, b) = siblings(true);
+        for n in 0..crate::runs::inbox::PAIR_BURST {
+            let from_to = if n % 2 == 0 { (a, b) } else { (b, a) };
+            assert!(!say(&rig, from_to.0, from_to.1, "x", DeliveryKind::Quiet).held);
+        }
+        let before = rig.hub.inbox_of(b).unwrap().len();
+        assert!(say(&rig, a, b, "again", DeliveryKind::Quiet).held);
+        assert_eq!(
+            rig.hub.inbox_of(b).unwrap().len(),
+            before,
+            "held, not delivered"
+        );
+        // Held messages release when either side works, and main hears once.
+        assert_eq!(rig.hub.pending_notices(rig.hub.main()).len(), 1);
+        rig.hub.note_work(b);
+        assert_eq!(rig.hub.inbox_of(b).unwrap().len(), before + 1);
+    }
+
     #[test]
     fn send_errors_are_the_documented_codes() {
         let script = Script::new(vec![(CHILD, vec![])]);
@@ -992,5 +1056,81 @@ mod race {
         assert_eq!(err, UnitError::RecipientTerminal);
         assert!(rig.hub.inbox_of(ack.id).unwrap().is_empty());
         assert_eq!(script.requests(CHILD), 1);
+    }
+}
+
+mod topology {
+    use super::*;
+
+    fn flat(script: &Script, route: &str, n: usize) -> String {
+        Value::Array(script.messages_of(route, n)).to_string()
+    }
+
+    #[test]
+    fn child_hears_its_place_and_main_hears_its_children() {
+        let script = Script::new(vec![
+            ("KID-ONE", vec![Step::Reply(reply("one"))]),
+            ("KID-TWO", vec![Step::Reply(reply("two"))]),
+            (PARENT, vec![]),
+        ]);
+        let rig = rig(&script);
+        let main = rig.hub.main();
+        assert_eq!(
+            rig.hub.topology_facts(main),
+            None,
+            "no runs, nothing to tell"
+        );
+        let one = spawn(&rig, "KID-ONE", json!({"name": "first"}));
+        let two = spawn(&rig, "KID-TWO", json!({"name": "second"}));
+        settle(&rig, one.id);
+        settle(&rig, two.id);
+
+        let text = flat(&script, "KID-ONE", 0);
+        assert!(text.contains("You are agent \\\"first\\\""), "{text}");
+        assert!(text.contains("Your parent is \\\"main\\\""), "{text}");
+        assert!(text.contains("You have no children."), "{text}");
+        assert!(
+            !text.contains("second"),
+            "siblings are not in the fact: {text}"
+        );
+
+        let facts = rig.hub.topology_facts(main).unwrap();
+        let names: Vec<_> = facts.children.iter().map(|c| c.1.as_str()).collect();
+        assert_eq!(names, ["first", "second"]);
+    }
+
+    #[test]
+    fn no_siblings_in_fact() {
+        let script = Script::new(vec![
+            ("KID-A", vec![]),
+            ("KID-B", vec![]),
+            ("KID-C", vec![]),
+        ]);
+        let rig = rig(&script);
+        let a = spawn(&rig, "KID-A", json!({"name": "aa"}));
+        let b = spawn(&rig, "KID-B", json!({"name": "bb"}));
+        let c = spawn_as(&rig, a.id, agent_req("KID-C", json!({"name": "cc"})));
+        let facts = rig.hub.topology_facts(a.id).unwrap();
+        assert_eq!(facts.parent.as_ref().unwrap().1, "main");
+        assert_eq!(facts.children.len(), 1);
+        assert_eq!(facts.children[0].1, "cc");
+        let facts = rig.hub.topology_facts(b.id).unwrap();
+        assert!(facts.children.is_empty());
+        assert_eq!(facts.me.2, 1);
+        assert_eq!(rig.hub.topology_facts(c.id).unwrap().me.2, 2);
+        let json = serde_json::to_string(&facts).unwrap();
+        assert!(!json.contains("aa"), "{json}");
+    }
+
+    #[test]
+    fn finished_children_leave_the_fact() {
+        let script = Script::new(vec![("KID-A", vec![Step::Reply(reply("ok"))])]);
+        let rig = rig(&script);
+        let a = spawn(&rig, "KID-A", json!({"name": "aa"}));
+        settle(&rig, a.id);
+        assert!(rig.hub.topology_facts(rig.hub.main()).is_some());
+        rig.hub.stop(rig.hub.main(), &[a.id], StopOpts::default());
+        settle(&rig, a.id);
+        assert_eq!(rig.hub.topology_facts(rig.hub.main()), None);
     }
 }
