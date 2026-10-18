@@ -1065,6 +1065,34 @@ data: [DONE]\n";
         })
     }
 
+    /// A topology update lands after the tool results and before the next
+    /// prompt: two user turns in a row, each kept whole and in order.
+    #[test]
+    fn convert_messages_update_after_tool_result_is_its_own_user_turn() {
+        let messages = vec![
+            Message::user("go".to_string()),
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::tool_use("tc_1", "bash", json!({}))],
+                ..Default::default()
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::tool_result("tc_1", "ok", false)],
+                ..Default::default()
+            },
+            Message::context_update("Run topology changed.".into(), Default::default()),
+            Message::user("next".to_string()),
+        ];
+        let wire = convert_messages(&messages, "s");
+        let roles: Vec<_> = wire.iter().map(|m| m["role"].as_str().unwrap()).collect();
+        assert_eq!(
+            roles,
+            ["system", "user", "assistant", "tool", "user", "user"]
+        );
+        assert_eq!(wire[4]["content"], "Run topology changed.");
+    }
+
     #[test]
     fn convert_messages_structure() {
         let messages = vec![
