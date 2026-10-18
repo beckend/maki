@@ -3,6 +3,7 @@
 //! task that owns their history (`agent.rs`).
 
 pub mod ack;
+mod admit;
 pub mod agent;
 #[cfg(test)]
 mod agent_run;
@@ -18,7 +19,7 @@ pub mod shell;
 mod signals;
 mod topology;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -42,6 +43,7 @@ use crate::{AgentEvent, Envelope, SubagentInfo};
 
 use ack::Acks;
 pub use ack::{AckRecord, AckState};
+use admit::Pool;
 use agent::AgentRun;
 pub use agent::{AgentLaunch, resolve_model};
 pub use clock::{Clock, ManualClock, SystemClock};
@@ -348,6 +350,10 @@ pub enum UnitError {
     SelfSend,
     QueueFull,
     SpawnLimit,
+    ShellLimit {
+        max: usize,
+        per_owner: bool,
+    },
     DepthLimit,
     Disabled,
     NotAgent,
@@ -371,6 +377,11 @@ impl fmt::Display for UnitError {
             Self::SelfSend => f.write_str("SELF"),
             Self::QueueFull => f.write_str("QUEUE_FULL"),
             Self::SpawnLimit => f.write_str("SPAWN_LIMIT"),
+            Self::ShellLimit { max, per_owner } => write!(
+                f,
+                "SHELL_LIMIT: {max} shells already running{}; wait for one to finish or stop one",
+                if *per_owner { " for you" } else { "" }
+            ),
             Self::DepthLimit => f.write_str("DEPTH_LIMIT"),
             Self::Disabled => f.write_str("DISABLED"),
             Self::NotAgent => f.write_str("NOT_AGENT"),
@@ -510,6 +521,18 @@ pub struct UnitView {
     pub result: Option<UnitResult>,
     /// How many times the run settled or went idle; see [`UnitHub::claim`].
     pub settle_gen: u64,
+    /// 1-based position and queue length while waiting for an agent slot.
+    pub queue: Option<(usize, usize)>,
+}
+
+impl UnitView {
+    /// The state as shown to a model: a waiting run says where it stands.
+    pub fn state_label(&self) -> String {
+        match self.queue {
+            Some((at, of)) => format!("queued (position {at} of {of})"),
+            None => self.state.label().to_owned(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -569,7 +592,14 @@ struct UnitTable {
     children: HashMap<UnitId, Vec<UnitId>>,
     /// Ping-pong guard state per pair of agent runs, see [`UnitHub::send`].
     pairs: HashMap<PairKey, PairState>,
+    /// Who holds an agent slot and who waits for one.
+    pool: Pool,
+    /// When each owner started its recent runs, for `spawn_per_minute`.
+    spawn_log: HashMap<UnitId, VecDeque<Instant>>,
 }
+
+/// Window of the per-owner spawn rate.
+const SPAWN_WINDOW: Duration = Duration::from_secs(60);
 
 fn settled_info(run: UnitId, handle: String, name: String, generation: u64) -> NoticeInfo {
     NoticeInfo {
@@ -683,15 +713,45 @@ impl UnitTable {
             .count()
     }
 
-    fn queue_position(&self, id: UnitId) -> Option<(usize, usize)> {
-        let queued: Vec<UnitId> = self
-            .order
-            .iter()
-            .copied()
-            .filter(|i| matches!(self.units[i].state, UnitState::Queued))
-            .collect();
-        let at = queued.iter().position(|i| *i == id)?;
-        Some((at + 1, queued.len()))
+    /// Gives free slots to the head of the line; a run that was `Queued`
+    /// becomes `Running`. The caller wakes the waiters after the lock.
+    fn promote(&mut self, max: usize) {
+        let units = &self.units;
+        self.pool.resume(|id| {
+            units
+                .get(&id)
+                .is_none_or(|u| matches!(u.state, UnitState::Done(_) | UnitState::Idle))
+        });
+        for id in self.pool.grant(max) {
+            let Some(unit) = self.units.get_mut(&id) else {
+                continue;
+            };
+            if !matches!(unit.state, UnitState::Queued) {
+                continue;
+            }
+            unit.state = UnitState::Running;
+            unit.started_at.get_or_insert_with(SystemTime::now);
+            let handle = unit.handle.to_string();
+            let event = self.event_of(
+                id,
+                AgentEvent::RunStateChanged {
+                    handle,
+                    state: "running".to_owned(),
+                },
+            );
+            self.outbox.push(event);
+        }
+    }
+
+    fn running_shells(&self, owner: Option<UnitId>) -> usize {
+        self.units
+            .values()
+            .filter(|u| {
+                matches!(u.kind, UnitKind::Shell(_))
+                    && !u.state.is_done()
+                    && owner.is_none_or(|o| u.owner == o)
+            })
+            .count()
     }
 
     fn view(&self, id: UnitId) -> UnitView {
@@ -722,6 +782,7 @@ impl UnitTable {
                 _ => None,
             },
             settle_gen: self.settle_gen.get(&id).copied().unwrap_or(0),
+            queue: self.pool.position(id),
         }
     }
 }
@@ -862,6 +923,17 @@ impl UnitHub {
         let name = req.name.take();
         let notice_policy = req.notify.unwrap_or_default();
         let origin_tool_use_id = req.origin_tool_use_id.take();
+        let is_agent = req.kind == RunKind::Agent;
+        let default_timeout = if is_agent {
+            self.limits.default_timeout.as_secs()
+        } else {
+            DEFAULT_SHELL_TIMEOUT_SECS
+        };
+        req.timeout_secs = Some(
+            req.timeout_secs
+                .unwrap_or(default_timeout)
+                .clamp(1, self.limits.max_timeout.as_secs().max(1)),
+        );
         let kind = req.into_kind()?;
         let mut table = self.table();
         let caller_depth = self.depth_of(&table, caller)?;
@@ -898,10 +970,47 @@ impl UnitHub {
             return Err(UnitError::DepthLimit);
         }
         let live = table.live_children(caller);
-        if live >= self.limits.max_children_per_run as usize
-            || table.units.len() >= self.limits.session_max_runs as usize
+        if live >= usize::from(self.limits.max_children_per_run)
+            || table.units.len() >= usize::from(self.limits.session_max_runs)
         {
             return Err(UnitError::SpawnLimit);
+        }
+        if !is_agent {
+            let max = usize::from(self.limits.max_shells);
+            let per_owner = usize::from(self.limits.max_shells_per_owner);
+            if table.running_shells(None) >= max {
+                return Err(UnitError::ShellLimit {
+                    max,
+                    per_owner: false,
+                });
+            }
+            if table.running_shells(Some(caller)) >= per_owner {
+                return Err(UnitError::ShellLimit {
+                    max: per_owner,
+                    per_owner: true,
+                });
+            }
+        }
+        let max_agents = usize::from(self.limits.max_agents);
+        let would_queue = is_agent && table.pool.would_queue(max_agents);
+        if would_queue && table.pool.queued_len() >= usize::from(self.limits.max_queue) {
+            return Err(UnitError::QueueFull);
+        }
+        let now = self.clock.now();
+        let recent = table.spawn_log.entry(caller).or_default();
+        while recent
+            .front()
+            .is_some_and(|t| now.saturating_duration_since(*t) >= SPAWN_WINDOW)
+        {
+            recent.pop_front();
+        }
+        if recent.len() >= usize::from(self.limits.spawn_per_minute) {
+            let wait = recent.front().map_or(SPAWN_WINDOW, |t| {
+                SPAWN_WINDOW - now.saturating_duration_since(*t)
+            });
+            return Err(UnitError::RateLimited {
+                retry_after: wait.as_secs() + u64::from(wait.subsec_nanos() > 0),
+            });
         }
         if let (UnitKind::Agent(spec), Some(launch)) = (&kind, launch.as_mut())
             && spec.fork
@@ -914,12 +1023,13 @@ impl UnitHub {
                 kind: "fork needs a completed turn to copy",
             })?);
         }
+        table.spawn_log.entry(caller).or_default().push_back(now);
         let (id, handle) = table.fresh_identity(kind.kind());
         let shell_spec = match &kind {
             UnitKind::Shell(spec) => Some(spec.clone()),
             UnitKind::Agent(_) => None,
         };
-        let running = shell_spec.is_some() || launch.is_some();
+        let running = !would_queue;
         let state = if running {
             UnitState::Running
         } else {
@@ -955,7 +1065,11 @@ impl UnitHub {
         table.children.entry(caller).or_default().push(id);
         table.order.push(id);
         table.units.insert(id, unit);
-        let queue_position = table.queue_position(id);
+        if is_agent {
+            table.pool.request(id, false);
+            table.pool.grant(max_agents);
+        }
+        let queue_position = table.pool.position(id);
         let started = shell_spec.map(|spec| {
             let log = self
                 .shell
@@ -1092,6 +1206,9 @@ impl UnitHub {
         unit.progress = None;
         let (owner, wake) = (unit.owner, unit.notice_policy == NoticePolicy::Wake);
         let (handle, name) = (unit.handle.to_string(), unit.name.to_string());
+        // Every way a run ends passes here, so a slot cannot leak.
+        table.pool.drop_run(id);
+        table.promote(usize::from(self.limits.max_agents));
         let generation = table.settle_gen.entry(id).or_default();
         *generation += 1;
         let generation = *generation;
@@ -1118,6 +1235,7 @@ impl UnitHub {
             return false;
         }
         unit.state = UnitState::Idle;
+        // An idle agent holds no slot.
         unit.last_activity = self.clock.now();
         unit.progress = None;
         let text = (notify && unit.notice_policy != NoticePolicy::Never)
@@ -1129,6 +1247,8 @@ impl UnitHub {
             unit.name.to_string(),
         );
         table.idle_results.insert(id, result);
+        table.pool.drop_run(id);
+        table.promote(usize::from(self.limits.max_agents));
         let generation = table.settle_gen.entry(id).or_default();
         *generation += 1;
         let generation = *generation;
@@ -1334,6 +1454,10 @@ impl UnitHub {
                 };
                 self.settle_locked(table, id, terminal, 0);
                 plan.settled = true;
+                // A queued agent has a driver parked on its slot: end it.
+                if let Some(run) = table.agents.get(&id) {
+                    plan.cancel.push((id, Arc::clone(run)));
+                }
             }
             UnitState::Running | UnitState::Idle | UnitState::Stopping => {
                 unit.notice_policy = NoticePolicy::Never;
@@ -1406,7 +1530,11 @@ impl UnitHub {
                 .collect()
         };
         let deadline = self.clock.now() + timeout;
-        loop {
+        // A run that blocks here gives its slot back (and takes one again,
+        // ahead of runs that never started, once it is done blocking).
+        let mut released = false;
+        let on = (ids.clone(), mode == WaitMode::All);
+        let views = loop {
             let listener = self.settled.listen();
             let (views, satisfied) = {
                 let table = self.table();
@@ -1424,7 +1552,10 @@ impl UnitHub {
                 (views, satisfied)
             };
             if satisfied || cancel.is_cancelled() {
-                return views;
+                break views;
+            }
+            if !released {
+                released = self.release_slot(caller, Some(on.clone()));
             }
             let ended = or(
                 or(
@@ -1445,13 +1576,115 @@ impl UnitHub {
             .await;
             if ended {
                 let table = self.table();
-                return ids
+                break ids
                     .iter()
                     .filter(|id| table.units.contains_key(id))
                     .map(|&id| table.view(id))
                     .collect();
             }
+        };
+        if released {
+            self.acquire(caller, cancel, true).await;
         }
+        views
+    }
+
+    /// Waits for an agent slot and holds it; false when the run was stopped
+    /// or `token` fired first. Nothing is held then. A fresh or woken run
+    /// queues behind everyone; `priority` (a run that resumes after blocking)
+    /// goes ahead of runs that never started. The pair of this and
+    /// [`Self::release_slot`] is the hook for any wait that must not pin a
+    /// slot (`wait` today, a permission prompt in 5b).
+    pub(crate) async fn acquire(&self, id: UnitId, token: &CancelToken, priority: bool) -> bool {
+        loop {
+            let listener = self.settled.listen();
+            if let Some(got) = self.try_acquire(id, priority) {
+                return got;
+            }
+            let cancelled = or(
+                async {
+                    listener.await;
+                    false
+                },
+                async {
+                    token.cancelled().await;
+                    true
+                },
+            )
+            .await;
+            if cancelled {
+                self.table().pool.drop_run(id);
+                return false;
+            }
+        }
+    }
+
+    /// One step of [`Self::acquire`] under the lock: `Some(true)` holding,
+    /// `Some(false)` the run is no longer admissible, `None` still waiting.
+    fn try_acquire(&self, id: UnitId, priority: bool) -> Option<bool> {
+        let mut table = self.table();
+        let state = table.units.get(&id).map(|u| u.state.clone());
+        if !matches!(
+            state,
+            Some(UnitState::Queued | UnitState::Running | UnitState::Idle)
+        ) {
+            table.pool.drop_run(id);
+            return Some(false);
+        }
+        if table.pool.holds(id) {
+            return Some(true);
+        }
+        table.pool.request(id, priority);
+        if !priority
+            && matches!(state, Some(UnitState::Running))
+            && let Some(unit) = table.units.get_mut(&id)
+        {
+            unit.state = UnitState::Queued;
+            let handle = unit.handle.to_string();
+            let event = table.event_of(
+                id,
+                AgentEvent::RunStateChanged {
+                    handle,
+                    state: "queued".to_owned(),
+                },
+            );
+            table.outbox.push(event);
+        }
+        table.promote(usize::from(self.limits.max_agents));
+        let got = table.pool.holds(id);
+        self.release(table);
+        got.then_some(true)
+    }
+
+    /// Gives `id`'s slot back, if it holds one, and hands it on. True when
+    /// a slot was released.
+    /// With `on`, the run is put back in line with priority as soon as that
+    /// wait is satisfied, inside the same critical section that settles the
+    /// run it waited for.
+    pub(crate) fn release_slot(&self, id: UnitId, on: Option<(Vec<UnitId>, bool)>) -> bool {
+        let mut table = self.table();
+        let held = table.pool.block(id, on);
+        if held {
+            table.promote(usize::from(self.limits.max_agents));
+        }
+        self.release(table);
+        if held {
+            self.settled.notify(usize::MAX);
+        }
+        held
+    }
+
+    /// Slots in use and the pool size, for accounting checks and `runs`.
+    pub fn slots_in_use(&self) -> usize {
+        self.table().pool.held_count()
+    }
+
+    /// Runs started this session and the backstop.
+    pub fn session_usage(&self) -> (usize, usize) {
+        (
+            self.table().units.len(),
+            usize::from(self.limits.session_max_runs),
+        )
     }
 
     /// Output of a shell run since `reader` last consumed, or a byte page
@@ -2425,7 +2658,10 @@ mod tests {
 
     #[test]
     fn agents_queue_in_order_and_shells_start() {
-        let hub = hub();
+        let hub = hub_with(UnitLimits {
+            max_agents: 0,
+            ..UnitLimits::default()
+        });
         let main = hub.main();
         let a = hub.spawn(main, request(RunKind::Agent, "a")).unwrap();
         let b = hub.spawn(main, request(RunKind::Agent, "b")).unwrap();

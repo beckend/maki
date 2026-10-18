@@ -91,8 +91,16 @@ pub const MIN_STREAM_TIMEOUT_SECS: u64 = 10;
 pub const DEFAULT_RUNS_MAX_DEPTH: u32 = 2;
 pub const DEFAULT_RUNS_MAX_CHILDREN: u32 = 8;
 pub const DEFAULT_RUNS_SESSION_MAX: u32 = 64;
+pub const DEFAULT_RUNS_MAX_AGENTS: u32 = 4;
+pub const DEFAULT_RUNS_MAX_SHELLS: u32 = 8;
+pub const DEFAULT_RUNS_MAX_SHELLS_PER_OWNER: u32 = 4;
+pub const DEFAULT_RUNS_MAX_QUEUE: u32 = 16;
+pub const DEFAULT_RUNS_SPAWN_PER_MINUTE: u32 = 10;
+pub const DEFAULT_RUNS_AGENT_TIMEOUT_SECS: u64 = 1800;
+pub const DEFAULT_RUNS_MAX_TIMEOUT_SECS: u64 = 86_400;
 pub const MIN_RUNS_MAX_DEPTH: u32 = 1;
 pub const MIN_RUNS_LIMIT: u32 = 1;
+pub const MIN_RUNS_TIMEOUT_SECS: u64 = 1;
 
 pub const MIN_RETRY_BASE_MS: u64 = 1;
 pub const MIN_RETRY_MAX_MS: u64 = 1;
@@ -833,6 +841,13 @@ pub struct RunsFileConfig {
     pub max_children_per_run: Option<u32>,
     pub session_max_runs: Option<u32>,
     pub siblings: Option<bool>,
+    pub max_agents: Option<u32>,
+    pub max_shells: Option<u32>,
+    pub max_shells_per_owner: Option<u32>,
+    pub max_queue: Option<u32>,
+    pub spawn_per_minute: Option<u32>,
+    pub default_timeout_secs: Option<u64>,
+    pub max_timeout_secs: Option<u64>,
 }
 
 impl RunsFileConfig {
@@ -844,7 +859,14 @@ impl RunsFileConfig {
             max_depth,
             max_children_per_run,
             session_max_runs,
-            siblings
+            siblings,
+            max_agents,
+            max_shells,
+            max_shells_per_owner,
+            max_queue,
+            spawn_per_minute,
+            default_timeout_secs,
+            max_timeout_secs
         );
     }
 }
@@ -1583,6 +1605,27 @@ pub struct RunsConfig {
         desc = "Let runs with the same parent message each other with `send`. Off: a run reaches only its parent, its children and `main`"
     )]
     pub siblings: bool,
+
+    #[config(default = DEFAULT_RUNS_MAX_AGENTS, min = MIN_RUNS_LIMIT, desc = "Agent runs that may work at once; more start queued, first come first served. A run waiting in `wait` does not count")]
+    pub max_agents: u32,
+
+    #[config(default = DEFAULT_RUNS_MAX_SHELLS, min = MIN_RUNS_LIMIT, desc = "Shell runs that may be running at once in the session")]
+    pub max_shells: u32,
+
+    #[config(default = DEFAULT_RUNS_MAX_SHELLS_PER_OWNER, min = MIN_RUNS_LIMIT, desc = "Shell runs one run may have running at once")]
+    pub max_shells_per_owner: u32,
+
+    #[config(default = DEFAULT_RUNS_MAX_QUEUE, min = MIN_RUNS_LIMIT, desc = "Agent runs that may wait for a free slot; a further `spawn` fails with QUEUE_FULL")]
+    pub max_queue: u32,
+
+    #[config(default = DEFAULT_RUNS_SPAWN_PER_MINUTE, min = MIN_RUNS_LIMIT, desc = "Runs one run may start per rolling minute")]
+    pub spawn_per_minute: u32,
+
+    #[config(default = DEFAULT_RUNS_AGENT_TIMEOUT_SECS, min = MIN_RUNS_TIMEOUT_SECS, desc = "Wall clock limit of an agent run (seconds) unless `spawn` sets `timeout_secs`; counted from when it starts working")]
+    pub default_timeout_secs: u64,
+
+    #[config(default = DEFAULT_RUNS_MAX_TIMEOUT_SECS, min = MIN_RUNS_TIMEOUT_SECS, desc = "Largest `timeout_secs` a `spawn` may ask for (seconds); larger values are lowered to it")]
+    pub max_timeout_secs: u64,
 }
 
 impl RunsConfig {
@@ -1595,6 +1638,21 @@ impl RunsConfig {
                 .unwrap_or(DEFAULT_RUNS_MAX_CHILDREN),
             session_max_runs: file.session_max_runs.unwrap_or(DEFAULT_RUNS_SESSION_MAX),
             siblings: file.siblings.unwrap_or(false),
+            max_agents: file.max_agents.unwrap_or(DEFAULT_RUNS_MAX_AGENTS),
+            max_shells: file.max_shells.unwrap_or(DEFAULT_RUNS_MAX_SHELLS),
+            max_shells_per_owner: file
+                .max_shells_per_owner
+                .unwrap_or(DEFAULT_RUNS_MAX_SHELLS_PER_OWNER),
+            max_queue: file.max_queue.unwrap_or(DEFAULT_RUNS_MAX_QUEUE),
+            spawn_per_minute: file
+                .spawn_per_minute
+                .unwrap_or(DEFAULT_RUNS_SPAWN_PER_MINUTE),
+            default_timeout_secs: file
+                .default_timeout_secs
+                .unwrap_or(DEFAULT_RUNS_AGENT_TIMEOUT_SECS),
+            max_timeout_secs: file
+                .max_timeout_secs
+                .unwrap_or(DEFAULT_RUNS_MAX_TIMEOUT_SECS),
         }
     }
 }
@@ -3004,10 +3062,33 @@ mod tests {
         assert_eq!(runs.max_depth, 1);
     }
 
-    #[test]
-    fn runs_limits_below_their_minimum_are_rejected() {
-        let raw: RawConfig = toml::from_str("[agent.runs]\nsession_max_runs = 0\n").unwrap();
+    #[test_case("session_max_runs" ; "session_max_runs")]
+    #[test_case("max_agents" ; "max_agents")]
+    #[test_case("max_shells" ; "max_shells")]
+    #[test_case("max_shells_per_owner" ; "max_shells_per_owner")]
+    #[test_case("max_queue" ; "max_queue")]
+    #[test_case("spawn_per_minute" ; "spawn_per_minute")]
+    #[test_case("default_timeout_secs" ; "default_timeout_secs")]
+    #[test_case("max_timeout_secs" ; "max_timeout_secs")]
+    fn zero_rejected(key: &str) {
+        let raw: RawConfig = toml::from_str(&format!("[agent.runs]\n{key} = 0\n")).unwrap();
         assert!(raw.into_config(&[]).unwrap().validate().is_err());
+    }
+
+    #[test]
+    fn runs_limit_defaults_match_the_design() {
+        let runs = RawConfig::default().into_config(&[]).unwrap().agent.runs;
+        assert_eq!(
+            (
+                runs.max_agents,
+                runs.max_shells,
+                runs.max_shells_per_owner,
+                runs.max_queue,
+                runs.spawn_per_minute,
+                runs.default_timeout_secs
+            ),
+            (4, 8, 4, 16, 10, 1800)
+        );
     }
 
     #[test_case("auto", NotificationMethod::Auto ; "auto")]

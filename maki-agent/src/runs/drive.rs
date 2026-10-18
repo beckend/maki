@@ -255,13 +255,13 @@ mod headless {
     }
 
     fn rig(driven: bool) -> Rig {
+        rig_with(driven, UnitLimits::default())
+    }
+
+    fn rig_with(driven: bool, limits: UnitLimits) -> Rig {
         let (tx, events) = flume::unbounded::<Envelope>();
         let clock = Arc::new(ManualClock::default());
-        let hub = UnitHub::new(
-            UnitLimits::default(),
-            EventSender::new(tx, 0),
-            clock.clone(),
-        );
+        let hub = UnitHub::new(limits, EventSender::new(tx, 0), clock.clone());
         let (wake_tx, wakes) = flume::unbounded();
         if driven {
             smol::spawn(Arc::clone(&hub).drive_main(Sink(wake_tx))).detach();
@@ -326,7 +326,14 @@ mod headless {
     #[test]
     fn join_timeout_stops_runs() {
         smol::block_on(async {
-            let rig = rig(false);
+            // No slots: both agents wait in the queue and have no driver.
+            let rig = rig_with(
+                false,
+                UnitLimits {
+                    max_agents: 0,
+                    ..UnitLimits::default()
+                },
+            );
             let parent = agent(&rig);
             let child = rig
                 .hub

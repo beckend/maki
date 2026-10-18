@@ -152,6 +152,7 @@ struct Rig {
     hub: Arc<UnitHub>,
     events: flume::Receiver<Envelope>,
     dir: TempDir,
+    clock: Arc<ManualClock>,
 }
 
 fn rig(script: &Arc<Script>) -> Rig {
@@ -172,10 +173,11 @@ fn rig_with(script: &Arc<Script>, limits: UnitLimits) -> Rig {
     ctx.registry = Arc::new(registry);
     let (tx, events) = flume::unbounded::<Envelope>();
     let dir = TempDir::new().unwrap();
+    let clock = Arc::new(ManualClock::default());
     let hub = UnitHub::with_shell_options(
         limits,
         EventSender::new(tx, 0),
-        Arc::new(ManualClock::default()),
+        clock.clone(),
         ShellOptions {
             dir: Some(dir.path().to_owned()),
             ..ShellOptions::default()
@@ -190,6 +192,7 @@ fn rig_with(script: &Arc<Script>, limits: UnitLimits) -> Rig {
         hub,
         events,
         dir,
+        clock,
     }
 }
 
@@ -1438,5 +1441,118 @@ mod ack {
         assert_eq!(notices.len(), 1, "{notices:?}");
         assert!(notices[0].contains("5 messages"), "{notices:?}");
         assert_eq!(rig.hub.acks_to(main, ack.id).len(), 5);
+    }
+}
+
+mod admit {
+    use super::*;
+
+    fn one_slot() -> UnitLimits {
+        UnitLimits {
+            max_agents: 1,
+            ..UnitLimits::default()
+        }
+    }
+
+    #[test]
+    fn queued_agents_start_in_order_as_slots_free() {
+        let (open_a, gate_a) = flume::bounded::<()>(1);
+        let script = Script::new(vec![
+            ("AAA", vec![Step::Gate(gate_a, reply("a"))]),
+            ("BBB", vec![Step::Reply(reply("b"))]),
+            ("CCC", vec![Step::Reply(reply("c"))]),
+        ]);
+        let rig = rig_with(&script, one_slot());
+        let a = spawn(&rig, "AAA", json!({"one_shot": true}));
+        let b = spawn(&rig, "BBB", json!({"one_shot": true}));
+        let c = spawn(&rig, "CCC", json!({"one_shot": true}));
+        assert_eq!((a.queue_position, b.queue_position), (None, Some((1, 1))));
+        assert_eq!(c.queue_position, Some((2, 2)));
+        await_requests(&script, "AAA", 1);
+        assert_eq!(script.requests("BBB") + script.requests("CCC"), 0);
+        assert_eq!(
+            rig.hub.get(c.id).unwrap().state_label(),
+            "queued (position 2 of 2)"
+        );
+        open_a.send(()).unwrap();
+        for id in [a.id, b.id, c.id] {
+            assert_eq!(done_reason(&settle(&rig, id)), DoneReason::Completed);
+        }
+        let order = finished_order(&rig);
+        let handles: Vec<String> = [&a, &b, &c].map(|x| x.handle.to_string()).into();
+        assert_eq!(order, handles, "FIFO");
+        assert_eq!(rig.hub.slots_in_use(), 0);
+    }
+
+    #[test]
+    fn stop_queued_agent_never_requests() {
+        let script = Script::new(vec![
+            ("AAA", vec![Step::Hang]),
+            ("BBB", vec![Step::Reply(reply("b"))]),
+        ]);
+        let rig = rig_with(&script, one_slot());
+        let a = spawn(&rig, "AAA", json!({}));
+        let b = spawn(&rig, "BBB", json!({}));
+        await_requests(&script, "AAA", 1);
+        rig.hub.stop(rig.hub.main(), &[b.id], StopOpts::default());
+        assert_eq!(done_reason(&settle(&rig, b.id)), DoneReason::Killed);
+        rig.hub.stop(rig.hub.main(), &[a.id], StopOpts::default());
+        assert_eq!(done_reason(&settle(&rig, a.id)), DoneReason::Killed);
+        assert_eq!(script.requests("BBB"), 0);
+        assert_eq!(rig.hub.slots_in_use(), 0);
+    }
+
+    #[test]
+    fn timeout_counts_from_start_not_from_queueing() {
+        let (open_a, gate_a) = flume::bounded::<()>(1);
+        let script = Script::new(vec![
+            ("AAA", vec![Step::Gate(gate_a, reply("a"))]),
+            ("BBB", vec![Step::Hang]),
+        ]);
+        let rig = rig_with(&script, one_slot());
+        let a = spawn(&rig, "AAA", json!({"one_shot": true}));
+        let b = spawn(&rig, "BBB", json!({"timeout_secs": 10}));
+        await_requests(&script, "AAA", 1);
+        rig.clock.advance(Duration::from_secs(100));
+        assert_eq!(rig.hub.get(b.id).unwrap().state.label(), "queued");
+        open_a.send(()).unwrap();
+        settle(&rig, a.id);
+        await_requests(&script, "BBB", 1);
+        rig.clock.advance(Duration::from_secs(11));
+        let view = settle(&rig, b.id);
+        assert_eq!(done_reason(&view), DoneReason::TimedOut);
+        assert_eq!(rig.hub.slots_in_use(), 0);
+    }
+
+    #[test]
+    fn parent_waiting_on_queued_child_does_not_deadlock() {
+        let spawn_kid = tool_use(
+            "t1",
+            "spawn",
+            json!({"kind": "agent", "description": "kid", "name": "kid", "prompt": CHILD}),
+        );
+        let wait_kid = tool_use("t2", "wait", json!({"ids": ["kid"]}));
+        let script = Script::new(vec![
+            (
+                PARENT,
+                vec![
+                    Step::Reply(spawn_kid),
+                    Step::Reply(wait_kid),
+                    Step::Reply(reply("parent done")),
+                ],
+            ),
+            (CHILD, vec![Step::Reply(reply("kid done"))]),
+        ]);
+        let rig = rig_with(&script, one_slot());
+        let parent = spawn(&rig, PARENT, json!({}));
+        // With one slot the child can only run once the parent's wait gave it up.
+        await_requests(&script, CHILD, 1);
+        let view = settle(&rig, parent.id);
+        assert_eq!(view.result.unwrap().summary, "parent done");
+        assert_eq!(script.requests(PARENT), 3);
+        rig.hub
+            .stop(rig.hub.main(), &[parent.id], StopOpts::default());
+        settle(&rig, parent.id);
+        assert_eq!(rig.hub.slots_in_use(), 0);
     }
 }
