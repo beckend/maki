@@ -11,6 +11,7 @@ mod broker;
 pub mod clock;
 mod drive;
 pub mod inbox;
+mod journal;
 pub mod limits;
 pub mod notice;
 #[cfg(test)]
@@ -24,7 +25,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use event_listener::Event;
@@ -51,6 +52,7 @@ pub use clock::{Clock, ManualClock, SystemClock};
 pub use drive::{Joined, WakeSink};
 use inbox::{Accepted, Phase};
 pub use inbox::{DeliveryKind, Inbox, InboxItem, MessageId, SendAck};
+pub use journal::ReconcileReport;
 pub use limits::UnitLimits;
 pub use notice::{Notice, NoticeInfo, NoticeKind};
 use shell::ShellRun;
@@ -820,6 +822,10 @@ pub struct UnitHub {
     attended: AtomicBool,
     /// Prompts waiting for an answer, over all runs.
     prompts: Arc<AtomicUsize>,
+    /// Where state changes are recorded, when `[agent.runs]` is on and the
+    /// session's journal could be opened.
+    journal: OnceLock<Arc<maki_storage::runs::RunJournal>>,
+    reconciled: AtomicBool,
 }
 
 /// Messages the ping-pong guard keeps per pair before it refuses more.
@@ -864,6 +870,8 @@ impl UnitHub {
             acks: Mutex::default(),
             attended: AtomicBool::new(true),
             prompts: Arc::default(),
+            journal: OnceLock::new(),
+            reconciled: AtomicBool::new(false),
         })
     }
 
@@ -887,6 +895,9 @@ impl UnitHub {
         let events = std::mem::take(&mut table.outbox);
         drop(table);
         for envelope in events {
+            if let AgentEvent::RunStateChanged { handle, state } = &envelope.event {
+                self.jot_state(handle, state);
+            }
             let _ = self.events.send_envelope(envelope);
         }
     }
@@ -1077,6 +1088,12 @@ impl UnitHub {
         table.names.insert(name.clone(), id);
         table.children.entry(caller).or_default().push(id);
         table.order.push(id);
+        self.jot(maki_storage::runs::JournalRecord::Spawn(
+            journal::spawn_record(&unit, launch.as_ref().map(|l| l.model_spec.as_str())),
+        ));
+        if !running {
+            self.jot_state(handle.as_str(), "queued");
+        }
         table.units.insert(id, unit);
         if is_agent {
             table.pool.request(id, false);
@@ -1214,6 +1231,9 @@ impl UnitHub {
             reason: terminal.reason.as_str().to_owned(),
             detail: terminal.detail.clone(),
         };
+        self.jot(maki_storage::runs::JournalRecord::Term(
+            journal::term_record(unit.handle.as_str(), &terminal, unit.cost),
+        ));
         unit.state = UnitState::Done(Box::new(terminal));
         unit.finished_at = Some(SystemTime::now());
         unit.last_activity = self.clock.now();
@@ -1335,6 +1355,7 @@ impl UnitHub {
             && matches!(unit.state, UnitState::Running)
         {
             unit.state = UnitState::Stopping;
+            self.jot_state(unit.handle.as_str(), "stopping");
         }
     }
 
@@ -1477,6 +1498,7 @@ impl UnitHub {
                 unit.notice_policy = NoticePolicy::Never;
                 if !matches!(unit.state, UnitState::Stopping) {
                     unit.state = UnitState::Stopping;
+                    self.jot_state(unit.handle.as_str(), "stopping");
                 }
                 if let Some(run) = table.shells.get(&id) {
                     run.request_stop();
@@ -1785,6 +1807,7 @@ impl UnitHub {
         {
             return;
         }
+        let record = journal::notice_record(&info, wake, &text, "queued");
         let item = InboxItem::notice(info, text, wake, self.clock.now());
         let Some(accepted) = guard.enqueue_notice(item, self.clock.now()) else {
             return;
@@ -1794,6 +1817,7 @@ impl UnitHub {
             self.mark_running(owner);
         }
         drop(guard);
+        self.jot(maki_storage::runs::JournalRecord::Notice(record));
         inbox.signal();
         if accepted == Accepted::Wake && owner == self.main {
             self.events.try_send(AgentEvent::RunNotice { wake: true });
@@ -1867,7 +1891,7 @@ impl UnitHub {
                 *at = (*at).max(seen);
             }
         }
-        guard.remove_notices(|item| {
+        let removed = guard.remove_notices(|item| {
             claim.seqs.contains(&item.seq())
                 || item.notice.as_ref().is_some_and(|n| {
                     n.kind == NoticeKind::Settled
@@ -1877,6 +1901,13 @@ impl UnitHub {
                             .any(|&(run, seen)| run == n.run && n.generation <= seen)
                 })
         });
+        for item in &removed {
+            if let Some(info) = &item.notice {
+                self.jot(maki_storage::runs::JournalRecord::Notice(
+                    journal::notice_record(info, item.wake, "", "consumed"),
+                ));
+            }
+        }
     }
 
     /// Whether the frontend may start a turn for `main` now. True when a waking
@@ -2037,6 +2068,14 @@ impl UnitHub {
             unit.name.to_string()
         };
         let item = InboxItem::new(id, from, label, kind, text, now);
+        let to_label = if to == self.main {
+            "main".to_owned()
+        } else {
+            table
+                .units
+                .get(&to)
+                .map_or_else(String::new, |u| u.handle.to_string())
+        };
         let (inbox, state) = if to == self.main {
             if from == self.user {
                 return Err(UnitError::NotReachable);
@@ -2084,6 +2123,9 @@ impl UnitHub {
                         retry_after: inbox::PAIR_WINDOW.as_secs(),
                     });
                 }
+                self.jot(maki_storage::runs::JournalRecord::Msg(
+                    journal::message_record(&item, &to_label, "held"),
+                ));
                 pair.held.push((to, item));
                 self.ack_insert(from, id, to, AckState::Held);
                 let first = !std::mem::replace(&mut pair.notified, true);
@@ -2104,6 +2146,11 @@ impl UnitHub {
         }
         self.release(table);
         self.deliver_all(released);
+        // Queued to the writer before the enqueue, so the body is never
+        // behind the delivery that could make it redundant.
+        self.jot(maki_storage::runs::JournalRecord::Msg(
+            journal::message_record(&item, &to_label, "accepted"),
+        ));
         // Before the enqueue: a drain right after it must find the record.
         self.ack_insert(from, id, to, AckState::Accepted);
         let delivered = self.deliver(to, &inbox, item, now, true);
@@ -2274,6 +2321,14 @@ impl UnitHub {
     /// The messages are in the recipient's history for a request that went
     /// out. Notices carry no ack. Never call with an inbox lock held.
     pub fn message_delivered(&self, items: &[InboxItem], step: Option<u32>) {
+        for item in items {
+            match &item.notice {
+                Some(info) => self.jot(maki_storage::runs::JournalRecord::Notice(
+                    journal::notice_record(info, item.wake, "", "delivered"),
+                )),
+                None => self.jot_ack(item, "delivered", step, None),
+            }
+        }
         let mut acks = self.acks();
         for item in items.iter().filter(|i| i.kind != DeliveryKind::Notice) {
             acks.advance(item.from, item.id, AckState::Delivered { step });
@@ -2287,6 +2342,7 @@ impl UnitHub {
         // inbox costs its senders one line, not one per message.
         let mut groups: Vec<(UnitId, UnitId, Vec<MessageId>)> = Vec::new();
         for item in items.iter().filter(|i| i.kind != DeliveryKind::Notice) {
+            self.jot_ack(item, "dropped", None, Some(reason));
             let to = self
                 .acks()
                 .advance(item.from, item.id, AckState::Dropped(reason));
@@ -2392,6 +2448,7 @@ impl UnitHub {
                 .collect::<Vec<_>>()
         };
         shell::shutdown_groups(&pids);
+        self.journal_mark("clean_shutdown");
     }
 }
 
@@ -2466,19 +2523,36 @@ pub fn sync_registration(
 }
 
 /// The hub for one root session and the root agent's handle on it, or `None`
-/// when `[agent.runs]` is off.
+/// when `[agent.runs]` is off. A resumed session's journal is reconciled here,
+/// before the first spawn: runs the last process left unfinished become `lost`.
 pub fn start_session(
     config: &maki_config::RunsConfig,
     events: EventSender,
     session: MakiId,
     attended: bool,
 ) -> Option<RunsCtx> {
+    start_session_in(
+        config,
+        events,
+        session,
+        attended,
+        maki_storage::paths::runs_dir,
+    )
+}
+
+fn start_session_in(
+    config: &maki_config::RunsConfig,
+    events: EventSender,
+    session: MakiId,
+    attended: bool,
+    runs_dir: impl FnOnce(&str) -> std::io::Result<PathBuf>,
+) -> Option<RunsCtx> {
     config.enabled.then(|| {
-        let dir = maki_storage::paths::runs_dir(&session.to_string())
+        let dir = runs_dir(&session.to_string())
             .inspect_err(|e| tracing::warn!(%e, "run logs unavailable, keeping output in memory"))
             .ok();
         let shell = ShellOptions {
-            dir,
+            dir: dir.clone(),
             ..ShellOptions::default()
         };
         let hub = UnitHub::with_shell_options(
@@ -2488,6 +2562,18 @@ pub fn start_session(
             shell,
         );
         hub.set_attended(attended);
+        if let Some(dir) = dir {
+            match maki_storage::runs::RunJournal::open_in(dir, Default::default()) {
+                Ok(journal) => {
+                    hub.attach_journal(Arc::new(journal));
+                    let report = hub.reconcile();
+                    if !report.lost.is_empty() {
+                        tracing::info!(lost = report.lost.len(), "runs lost with the last process");
+                    }
+                }
+                Err(e) => tracing::warn!(%e, "run journal unavailable, runs are not persisted"),
+            }
+        }
         let self_run = hub.main();
         RunsCtx { hub, self_run }
     })

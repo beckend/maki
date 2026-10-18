@@ -309,6 +309,9 @@ async fn supervise(
         }
     };
     let pid = guard.id();
+    if let Some(hub) = hub.upgrade() {
+        hub.record_proc(id, pid);
+    }
 
     let ended = or(async { Ended::Exited(guard.status().await) }, async {
         Ended::Stop(
@@ -428,7 +431,7 @@ pub(super) fn shutdown_groups(pids: &[u32]) {
 }
 
 #[cfg(unix)]
-fn group_exists(pgid: u32) -> bool {
+pub(super) fn group_exists(pgid: u32) -> bool {
     use rustix::process::{Pid, test_kill_process_group};
     i32::try_from(pgid)
         .ok()
@@ -575,7 +578,7 @@ fn signal_name(sig: i32) -> String {
 }
 
 #[cfg(unix)]
-fn term_group(pid: u32) {
+pub(super) fn term_group(pid: u32) {
     use rustix::process::{Pid, Signal, kill_process_group};
     if let Some(group) = i32::try_from(pid).ok().and_then(Pid::from_raw) {
         let _ = kill_process_group(group, Signal::TERM);
