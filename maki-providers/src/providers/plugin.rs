@@ -1,9 +1,12 @@
+use std::cell::Cell;
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::iter;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, RwLock};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard, PoisonError, RwLock};
+use std::thread::{self, ThreadId};
+use std::time::Duration;
 
 use flume::Sender;
 use maki_config::host_allowed;
@@ -470,13 +473,134 @@ type AuthCell = (Option<Arc<str>>, Arc<AuthState>);
 /// there is no moment at which a reader can see a half-built registry: during
 /// a load the previous generation is still the published one.
 static PROVIDERS: LazyLock<RwLock<Arc<Registry>>> = LazyLock::new(RwLock::default);
-/// The load in progress. `Some` between [`begin_load`] and [`commit_load`],
-/// and open at process start so a host that loads plugins without driving the
-/// phases (tests, embedders) still registers.
-static STAGING: LazyLock<Mutex<Option<Registry>>> =
-    LazyLock::new(|| Mutex::new(Some(Registry::for_load())));
 /// The current owner and auth state of each slug: see [`shared_auth`].
 static AUTH: LazyLock<RwLock<HashMap<Box<str>, AuthCell>>> = LazyLock::new(RwLock::default);
+/// One load at a time. See [`begin_load`].
+static LOAD: LazyLock<LoadWindow> = LazyLock::new(LoadWindow::default);
+
+thread_local! {
+    /// The window this thread's registrations belong to. See [`Claim`].
+    static CLAIM: Cell<Claim> = const { Cell::new(Claim::None) };
+}
+
+/// Which window a thread's registrations land in: no window yet, the one a load
+/// opened, or the staging nobody opened.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Claim {
+    None,
+    /// A load: this thread opened it or staged in it, so the registrations that
+    /// follow are that load's and are refused once it publishes.
+    Load(LoadId),
+    /// Staging nobody opened, which is how a host that loads plugins without
+    /// driving the phases (tests, embedders) registers. A load that comes and
+    /// goes replaces it, so it is opened again rather than refused: such a host
+    /// is not in anybody's load and no load closes it out.
+    Implicit(LoadId),
+}
+
+impl Claim {
+    /// The window this claim names, which no window can match.
+    fn id(self) -> LoadId {
+        match self {
+            Self::None => NO_LOAD,
+            Self::Load(id) | Self::Implicit(id) => id,
+        }
+    }
+}
+
+/// A load's identity. Ids are handed out from one, so [`NO_LOAD`] is the one
+/// value no window can have.
+type LoadId = u64;
+const NO_LOAD: LoadId = 0;
+/// Where the next window's id comes from.
+static NEXT_LOAD: AtomicU64 = AtomicU64::new(NO_LOAD + 1);
+
+/// How long a load waits for the load in progress before taking its window.
+/// A load that never commits — a panic between the two phases — must not wedge
+/// every load behind it. Long enough for the load a second thread is waiting
+/// on, short enough that a wedge is a delay and not a hang.
+const LOAD_WAIT: Duration = Duration::from_secs(1);
+
+/// The registration window, and the lock that keeps a load to one.
+#[derive(Default)]
+struct LoadWindow {
+    /// `Some` between [`begin_load`] and [`commit_load`], and the staging a
+    /// host that drives no phases opens for itself.
+    open: Mutex<Option<Load>>,
+    /// Signalled whenever a load publishes, so a [`begin_load`] waiting for one
+    /// wakes instead of spinning.
+    published: Condvar,
+}
+
+struct Load {
+    id: LoadId,
+    staging: Registry,
+    /// The thread that opened the load, `None` for staging nobody opened.
+    owner: Option<ThreadId>,
+}
+
+impl LoadWindow {
+    fn open(&self) -> MutexGuard<'_, Option<Load>> {
+        self.open.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// The window a registration on this thread lands in, opening one if there is
+/// none and claiming it for good. A window a load opened is claimed as that
+/// load's, so the registrations that follow publish with it; a window nobody
+/// opened is staging of its own.
+fn claim_window(open: &mut Option<Load>, mine: Claim) -> Claim {
+    if mine != Claim::None {
+        return mine;
+    }
+    let claim = match open {
+        // A window a load opened is that load's, so what this thread registers
+        // publishes with it and is refused once the load has.
+        Some(load) if load.owner.is_some() => Claim::Load(load.id),
+        // Staging nobody opened is staging of its own.
+        Some(load) => Claim::Implicit(load.id),
+        // Nothing is staging at all, so open some.
+        none => {
+            let id = NEXT_LOAD.fetch_add(1, Ordering::Relaxed);
+            *none = Some(Load {
+                id,
+                staging: Registry::for_load(),
+                owner: None,
+            });
+            Claim::Implicit(id)
+        }
+    };
+    CLAIM.set(claim);
+    claim
+}
+
+/// Runs `stage` against the window this thread's registrations belong to.
+/// [`Err`] when a load this thread is in has since published.
+fn with_staging<R>(stage: impl FnOnce(&mut Registry) -> R) -> Result<R, ()> {
+    let mut open = LOAD.open();
+    let mine = claim_window(&mut open, CLAIM.get());
+    match open.as_mut().filter(|load| load.id == mine.id()) {
+        Some(load) => Ok(stage(&mut load.staging)),
+        // The load this thread registered into has published, so this
+        // registration belongs to a load that is over.
+        None if matches!(mine, Claim::Load(_)) => Err(()),
+        // Staging nobody opened is not a load: a load that replaced it took
+        // what was staged with it, and what comes next stages again.
+        None => {
+            claim_window(&mut open, Claim::None);
+            let load = open.as_mut().expect("staging of its own is always open");
+            Ok(stage(&mut load.staging))
+        }
+    }
+}
+
+/// The provider a `providers.toml` entry selects for `slug`, read from the
+/// window a registration on this thread would land in.
+fn selected_owner(slug: &str) -> Option<String> {
+    with_staging(|registry| registry.selected.get(slug).cloned())
+        .ok()
+        .flatten()
+}
 
 /// Opens the registration window, at the top of every plugin load.
 ///
@@ -484,8 +608,50 @@ static AUTH: LazyLock<RwLock<HashMap<Box<str>, AuthCell>>> = LazyLock::new(RwLoc
 /// replacements exist would make every reader answer "unknown provider" for as
 /// long as the load takes, so [`commit_load`] swaps the whole map in one step
 /// instead.
+///
+/// One load at a time: a load that arrives while another is open waits for it
+/// to publish rather than staging over it. Two overlapping loads used to share
+/// the one window, so the second [`begin_load`] threw away what the first had
+/// staged and the first [`commit_load`] published the second's declarations.
+/// Staging nobody opened is not a load and is replaced rather than waited on:
+/// nothing promised to commit it, so holding the window open for it would hold
+/// it for good.
 pub fn begin_load() {
-    *STAGING.lock().unwrap() = Some(Registry::for_load());
+    let me = thread::current().id();
+    let mut open = LOAD.open();
+    // The load this one is waiting on, and whether the wait is out of time. A
+    // load is only taken once the wait is out and it is still the load that was
+    // waited on, so one waiting thread takes the window rather than all of them.
+    let (mut waited_on, mut waited_out) = (NO_LOAD, false);
+    loop {
+        match open.as_ref() {
+            None => break,
+            Some(load) if load.owner == Some(me) => break,
+            Some(load) if load.owner.is_none() => break,
+            Some(load) => {
+                if waited_out && waited_on == load.id {
+                    warn!(owner = ?load.owner, "a provider load is still open; taking its registration window");
+                    break;
+                }
+                waited_on = load.id;
+            }
+        }
+        let (guard, waited) = LOAD
+            .published
+            .wait_timeout(open, LOAD_WAIT)
+            .unwrap_or_else(PoisonError::into_inner);
+        open = guard;
+        waited_out = waited.timed_out();
+    }
+    let id = NEXT_LOAD.fetch_add(1, Ordering::Relaxed);
+    *open = Some(Load {
+        id,
+        staging: Registry::for_load(),
+        owner: Some(me),
+    });
+    // A thread that opens a load is in it, so what it registers belongs to that
+    // load and is refused once the load has published.
+    CLAIM.set(Claim::Load(id));
 }
 
 /// Publishes what this load registered. A load that registered nothing
@@ -495,7 +661,22 @@ pub fn begin_load() {
 /// follow a declaration that is actually going to serve: one a failed plugin
 /// staged and [`discard`] took back never touched them.
 pub fn commit_load() {
-    let Some(staged) = STAGING.lock().unwrap().take() else {
+    let staged = {
+        let mut open = LOAD.open();
+        let claim = CLAIM.get();
+        let me = thread::current().id();
+        // Staging nobody opened is published by whoever asks for it: only the
+        // host that staged it knows when it is done, and it is not a load this
+        // thread may take over. A load is this thread's to publish if it opened
+        // it or staged in it, and nobody else's.
+        let mine = open.as_ref().is_some_and(|load| match load.owner {
+            None => true,
+            Some(owner) => owner == me || load.id == claim.id(),
+        });
+        mine.then(|| open.take()).flatten().map(|load| load.staging)
+    };
+    LOAD.published.notify_all();
+    let Some(staged) = staged else {
         return;
     };
     for entry in staged.entries.values() {
@@ -523,26 +704,32 @@ pub fn commit_load() {
 /// whose load failed after it registered, so its slugs end up where they would
 /// be had the plugin never loaded.
 pub fn discard(plugin: &str) {
-    let mut staging = STAGING.lock().unwrap();
-    let Some(staged) = staging.as_mut() else {
+    // A plugin that staged nothing has nothing to take back, and a thread that
+    // registered nothing has no window to open one in.
+    if CLAIM.get() == Claim::None {
         return;
-    };
-    let dropped: Vec<Box<str>> = staged
-        .entries
-        .iter()
-        .filter(|(_, entry)| entry.owner.as_deref() == Some(plugin))
-        .map(|(slug, _)| slug.clone())
-        .collect();
-    for slug in &dropped {
-        staged.entries.remove(slug);
     }
-    if !dropped.is_empty() {
-        debug!(plugin, slugs = ?dropped, "discarded the declarations of a failed plugin load");
-    }
+    let _ = with_staging(|registry| {
+        let dropped: Vec<Box<str>> = registry
+            .entries
+            .iter()
+            .filter(|(_, entry)| entry.owner.as_deref() == Some(plugin))
+            .map(|(slug, _)| slug.clone())
+            .collect();
+        for slug in &dropped {
+            registry.entries.remove(slug);
+        }
+        if !dropped.is_empty() {
+            debug!(plugin, slugs = ?dropped, "discarded the declarations of a failed plugin load");
+        }
+    });
 }
 
-/// Registers a declaration in the load in progress. A slug is registered once
-/// per load: a second declaration of it is [`RegisterError::DuplicateSlug`].
+/// Registers a declaration in the load in progress, or in the staging nobody
+/// opened when no load is in progress: that is how a host that loads plugins
+/// without driving the phases (tests, embedders) registers. A slug is
+/// registered once per load, and a second declaration of it that says something
+/// else is [`RegisterError::DuplicateSlug`].
 pub fn register(reg: Registration, authority: DeclAuthority) -> Result<(), RegisterError> {
     register_owned(reg, authority, None)
 }
@@ -596,32 +783,55 @@ fn register_owned(
         })?;
     }
 
-    let mut staging = STAGING.lock().unwrap();
-    let Some(staged) = staging.as_mut() else {
-        return Err(RegisterError::Closed(slug));
-    };
-    let Entry::Vacant(vacant) = staged.entries.entry(slug.as_str().into()) else {
-        return Err(RegisterError::DuplicateSlug(slug));
-    };
-    debug!(
-        slug,
-        ?authority,
-        codec = ?decl.codec,
-        base = decl.base.as_deref(),
-        models = decl.models.len(),
-        hooked_credentials = hooks.auth.is_some(),
-        "registered provider declaration"
-    );
-    vacant.insert(Arc::new(PluginEntry {
-        auth: shared_auth(&slug, owner.clone()),
-        built,
-        decl,
-        authority,
-        owner,
-        target,
-        hooks,
-    }));
-    Ok(())
+    with_staging(|staged| {
+        let entry = Arc::new(PluginEntry {
+            auth: shared_auth(&slug, owner.clone()),
+            built,
+            decl,
+            authority,
+            owner,
+            target,
+            hooks,
+        });
+        debug!(
+            slug = entry.decl.slug,
+            ?authority,
+            codec = ?entry.decl.codec,
+            base = entry.decl.base.as_deref(),
+            models = entry.decl.models.len(),
+            hooked_credentials = entry.hooks.auth.is_some(),
+            "registered provider declaration"
+        );
+        match staged.entries.entry(entry.decl.slug.as_str().into()) {
+            Entry::Vacant(vacant) => {
+                vacant.insert(entry);
+            }
+            // A second declaration of a slug that says exactly what the staged
+            // one says is that declaration, not a rival: a host that loads the
+            // same plugin again, or two hosts loading it at once, must not be a
+            // conflict. The newest one is what serves, and a declaration that
+            // differs is still [`RegisterError::DuplicateSlug`].
+            Entry::Occupied(mut occupied)
+                if occupied.get().owner == entry.owner
+                    && same_declaration(&occupied.get().decl, &entry.decl) =>
+            {
+                occupied.insert(entry);
+            }
+            Entry::Occupied(_) => {
+                return Err(RegisterError::DuplicateSlug(entry.decl.slug.clone()));
+            }
+        }
+        Ok(())
+    })
+    .map_err(|()| RegisterError::Closed(slug))?
+}
+
+/// Two declarations are one declaration when they are the same data: the JSON a
+/// spec row is built from, which is what [`spec::build`] keys its own cache on.
+fn same_declaration(one: &ProviderDecl, other: &ProviderDecl) -> bool {
+    let json =
+        |decl: &ProviderDecl| serde_json::to_string(decl).expect("a declaration is plain data");
+    json(one) == json(other)
 }
 
 fn check_owner(
@@ -641,11 +851,7 @@ fn check_owner(
     if authority == DeclAuthority::ThirdParty {
         let config = ProvidersConfig::load_or_default();
         let def = config.get(slug);
-        let selected = STAGING
-            .lock()
-            .unwrap()
-            .as_ref()
-            .and_then(|registry| registry.selected.get(slug).cloned());
+        let selected = selected_owner(slug);
         if let Some(selected) = selected {
             if owner != Some(selected.as_str()) {
                 return Err(RegisterError::SelectedOwner {
@@ -1584,6 +1790,7 @@ pub fn logout(slug: &str) -> Result<bool, AgentError> {
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::AtomicUsize;
+    use std::sync::mpsc;
     use std::time::Duration;
 
     use futures_lite::future::zip;
@@ -2095,6 +2302,111 @@ mod tests {
             AUTH.read().unwrap().contains_key(SLUG),
             "{CREDENTIALS_DROPPED}"
         );
+    }
+
+    /// One load at a time. Two overlapping loads used to share the one window,
+    /// so the second [`begin_load`] threw away what the first had staged and a
+    /// slug the first had already declared was free to be declared again.
+    #[test]
+    fn a_second_load_waits_for_the_one_in_progress() {
+        const FIRST: &str = "overlapping-first";
+        const SECOND: &str = "overlapping-second";
+        const STILL_STAGED: &str = "the load in progress must still hold what it staged";
+        /// Long enough for the other load to have reached [`begin_load`], and
+        /// only ever waited on: with the window held, the sleep changes how
+        /// long the other load waits and nothing else.
+        const REACHED_THE_WAIT: Duration = Duration::from_millis(100);
+        let (opened_tx, opened) = mpsc::channel();
+        let (proceed_tx, proceed) = mpsc::channel();
+        let (staged_tx, staged) = mpsc::channel();
+
+        let loader = thread::spawn(move || {
+            begin_load();
+            register(registration(FIRST), DeclAuthority::Bundled).unwrap();
+            opened_tx.send(()).unwrap();
+            proceed.recv().unwrap();
+            std::thread::sleep(REACHED_THE_WAIT);
+            // A different declaration of the same slug is a conflict, and is
+            // one only while this load still holds the window.
+            let mut rival = registration(FIRST);
+            rival.decl.display_name = "Another Plugin".to_owned();
+            staged_tx
+                .send(register(rival, DeclAuthority::Bundled))
+                .unwrap();
+            commit_load();
+        });
+
+        opened.recv().unwrap();
+        // This one asks for the window the load above holds, and gets it once
+        // that load has published.
+        proceed_tx.send(()).unwrap();
+        begin_load();
+        register(registration(SECOND), DeclAuthority::Bundled).unwrap();
+        commit_load();
+
+        let again = staged.recv().unwrap().unwrap_err();
+        assert!(
+            matches!(again, RegisterError::DuplicateSlug(ref slug) if slug == FIRST),
+            "{STILL_STAGED}: {again}"
+        );
+        loader.join().unwrap();
+    }
+
+    /// A host that loads plugins without driving the phases — tests, embedders
+    /// — registers into a window of its own, so loading twice, or loading
+    /// alongside another host, cannot collide with what an earlier load left
+    /// behind in a registry the whole process shares.
+    #[test]
+    fn a_host_that_drives_no_phases_can_load_more_than_once() {
+        const SLUG: &str = "phased-host-plugin";
+        let load = || {
+            let slug = SLUG.to_owned();
+            thread::spawn(move || register(registration(&slug), DeclAuthority::Bundled))
+        };
+        let hosts: Vec<_> = (0..2).map(|_| load()).collect();
+        for host in hosts {
+            host.join()
+                .unwrap()
+                .expect("a host that drives no phases still registers");
+        }
+    }
+
+    /// A slug is declared once per load, but a declaration that says what the
+    /// staged one says is that declaration: a host that loads the same plugin
+    /// twice, and two hosts loading it at once, must not be a conflict. It is
+    /// the newest that serves, since its hooks are the ones a later load built.
+    #[test]
+    fn declaring_the_same_provider_twice_is_one_declaration() {
+        const SLUG: &str = "twice-declared-plugin";
+        const NOT_TWICE: &str = "the same declaration twice is still one declaration";
+        begin_load();
+        register(registration(SLUG), DeclAuthority::Bundled).expect(NOT_TWICE);
+        register(registration(SLUG), DeclAuthority::Bundled).expect(NOT_TWICE);
+        // A declaration that says something else is still a conflict.
+        let mut rival = registration(SLUG);
+        rival.decl.display_name = "Another Plugin".to_owned();
+        let error = register(rival, DeclAuthority::Bundled).unwrap_err();
+        assert!(matches!(error, RegisterError::DuplicateSlug(_)), "{error}");
+        commit_load();
+
+        let served = entry(SLUG).expect("the slug is registered");
+        assert_eq!(served.decl.display_name, DISPLAY_NAME);
+        assert_eq!(
+            served.owner, None,
+            "the declaration that served is one of ours"
+        );
+    }
+
+    /// A plugin can only declare a provider while its own load is the one in
+    /// progress, so the order is part of the contract: a load publishes, and a
+    /// registration after it is refused rather than staged for a load that will
+    /// never publish it.
+    #[test]
+    fn a_registration_after_the_load_published_is_refused() {
+        const SLUG: &str = "after-the-load";
+        register_loaded(registration(SLUG)).unwrap();
+        let error = register(registration(SLUG), DeclAuthority::Bundled).unwrap_err();
+        assert!(matches!(error, RegisterError::Closed(_)), "{error}");
     }
 
     /// The fence behind "no synchronous path calls a plugin": every hook here
@@ -2957,6 +3269,11 @@ mod tests {
 
     fn already_registered(reg: &mut Registration) {
         register(registration(&reg.decl.slug), DeclAuthority::Bundled).unwrap();
+        // A different declaration of a slug this load staged. What it says has
+        // to differ: the same declaration again is the same declaration, and
+        // [`declaring_the_same_provider_twice_is_one_declaration`] is the test
+        // for that.
+        reg.decl.display_name = "Another Plugin".to_owned();
     }
 
     fn codec_and_base(reg: &mut Registration) {
