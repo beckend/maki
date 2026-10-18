@@ -3,6 +3,8 @@
 //! task that owns their history (`agent.rs`).
 
 pub mod agent;
+#[cfg(test)]
+mod agent_run;
 pub mod clock;
 pub mod limits;
 pub mod notice;
