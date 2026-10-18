@@ -8,6 +8,7 @@ pub(crate) mod help_modal;
 pub mod input;
 pub mod keybindings;
 pub(crate) mod list_picker;
+pub(crate) mod log_viewer;
 pub(crate) mod login_picker;
 pub(crate) mod lua_float;
 pub(crate) mod mcp_picker;

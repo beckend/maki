@@ -978,18 +978,22 @@ mod tests {
         maki_agent::runs::RunsCtx { hub, self_run }
     }
 
-    #[test]
-    fn deliver_to_run_refuses_an_unknown_run() {
+    #[tokio::test]
+    async fn deliver_to_run_refuses_an_unknown_run() {
         let runs = test_hub();
-        let err = smol::block_on(deliver_to_run(&runs, None, "ag-nope", "hi".into()));
+        let err = deliver_to_run(&runs, None, "ag-nope", "hi".into()).await;
         assert!(err.is_err());
     }
 
-    #[test]
-    fn deliver_to_run_does_not_route_the_user_to_main() {
+    #[tokio::test]
+    async fn deliver_to_run_does_not_route_the_user_to_main() {
         let runs = test_hub();
         let inbox = runs.hub.inbox_of(runs.hub.main()).unwrap();
-        assert!(smol::block_on(deliver_to_run(&runs, None, "main", "hi".into())).is_err());
+        assert!(
+            deliver_to_run(&runs, None, "main", "hi".into())
+                .await
+                .is_err()
+        );
         assert!(inbox.is_empty());
     }
 }
