@@ -4432,6 +4432,52 @@ pub(crate) struct LuaThread {
     pub key_lint: KeyLint,
 }
 
+/// How often a blocked caller re-checks that the host still exists.
+const REPLY_POLL: Duration = Duration::from_millis(100);
+
+/// Waits for a reply to a request sent on `tx`. A request that slips into
+/// the queue as the Lua thread shuts down is never answered, and its reply
+/// sender lives on inside the queue, so a plain `recv` would hang. The
+/// channel reports disconnected once the thread drops its receivers, so
+/// polling that turns the stranded wait into an error.
+pub(crate) fn recv_reply<T>(
+    rx: &flume::Receiver<T>,
+    tx: &flume::Sender<Request>,
+) -> Result<T, flume::RecvError> {
+    loop {
+        match rx.recv_timeout(REPLY_POLL) {
+            Ok(v) => return Ok(v),
+            Err(flume::RecvTimeoutError::Disconnected) => {
+                return Err(flume::RecvError::Disconnected);
+            }
+            Err(flume::RecvTimeoutError::Timeout) if tx.is_disconnected() => {
+                return rx.try_recv().map_err(|_| flume::RecvError::Disconnected);
+            }
+            Err(flume::RecvTimeoutError::Timeout) => {}
+        }
+    }
+}
+
+/// Async twin of [`recv_reply`].
+pub(crate) async fn recv_reply_async<T>(
+    rx: &flume::Receiver<T>,
+    tx: &flume::Sender<Request>,
+) -> Result<T, flume::RecvError> {
+    loop {
+        let tick = async {
+            smol::Timer::after(REPLY_POLL).await;
+            None
+        };
+        match futures_lite::future::or(async { Some(rx.recv_async().await) }, tick).await {
+            Some(r) => return r,
+            None if tx.is_disconnected() => {
+                return rx.try_recv().map_err(|_| flume::RecvError::Disconnected);
+            }
+            None => {}
+        }
+    }
+}
+
 /// Lua lives on its own OS thread (no Send needed). `smol::block_on`
 /// drives async, load/clear requests wait for in-flight tools.
 pub fn spawn(
@@ -6681,6 +6727,20 @@ mod tests {
         let result = timed_loop(&lua).call::<bool>(());
 
         assert!(result.unwrap());
+    }
+    #[test]
+    fn reply_wait_errors_when_request_stranded_by_shutdown() {
+        let (tx, rx) = flume::unbounded::<Request>();
+        let (reply, reply_rx) = flume::bounded(1);
+        // Lands after the thread's last drain but before it drops its receiver.
+        tx.send(Request::CollectPromptSlots { reply }).unwrap();
+        drop(rx);
+        // The queue keeps the message and its reply sender alive.
+        assert!(!reply_rx.is_disconnected());
+        assert!(recv_reply(&reply_rx, &tx).is_err());
+        let (reply, reply_rx) = flume::bounded::<()>(1);
+        let _keep = reply;
+        assert!(smol::block_on(recv_reply_async(&reply_rx, &tx)).is_err());
     }
 
     #[test]
