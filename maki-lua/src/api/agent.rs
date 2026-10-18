@@ -1358,6 +1358,7 @@ impl SessionState {
         }
         self.closed = true;
         self.stream_guard.take();
+        self.params.mailbox = None;
         self.cancellation.cancel();
         let usage = self.params.ledger.totals().usage;
         let messages = std::mem::replace(&mut self.history, History::new(Vec::new())).into_vec();
@@ -2082,6 +2083,24 @@ mod tests {
             Err(not_live(id)),
             "a dropped handle must unregister its id"
         );
+    }
+
+    /// `close` is the plugin's way to say it is done, so the id must stop
+    /// answering at once, not whenever the GC finalises the handle.
+    #[test]
+    fn a_closed_subagent_stops_being_addressable() {
+        let lua = Lua::new();
+        let ctx = stub_ctx_with(&AgentMode::Build, None, Some(PARENT_ID));
+        smol::block_on(async {
+            let sess = native_session(&lua, &ctx).await;
+            let id: MakiId = session_id(&lua, &sess.borrow::<LuaSession>().unwrap())
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert!(notify(id).is_ok());
+            close(lua.clone(), sess.borrow().unwrap()).await.unwrap();
+            assert_eq!(notify(id).map_err(|e| e.to_string()), Err(not_live(id)));
+        });
     }
 
     /// The id is for messaging only. `AgentParams.session_id` stays the
