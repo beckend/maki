@@ -125,6 +125,20 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         plugin_access: PluginAccess::Open,
     },
     BuiltinCommand {
+        name: "/runs",
+        description: "List background runs and open their tabs",
+        max_args: 0,
+        bang: false,
+        plugin_access: PluginAccess::Open,
+    },
+    BuiltinCommand {
+        name: "/stop",
+        description: "Stop a background run by name or handle, or all of them",
+        max_args: 1,
+        bang: false,
+        plugin_access: PluginAccess::Open,
+    },
+    BuiltinCommand {
         name: "/login",
         description: "Authenticate with an LLM provider",
         max_args: 0,

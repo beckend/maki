@@ -281,6 +281,23 @@ impl PermissionPrompt {
         self.queue.front().and_then(|r| r.label.as_deref())
     }
 
+    /// Handles of the background runs that have an ask waiting, on screen or
+    /// not. Drives the `!` badge and the `/runs` rows.
+    pub(crate) fn waiting_runs(&self) -> Vec<&str> {
+        let mut out: Vec<&str> = Vec::new();
+        for handle in self
+            .queue
+            .iter()
+            .filter_map(|r| r.subagent_id.as_deref())
+            .filter(|s| s.starts_with("ag-"))
+        {
+            if !out.contains(&handle) {
+                out.push(handle);
+            }
+        }
+        out
+    }
+
     pub(crate) fn tool(&self) -> Option<&ToolKey> {
         self.queue.front().map(|request| &request.tool)
     }

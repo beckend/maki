@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
+use maki_agent::AgentEvent;
 use maki_agent::permissions::PermissionManager;
 use maki_agent::session::Resumed;
 use maki_agent::{
@@ -130,6 +131,45 @@ impl AgentHandles {
             return;
         }
         self.subagent_cancels.cancel(tool_use_id);
+    }
+
+    /// `/stop`: a handle or name stops that run and what it started, `all`
+    /// every live run. Fire and forget, like the stop an Esc in the tab does.
+    pub(crate) fn stop_runs(&self, target: &str) {
+        let Some(runs) = self.mailbox.seed().and_then(|seed| seed.runs.clone()) else {
+            return;
+        };
+        let hub = &runs.hub;
+        let ids: Vec<_> = if target == "all" {
+            hub.list(hub.main(), maki_agent::runs::Scope::Children)
+                .into_iter()
+                .filter(|v| !v.state.is_done())
+                .map(|v| v.id)
+                .collect()
+        } else {
+            hub.resolve(hub.main(), target).into_iter().collect()
+        };
+        hub.stop(hub.main(), &ids, maki_agent::runs::StopOpts::default());
+    }
+
+    /// Text typed in a native run's tab: a steer from the user, after bringing
+    /// a finished run back from its transcript when it is not live. The work
+    /// is async (transcript and launch), so it runs detached and reports a
+    /// refusal as a notice in the main chat.
+    pub(crate) fn send_to_run(&self, handle: String, text: String) {
+        let Some(runs) = self.mailbox.seed().and_then(|seed| seed.runs.clone()) else {
+            return;
+        };
+        let seed = self.mailbox.seed();
+        let events = maki_agent::EventSender::new(self.agent_tx.clone(), 0);
+        smol::spawn(async move {
+            if let Err(e) = deliver_to_run(&runs, seed.as_deref(), &handle, text).await {
+                events.try_send(AgentEvent::Notice {
+                    text: format!("could not message {handle}: {e}"),
+                });
+            }
+        })
+        .detach();
     }
 
     /// Respawn or shutdown: this loop is done, whatever it was in the middle of.
@@ -310,6 +350,36 @@ fn spawn_agent_internal(
         mailbox,
         task,
     }
+}
+
+/// One message from the user to a run, reviving it first when it is finished.
+async fn deliver_to_run(
+    runs: &maki_agent::runs::RunsCtx,
+    seed: Option<&maki_agent::AgentSeed>,
+    handle: &str,
+    text: String,
+) -> Result<(), String> {
+    use maki_agent::runs::{AgentLaunch, DeliveryKind};
+    let hub = &runs.hub;
+    let user = hub.user();
+    let to = hub.resolve(hub.main(), handle).map_err(|e| e.to_string())?;
+    let kind = DeliveryKind::Steer;
+    let Some(plan) = hub.revive_plan(user, to).map_err(|e| e.to_string())? else {
+        return hub
+            .send(user, to, text, kind)
+            .map(|_| ())
+            .map_err(|e| e.to_string());
+    };
+    let seed = seed.ok_or("the session has no live agent")?;
+    let (loader, name) = (Arc::clone(hub), plan.handle.to_string());
+    let transcript = smol::unblock(move || loader.load_transcript(&name))
+        .await
+        .ok_or("its transcript is gone")?;
+    let ctx = seed.tool_context(maki_agent::CancelToken::none());
+    let launch = AgentLaunch::prepare(&ctx, &plan.spec).await?;
+    hub.revive(user, plan, launch, transcript, text, kind)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 #[cfg(test)]

@@ -63,6 +63,9 @@ pub struct StatusBarContext<'a> {
     pub restricted: bool,
     pub yolo: bool,
     pub restoring: bool,
+    /// `runs 3 running 1 queued !`, `None` while no native run has anything
+    /// to report.
+    pub runs: Option<String>,
 }
 
 pub struct StatusBar {
@@ -194,6 +197,15 @@ impl StatusBar {
                 format!(" [{name}]"),
                 theme::current().status_dim,
             ));
+        }
+
+        if let Some(runs) = &ctx.runs {
+            let style = if runs.ends_with(" !") {
+                theme::current().status_notice
+            } else {
+                theme::current().status_dim
+            };
+            left_spans.push(Span::styled(format!(" [{runs}]"), style));
         }
 
         if !ctx.auto_scroll {
@@ -504,6 +516,7 @@ mod tests {
             restricted: false,
             yolo,
             restoring: false,
+            runs: None,
         }
     }
 
