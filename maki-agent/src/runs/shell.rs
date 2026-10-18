@@ -877,7 +877,13 @@ mod tests {
         let first = rig.hub.stop(main, &[id], Default::default());
         let again = rig.hub.stop(main, &[id], Default::default());
         assert!(matches!(first[0].status, Ok(StopStatus::Requested)));
-        assert!(matches!(again[0].status, Ok(StopStatus::Requested)));
+        // The shell may already have died of the first SIGTERM on a busy host.
+        assert!(
+            matches!(&again[0].status, Ok(StopStatus::Requested))
+                || matches!(&again[0].status, Ok(StopStatus::AlreadyFinished(s)) if s == "killed"),
+            "{:?}",
+            again[0].status
+        );
         let t = finished(&rig, id);
         assert_eq!(t.reason, DoneReason::Killed);
         let after = rig.hub.stop(main, &[id], Default::default());
