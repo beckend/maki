@@ -102,11 +102,12 @@ impl Lines {
     pub(super) fn feed(&mut self, data: &[u8]) -> Vec<String> {
         let mut out = Vec::new();
         for &b in data {
-            if b == b'\n' || self.partial.len() >= MAX_LINE_BYTES {
+            if b == b'\n' {
                 out.push(self.take());
-                if b == b'\n' {
-                    continue;
-                }
+                continue;
+            }
+            if self.partial.len() >= MAX_LINE_BYTES {
+                out.push(self.take());
             }
             self.partial.push(b);
         }
@@ -195,6 +196,14 @@ impl Watch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exact_cap_line_has_no_empty_tail() {
+        let mut l = Lines::default();
+        let mut data = vec![b'a'; MAX_LINE_BYTES];
+        data.push(b'\n');
+        assert_eq!(l.feed(&data).len(), 1);
+    }
 
     fn s(n: u64) -> Duration {
         Duration::from_secs(n)
