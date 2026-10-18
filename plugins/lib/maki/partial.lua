@@ -40,4 +40,24 @@ function M.cut(view, out, reason, timeout_secs, started_at)
   }
 end
 
+
+local PROMOTED_FMT = "[timed out after %ds; still running as %s, use wait or runs to follow it; %s]"
+
+--- Like `cut` for a timed-out command that was handed to the run hub instead
+--- of being killed. Not an error: the process is alive and owns {handle}.
+function M.promoted(view, out, handle, timeout_secs)
+  local marker = PROMOTED_FMT:format(timeout_secs, handle, out ~= "" and SOME_OUTPUT or NO_OUTPUT)
+  if out == "" then
+    view:clear()
+  end
+  view:append({ { marker, "dim" } })
+  view:finish()
+
+  return {
+    llm_output = (out ~= "" and out .. "\n" or "") .. marker,
+    is_error = false,
+    body = view.buf,
+  }
+end
+
 return M

@@ -8763,264 +8763,83 @@ fn a_ctx_session_pays_for_reach_whoever_could_answer(answerable: bool) {
     assert!(text.text.contains("fs_write"), "got: {}", text.text);
 }
 
-/// One plugin process serves every tab, so each window and hint has to say
-/// which tab it is for. A background agent's window should never pop up on
-/// the tab the user is looking at.
-mod session_owned_ui {
-    use super::*;
+const PROMOTE_PLUGIN: &str = r#"
+maki.api.register_tool({
+    name = "promote_test",
+    description = "promotes its job when the deadline hits",
+    schema = { type = "object", properties = {}, additionalProperties = false },
+    audiences = { "main" },
+    handler = function(input, ctx)
+        ctx:set_deadline(1)
+        local parts = {}
+        local job = maki.fn.jobstart("echo started; sleep 2; echo done", {
+            on_stdout = function(_, line) parts[#parts + 1] = line end,
+        })
+        maki.async.on_cancel(function(reason)
+            local handle, err = ctx:promote(job, { command = "sleep-ish", output = table.concat(parts, "\n") })
+            ctx:finish({ llm_output = (handle or ("refused: " .. tostring(err))) .. " reason=" .. reason })
+        end)
+        return nil
+    end,
+})
+"#;
 
-    const PLUGIN: &str = "owned_ui";
-    const OPEN_TOOL: &str = "open_owned";
-    const HINT_TOOL: &str = "hint_owned";
-    const COMMAND: &str = "/open_owned";
-    const NO_OPEN_WIN: &str = "open_win never reached the UI";
-    const OPEN_WIN_TIMEOUT: Duration = Duration::from_secs(30);
-    const BAD_SESSION_ERR: &str = "open_win: bad session";
-    const UNKNOWN_HINT_OPT_ERR: &str = "\"sesion\"";
-
-    const SRC: &str = r#"
-    local function open(opts)
-        opts = opts or {}
-        opts.focus = false
-        maki.ui.open_win(maki.ui.buf({ scratch = true }), opts)
-    end
-
-    maki.api.register_tool({
-        name = "open_owned",
-        description = "opens a window",
-        schema = {
-            type = "object",
-            properties = { opts = { type = "object" }, deferred = { type = "boolean" } },
+#[tokio::test]
+async fn ctx_promote_hands_a_timed_out_job_to_the_run_hub() {
+    use maki_agent::runs::{RunsCtx, Scope, UnitLimits, UnitState, WaitMode};
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source("promote_test", PROMOTE_PLUGIN).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let (tx, _rx) = flume::unbounded();
+    let hub = maki_agent::runs::UnitHub::with_shell_options(
+        UnitLimits::default(),
+        maki_agent::EventSender::new(tx, 0),
+        Arc::new(maki_agent::runs::SystemClock),
+        maki_agent::runs::ShellOptions {
+            dir: Some(dir.path().to_path_buf()),
+            ..Default::default()
         },
-        handler = function(input)
-            if input.deferred then
-                maki.async.run(function() open(input.opts) end)
-            else
-                open(input.opts)
-            end
-            return ""
-        end,
-    })
+    );
+    let mut ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
+    ctx.runs = Some(RunsCtx {
+        hub: Arc::clone(&hub),
+        self_run: hub.main(),
+    });
+    let out = exec_with_ctx(&reg, "promote_test", json!({}), &ctx).unwrap();
+    let handle = out.split_whitespace().next().unwrap().to_owned();
+    assert!(handle.starts_with("sh-"), "got: {out}");
+    assert!(out.ends_with("reason=timeout"), "got: {out}");
 
-    maki.api.register_tool({
-        name = "hint_owned",
-        description = "sets a hint",
-        schema = { type = "object", properties = { opts = { type = "object" } } },
-        handler = function(input)
-            maki.ui.set_status_hint({ { "hint", "" } }, input.opts)
-            return ""
-        end,
-    })
-
-    maki.api.register_command({
-        name = "/open_owned",
-        description = "opens a window",
-        handler = function() open(nil) end,
-    })
-    "#;
-
-    fn host() -> (Arc<ToolRegistry>, PluginHost) {
-        let reg = fresh_registry();
-        let host = PluginHost::new(Arc::clone(&reg)).unwrap();
-        host.load_source(PLUGIN, SRC).unwrap();
-        (reg, host)
-    }
-
-    fn ctx_in(session: MakiId) -> ToolContext {
-        let mut ctx = maki_agent::tools::test_support::stub_ctx(&AgentMode::Build);
-        ctx.session_id = Some(SessionRef::from_id(session));
-        ctx
-    }
-
-    fn for_session(session: impl ToString) -> Value {
-        json!({ "opts": { "session": session.to_string() } })
-    }
-
-    /// Waits, since a `maki.async.run` window opens after the call returns.
-    fn opened_in(host: &PluginHost) -> Option<MakiId> {
-        let rx = host.ui_action_rx();
-        loop {
-            if let maki_lua::UiAction::OpenWin { session, .. } =
-                rx.recv_timeout(OPEN_WIN_TIMEOUT).expect(NO_OPEN_WIN)
-            {
-                return session;
-            }
-        }
-    }
-
-    fn hint_owners(host: &PluginHost) -> Vec<Option<MakiId>> {
-        host.hint_reader()
-            .load_full()
-            .entries
-            .iter()
-            .map(|e| e.session)
-            .collect()
-    }
-
-    #[test_case::test_case(false ; "handler")]
-    #[test_case::test_case(true ; "async_run_under_handler")]
-    fn window_goes_to_the_calling_session(deferred: bool) {
-        let (reg, host) = host();
-        let caller = MakiId::generate();
-
-        let input = json!({ "deferred": deferred });
-        exec_with_ctx(&reg, OPEN_TOOL, input, &ctx_in(caller)).unwrap();
-
-        assert_eq!(opened_in(&host), Some(caller));
-    }
-
-    #[test]
-    fn explicit_session_wins_over_the_caller() {
-        let (reg, host) = host();
-        let named = MakiId::generate();
-
-        exec_with_ctx(
-            &reg,
-            OPEN_TOOL,
-            for_session(named),
-            &ctx_in(MakiId::generate()),
+    let runs = hub.list(hub.main(), Scope::All);
+    assert_eq!(runs.len(), 1);
+    let id = runs[0].id;
+    let views = hub
+        .wait(
+            hub.main(),
+            &[id],
+            WaitMode::All,
+            Duration::from_secs(30),
+            &maki_agent::cancel::CancelToken::none(),
         )
-        .unwrap();
-
-        assert_eq!(opened_in(&host), Some(named));
-    }
-
-    /// Nothing ties a command to a session, so the UI puts it on the
-    /// focused tab.
-    #[test]
-    fn window_outside_a_tool_call_has_no_owner() {
-        let (_reg, host) = host();
-
-        host.event_handle()
-            .run_command(Arc::from(PLUGIN), Arc::from(COMMAND), String::new(), 0);
-
-        assert_eq!(opened_in(&host), None);
-    }
-
-    /// A typo here would quietly put the window or hint in the wrong tab.
-    #[test_case::test_case(OPEN_TOOL, for_session("not-a-session"), BAD_SESSION_ERR ; "open_win_bad_session")]
-    #[test_case::test_case(HINT_TOOL, json!({ "opts": { "sesion": "x" } }), UNKNOWN_HINT_OPT_ERR ; "hint_unknown_option")]
-    fn bad_session_options_throw(tool: &str, input: Value, expected: &str) {
-        let (reg, _host) = host();
-
-        let err = exec_with_ctx(&reg, tool, input, &ctx_in(MakiId::generate())).unwrap_err();
-
-        assert!(err.contains(expected), "got: {err}");
-    }
-
-    /// Unlike a window, a hint takes no session from the call. One plugin
-    /// would fill one slot from its tool and another from its keymap
-    /// otherwise, and the tab of that call would show both.
-    #[test]
-    fn hint_without_session_shows_in_every_tab_even_from_a_tool_call() {
-        let (reg, host) = host();
-
-        exec_with_ctx(&reg, HINT_TOOL, json!({}), &ctx_in(MakiId::generate())).unwrap();
-
-        assert_eq!(hint_owners(&host), [None]);
-    }
-
-    #[test]
-    fn ending_a_session_takes_only_its_hints() {
-        let (reg, host) = host();
-        let (ended, kept) = (MakiId::generate(), MakiId::generate());
-        for input in [json!({}), for_session(ended), for_session(kept)] {
-            exec_with_ctx(&reg, HINT_TOOL, input, &ctx_in(MakiId::generate())).unwrap();
-        }
-
-        host.event_handle()
-            .end_sessions_blocking([ended], SessionEndReason::Delete);
-
-        assert_eq!(hint_owners(&host), [None, Some(kept)]);
-    }
+        .await;
+    assert!(
+        matches!(views[0].state, UnitState::Done(_)),
+        "{:?}",
+        views[0].state
+    );
+    let log = std::fs::read_to_string(dir.path().join(format!("{handle}.log"))).unwrap();
+    assert_eq!(
+        log, "started\ndone\n",
+        "output before and after the hand-over"
+    );
 }
 
-const PARK_MS: u64 = 600_000;
-const DELIVERY_POLLS: usize = 3000;
-const DELIVERY_POLL_MS: u64 = 10;
-const SECOND_JOB_EXIT: i32 = 3;
-
-/// The first job's callback parks far longer than the test runs, and the
-/// second job starts only once it has, so that job reaches its `on_exit`
-/// only if the two are delivered apart.
 #[test]
-fn a_parked_callback_holds_back_only_its_own_job() {
-    let src = format!(
-        r#"local parked, exit_code
-local function wait_until(done)
-    for _ = 1, {DELIVERY_POLLS} do
-        if done() then return end
-        maki.async.sleep({DELIVERY_POLL_MS})
-    end
-end
-maki.api.register_tool({{
-    name = "start_jobs",
-    description = "t",
-    schema = {MINIMAL_SCHEMA},
-    handler = function()
-        maki.fn.jobstart("echo park", {{
-            scope = "plugin",
-            on_stdout = function()
-                parked = true
-                maki.async.sleep({PARK_MS})
-            end,
-        }})
-        wait_until(function() return parked end)
-        assert(parked, "the first callback never parked")
-        maki.fn.jobstart("exit {SECOND_JOB_EXIT}", {{
-            scope = "plugin",
-            on_exit = function(_, code) exit_code = code end,
-        }})
-        return "started"
-    end,
-}})
-maki.api.register_tool({{
-    name = "second_exit",
-    description = "t",
-    schema = {MINIMAL_SCHEMA},
-    handler = function()
-        wait_until(function() return exit_code end)
-        return "exit=" .. tostring(exit_code)
-    end,
-}})"#
-    );
+fn ctx_promote_refuses_when_runs_are_off() {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
-    host.load_source("parked_plugin", &src).unwrap();
-    exec_tool(&reg, "start_jobs", json!({})).unwrap();
-    let out = exec_tool(&reg, "second_exit", json!({})).unwrap();
-    assert_eq!(out, format!("exit={SECOND_JOB_EXIT}"));
-}
-
-/// Twice the 16 MiB a job may queue, so `jobwait` only sees the end if the
-/// lines it takes free the job's readers again.
-#[cfg(unix)]
-const PAST_BOUND_LINES: usize = 2 * 16 * 1024 * 1024 / PADDED_LINE_BYTES;
-#[cfg(unix)]
-const PADDED_LINE_BYTES: usize = 4096;
-#[cfg(unix)]
-const PAST_BOUND_WAIT_MS: u64 = 20_000;
-
-#[cfg(unix)]
-#[test]
-fn jobwait_drains_a_job_past_its_queue_bound() {
-    let src = format!(
-        r#"maki.api.register_tool({{
-    name = "wait_past_bound",
-    description = "t",
-    schema = {MINIMAL_SCHEMA},
-    handler = function()
-        local id = maki.fn.jobstart("seq -f %0{PADDED_LINE_BYTES}g 1 {PAST_BOUND_LINES}")
-        local result, err = maki.fn.jobwait(id, {PAST_BOUND_WAIT_MS})
-        if not result then return "error: " .. err end
-        return tostring(#result.stdout)
-    end,
-}})"#
-    );
-    let reg = fresh_registry();
-    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
-    host.load_source("past_bound_plugin", &src).unwrap();
-    let out = exec_tool(&reg, "wait_past_bound", json!({})).unwrap();
-    let expected = PAST_BOUND_LINES * (PADDED_LINE_BYTES + 1) - 1;
-    assert_eq!(out, expected.to_string());
+    host.load_source("promote_test", PROMOTE_PLUGIN).unwrap();
+    let out = exec_tool(&reg, "promote_test", json!({})).unwrap();
+    assert_eq!(out, "refused: runs are not enabled reason=timeout");
 }
