@@ -1263,7 +1263,7 @@ mod ack {
             ("PARENT-A", vec![Step::Hang]),
             ("CHILD-B", vec![Step::Hang]),
         ]);
-        let (rig, a, b) = super::hub::pair(&script).await;
+        let (rig, a, b) = super::hub::pair(&script).await.await;
         await_requests(&script, "PARENT-A", 1).await;
         await_requests(&script, "CHILD-B", 1).await;
         for n in 0..crate::runs::inbox::PAIR_BURST {
@@ -2067,13 +2067,13 @@ mod perm {
     }
 
     #[tokio::test]
-    async fn headless_inherit_yolo_allows() {
-        use UnattendedMode::{Deny, InheritYolo};
+    async fn headless_allow_under_yolo_allows() {
+        use UnattendedMode::{AllowUnderYolo, Deny};
         assert_eq!(
-            unattended_answer(InheritYolo, true),
+            unattended_answer(AllowUnderYolo, true),
             PermissionAnswer::AllowOnce
         );
-        for (mode, yolo) in [(Deny, true), (Deny, false), (InheritYolo, false)] {
+        for (mode, yolo) in [(Deny, true), (Deny, false), (AllowUnderYolo, false)] {
             assert!(
                 matches!(
                     unattended_answer(mode, yolo),
