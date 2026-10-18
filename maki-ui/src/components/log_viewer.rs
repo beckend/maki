@@ -35,6 +35,9 @@ pub(crate) struct LogViewer {
     lines: Vec<String>,
     /// The last line has no newline yet.
     partial: bool,
+    /// Raw bytes of that unfinished line, so a character split across two
+    /// polls is decoded whole.
+    tail: Vec<u8>,
     scroll: ModalScroll,
 }
 
@@ -47,6 +50,7 @@ impl LogViewer {
             offset: 0,
             lines: Vec::new(),
             partial: false,
+            tail: Vec::new(),
             scroll: ModalScroll::new(),
         }
     }
@@ -58,6 +62,7 @@ impl LogViewer {
         self.path = path;
         self.lines.clear();
         self.partial = false;
+        self.tail.clear();
         self.scroll = ModalScroll::new();
         _ = self.poll();
     }
@@ -84,11 +89,16 @@ impl LogViewer {
         let Some(path) = &self.path else {
             return Dirty::NO;
         };
-        let Some((chunk, next)) = read_from(path, self.offset) else {
+        let Some((chunk, next, restarted)) = read_from(path, self.offset) else {
             return Dirty::NO;
         };
-        if next == self.offset {
+        if next == self.offset && !restarted {
             return Dirty::NO;
+        }
+        if restarted {
+            self.lines.clear();
+            self.tail.clear();
+            self.partial = false;
         }
         self.offset = next;
         self.append(&chunk);
@@ -96,20 +106,22 @@ impl LogViewer {
     }
 
     fn append(&mut self, chunk: &[u8]) {
-        let text = String::from_utf8_lossy(chunk);
-        let mut parts = text.split('\n');
-        let first = parts.next().unwrap_or("");
-        match self.lines.last_mut() {
-            Some(last) if self.partial => last.push_str(first),
-            _ => self.lines.push(first.to_owned()),
-        }
-        for part in parts {
-            self.lines.push(part.to_owned());
-        }
-        // `split` leaves an empty tail after a final newline: that is no line.
-        self.partial = !text.ends_with('\n');
-        if !self.partial {
+        if self.partial {
             self.lines.pop();
+        }
+        self.tail.extend_from_slice(chunk);
+        let mut start = 0;
+        while let Some(nl) = self.tail[start..].iter().position(|&b| b == b'\n') {
+            let end = start + nl;
+            self.lines
+                .push(String::from_utf8_lossy(&self.tail[start..end]).into_owned());
+            start = end + 1;
+        }
+        self.tail.drain(..start);
+        self.partial = !self.tail.is_empty();
+        if self.partial {
+            self.lines
+                .push(String::from_utf8_lossy(&self.tail).into_owned());
         }
         let over = self.lines.len().saturating_sub(MAX_LINES);
         if over > 0 {
@@ -191,15 +203,16 @@ fn initial_offset(path: &Path) -> u64 {
 
 /// Up to [`POLL_BYTES`] from `offset`, with the offset after them. A file
 /// that shrank is read again from the start.
-fn read_from(path: &Path, offset: u64) -> Option<(Vec<u8>, u64)> {
+fn read_from(path: &Path, offset: u64) -> Option<(Vec<u8>, u64, bool)> {
     let mut file = File::open(path).ok()?;
     let len = file.metadata().ok()?.len();
-    let from = if len < offset { 0 } else { offset };
+    let restarted = len < offset;
+    let from = if restarted { 0 } else { offset };
     file.seek(SeekFrom::Start(from)).ok()?;
     let mut chunk = Vec::new();
     file.take(POLL_BYTES).read_to_end(&mut chunk).ok()?;
     let next = from + chunk.len() as u64;
-    Some((chunk, next))
+    Some((chunk, next, restarted))
 }
 
 impl Overlay for LogViewer {
@@ -290,6 +303,29 @@ mod tests {
         v.open("sh-4", Some(path.clone()));
         std::fs::write(&path, "b\n").unwrap();
         assert!(v.poll().take());
-        assert_eq!(v.lines().last().unwrap(), "b");
+        assert_eq!(v.lines(), ["b"]);
+    }
+
+    #[test]
+    fn multibyte_char_split_across_polls_is_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sh-5.log");
+        let bytes = "é\n".as_bytes();
+        std::fs::write(&path, &bytes[..1]).unwrap();
+        let mut v = LogViewer::new();
+        v.open("sh-5", Some(path.clone()));
+        std::fs::write(&path, bytes).unwrap();
+        assert!(v.poll().take());
+        assert_eq!(v.lines(), ["é"]);
+    }
+
+    #[test]
+    fn non_utf8_bytes_are_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sh-6.log");
+        std::fs::write(&path, b"a\xffb\n").unwrap();
+        let mut v = LogViewer::new();
+        v.open("sh-6", Some(path));
+        assert_eq!(v.lines(), ["a\u{fffd}b"]);
     }
 }
