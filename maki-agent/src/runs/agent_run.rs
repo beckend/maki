@@ -3000,12 +3000,19 @@ mod chaos {
         let ack = spawn(&rig, CHILD, json!({}));
         await_requests(&script, CHILD, 1);
         rig.hub.stop(rig.hub.main(), &[ack.id], StopOpts::default());
-        // The runner is stuck inside the provider call, so the stop leaves the
-        // run `stopping`. smol's global executor has one thread by default and
-        // the stuck runner holds it, so the watch timer cannot run here; call
-        // the force settle it would call (the timer wiring is `stop`'s one line).
+        // The runner is stuck inside the provider call and holds a thread, so
+        // the stop leaves the run `stopping`. The real timer (on its own
+        // thread) must still fire once the clock passes the deadline.
         assert_eq!(rig.hub.get(ack.id).unwrap().state.label(), "stopping");
-        rig.hub.force_settle(ack.id);
+        let started = std::time::Instant::now();
+        while rig.hub.get(ack.id).unwrap().state.label() == "stopping" {
+            rig.clock.advance(Duration::from_secs(6));
+            assert!(
+                started.elapsed() < Duration::from_secs(20),
+                "timer never fired"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
         let view = rig.hub.get(ack.id).unwrap();
         let UnitState::Done(term) = &view.state else {
             unreachable!()
