@@ -812,7 +812,12 @@ mod hub {
     }
 
     fn siblings(on: bool) -> (Rig, UnitId, UnitId) {
-        let script = Script::new(vec![("SIB-A", vec![]), ("SIB-B", vec![])]);
+        // Hung in their first request: a running child would drain its inbox
+        // under the test.
+        let script = Script::new(vec![
+            ("SIB-A", vec![Step::Hang]),
+            ("SIB-B", vec![Step::Hang]),
+        ]);
         let rig = rig_with(
             &script,
             UnitLimits {
@@ -822,6 +827,8 @@ mod hub {
         );
         let a = spawn(&rig, "SIB-A", json!({"name": "alpha"}));
         let b = spawn(&rig, "SIB-B", json!({"name": "beta"}));
+        await_requests(&script, "SIB-A", 1);
+        await_requests(&script, "SIB-B", 1);
         (rig, a.id, b.id)
     }
 
@@ -848,17 +855,15 @@ mod hub {
             let from_to = if n % 2 == 0 { (a, b) } else { (b, a) };
             assert!(!say(&rig, from_to.0, from_to.1, "x", DeliveryKind::Quiet).held);
         }
-        let before = rig.hub.inbox_of(b).unwrap().len();
+        // The children run and drain their inboxes, so the length of an inbox
+        // proves nothing; the ack record says where the message is.
+        let held_state = |rig: &Rig| rig.hub.acks_to(a, b).last().unwrap().state;
         assert!(say(&rig, a, b, "again", DeliveryKind::Quiet).held);
-        assert_eq!(
-            rig.hub.inbox_of(b).unwrap().len(),
-            before,
-            "held, not delivered"
-        );
+        assert_eq!(held_state(&rig), crate::runs::AckState::Held);
         // Held messages release when either side works, and main hears once.
         assert_eq!(rig.hub.pending_notices(rig.hub.main()).len(), 1);
         rig.hub.note_work(b);
-        assert_eq!(rig.hub.inbox_of(b).unwrap().len(), before + 1);
+        assert_ne!(held_state(&rig), crate::runs::AckState::Held);
     }
 
     #[test]
@@ -1198,8 +1203,13 @@ mod ack {
 
     #[test]
     fn guard_release_into_full_inbox_is_dropped_and_reported() {
-        let script = Script::new(vec![("PARENT-A", vec![]), ("CHILD-B", vec![])]);
+        let script = Script::new(vec![
+            ("PARENT-A", vec![Step::Hang]),
+            ("CHILD-B", vec![Step::Hang]),
+        ]);
         let (rig, a, b) = super::hub::pair(&script);
+        await_requests(&script, "PARENT-A", 1);
+        await_requests(&script, "CHILD-B", 1);
         for n in 0..crate::runs::inbox::PAIR_BURST {
             say(&rig, b, a, &format!("q{n}"), DeliveryKind::Quiet);
         }
@@ -1266,5 +1276,167 @@ mod ack {
         assert!(text.contains("is not delivered after 60s"), "{text}");
         rig.hub.stop(main, &[ack.id], StopOpts::default());
         settle(&rig, ack.id);
+    }
+
+    fn dropped_notices(rig: &Rig, owner: UnitId) -> Vec<String> {
+        rig.hub
+            .pending_notices(owner)
+            .into_iter()
+            .map(|n| n.text)
+            .filter(|t| t.contains("dropped"))
+            .collect()
+    }
+
+    fn wait_idle_after(rig: &Rig, script: &Script, id: UnitId, requests: usize) {
+        for _ in 0..50_000_000u64 {
+            if script.requests(CHILD) >= requests
+                && rig.hub.get(id).unwrap().state.label() == "idle"
+            {
+                return;
+            }
+            std::thread::yield_now();
+        }
+        panic!("never idle after {requests} requests");
+    }
+
+    #[test]
+    fn a_request_cancelled_before_it_returned_never_confirms_the_message() {
+        let script = Script::new(vec![(
+            CHILD,
+            vec![
+                Step::Reply(reply("r1")),
+                Step::Hang,
+                Step::Reply(reply("r3")),
+            ],
+        )]);
+        let rig = rig(&script);
+        let ack = spawn(&rig, CHILD, json!({}));
+        settle(&rig, ack.id);
+        let main = rig.hub.main();
+        // The idle child restarts on it: the message becomes the user message
+        // of a request that hangs, then is interrupted.
+        say(&rig, main, ack.id, "ZZ-first", DeliveryKind::Steer);
+        await_requests(&script, CHILD, 2);
+        assert_eq!(state_of(&rig, main, ack.id), [AckState::Accepted]);
+        rig.hub.stop(
+            main,
+            &[ack.id],
+            StopOpts {
+                soft: true,
+                ..StopOpts::default()
+            },
+        );
+        wait_idle_after(&rig, &script, ack.id, 2);
+        assert_eq!(
+            state_of(&rig, main, ack.id),
+            [AckState::Accepted],
+            "interrupted, not delivered, not lost"
+        );
+        // The history kept it; the next request that returns confirms it once.
+        say(&rig, main, ack.id, "ZZ-second", DeliveryKind::Steer);
+        wait_idle_after(&rig, &script, ack.id, 3);
+        let states = state_of(&rig, main, ack.id);
+        assert!(
+            matches!(states[..], [AckState::Delivered { .. }]),
+            "{states:?}"
+        );
+        assert_eq!(count_in(&script, 2, "ZZ-first"), 1, "carried, not repeated");
+        assert_eq!(count_in(&script, 2, "ZZ-second"), 1);
+    }
+
+    fn count_in(script: &Script, n: usize, needle: &str) -> usize {
+        script
+            .messages_of(CHILD, n)
+            .iter()
+            .map(serde_json::Value::to_string)
+            .collect::<String>()
+            .matches(needle)
+            .count()
+    }
+
+    fn pause_at(
+        rig: &Rig,
+        id: UnitId,
+        at: &'static str,
+    ) -> (flume::Receiver<()>, flume::Sender<()>) {
+        let (reached_tx, reached_rx) = flume::unbounded();
+        let (go_tx, go_rx) = flume::unbounded();
+        rig.hub
+            .table()
+            .agents
+            .get(&id)
+            .unwrap()
+            .pauses
+            .lock()
+            .unwrap()
+            .insert(at, (reached_tx, go_rx));
+        (reached_rx, go_tx)
+    }
+
+    #[test]
+    fn stop_before_the_settle_drops_exactly_once() {
+        let (release, gate) = flume::bounded::<()>(1);
+        let script = Script::new(vec![(CHILD, vec![Step::Gate(gate, reply("r1"))])]);
+        let rig = rig(&script);
+        let ack = spawn(&rig, CHILD, json!({}));
+        await_requests(&script, CHILD, 1);
+        let held = pause_at(&rig, ack.id, "before_settle");
+        release.send(()).unwrap();
+        held.0.recv_timeout(Duration::from_secs(20)).unwrap();
+        let main = rig.hub.main();
+        say(&rig, main, ack.id, "late", DeliveryKind::Steer);
+        rig.hub.stop(main, &[ack.id], StopOpts::default());
+        held.1.send(()).unwrap();
+        settle(&rig, ack.id);
+        assert_eq!(
+            state_of(&rig, main, ack.id),
+            [AckState::Dropped("recipient_stopped")]
+        );
+        assert_eq!(dropped_notices(&rig, main).len(), 1);
+    }
+
+    #[test]
+    fn stop_after_the_restart_keeps_the_delivery() {
+        let (release, gate) = flume::bounded::<()>(1);
+        let script = Script::new(vec![(
+            CHILD,
+            vec![Step::Gate(gate, reply("r1")), Step::Reply(reply("r2"))],
+        )]);
+        let rig = rig(&script);
+        let ack = spawn(&rig, CHILD, json!({}));
+        await_requests(&script, CHILD, 1);
+        let held = pause_at(&rig, ack.id, "before_settle");
+        release.send(()).unwrap();
+        held.0.recv_timeout(Duration::from_secs(20)).unwrap();
+        let main = rig.hub.main();
+        say(&rig, main, ack.id, "early", DeliveryKind::Steer);
+        held.1.send(()).unwrap();
+        wait_idle_after(&rig, &script, ack.id, 2);
+        rig.hub.stop(main, &[ack.id], StopOpts::default());
+        settle(&rig, ack.id);
+        let states = state_of(&rig, main, ack.id);
+        assert!(
+            matches!(states[..], [AckState::Delivered { .. }]),
+            "{states:?}"
+        );
+        assert!(dropped_notices(&rig, main).is_empty());
+    }
+
+    #[test]
+    fn many_drops_make_one_notice() {
+        let script = Script::new(vec![(CHILD, vec![Step::Hang])]);
+        let rig = rig(&script);
+        let ack = spawn(&rig, CHILD, json!({}));
+        await_requests(&script, CHILD, 1);
+        let main = rig.hub.main();
+        for n in 0..5 {
+            say(&rig, main, ack.id, &format!("q{n}"), DeliveryKind::Quiet);
+        }
+        rig.hub.stop(main, &[ack.id], StopOpts::default());
+        settle(&rig, ack.id);
+        let notices = dropped_notices(&rig, main);
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(notices[0].contains("5 messages"), "{notices:?}");
+        assert_eq!(rig.hub.acks_to(main, ack.id).len(), 5);
     }
 }

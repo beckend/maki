@@ -1928,7 +1928,10 @@ impl UnitHub {
         for (to, item) in items {
             let failed = match self.inbox_of(to) {
                 Some(inbox) => match self.deliver(to, &inbox, item.clone(), now, false) {
-                    Ok(()) => continue,
+                    Ok(()) => {
+                        self.acks().released(item.from, item.id);
+                        continue;
+                    }
                     Err(UnitError::InboxFull { .. }) => "inbox_full",
                     Err(_) => "recipient_stopped",
                 },
@@ -2015,19 +2018,41 @@ impl UnitHub {
     /// The messages will never be delivered: the sender learns it through
     /// `runs` and one quiet notice each. Never call with an inbox lock held.
     pub fn messages_dropped(&self, items: &[InboxItem], reason: &'static str) {
+        // One notice per sender and recipient, so a stopped agent with a full
+        // inbox costs its senders one line, not one per message.
+        let mut groups: Vec<(UnitId, UnitId, Vec<MessageId>)> = Vec::new();
         for item in items.iter().filter(|i| i.kind != DeliveryKind::Notice) {
             let to = self
                 .acks()
                 .advance(item.from, item.id, AckState::Dropped(reason));
-            if let Some(to) = to {
-                let text = format!(
-                    "message {} to {} was dropped: {}",
-                    item.id,
-                    self.run_label(to),
-                    reason.replace('_', " ")
-                );
-                self.ack_notice(item.from, to, text);
+            let Some(to) = to else { continue };
+            match groups.iter_mut().find(|g| g.0 == item.from && g.1 == to) {
+                Some(g) => g.2.push(item.id),
+                None => groups.push((item.from, to, vec![item.id])),
             }
+        }
+        for (from, to, ids) in groups {
+            let list = match ids.as_slice() {
+                [one] => format!("message {one}"),
+                many => {
+                    let shown: Vec<String> =
+                        many.iter().take(8).map(MessageId::to_string).collect();
+                    let more = many.len().saturating_sub(8);
+                    let more = if more > 0 {
+                        format!(" and {more} more")
+                    } else {
+                        String::new()
+                    };
+                    format!("{} messages ({}{more})", many.len(), shown.join(", "))
+                }
+            };
+            let text = format!(
+                "{list} to {} {} dropped: {}",
+                self.run_label(to),
+                if ids.len() == 1 { "was" } else { "were" },
+                reason.replace('_', " ")
+            );
+            self.ack_notice(from, to, text);
         }
     }
 

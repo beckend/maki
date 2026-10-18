@@ -53,6 +53,10 @@ pub struct History {
     /// because messages only make sense under the prefix they were sent with,
     /// and every frontend already keeps a `History` for the whole session.
     live: Option<LiveFrame>,
+    /// Run messages in the transcript that no sent request has carried yet.
+    /// Here and not on the `Agent`, which a driver builds anew every turn: a
+    /// turn cancelled mid-request must not forget them.
+    landed: Vec<(crate::runs::InboxItem, Option<u32>)>,
 }
 
 impl History {
@@ -62,7 +66,22 @@ impl History {
             mirror: None,
             unsaved: false,
             live: None,
+            landed: Vec::new(),
         }
+    }
+
+    pub(crate) fn note_landed(&mut self, items: &[crate::runs::InboxItem], step: Option<u32>) {
+        self.landed.extend(
+            items
+                .iter()
+                .filter(|i| i.id.0 != 0)
+                .cloned()
+                .map(|i| (i, step)),
+        );
+    }
+
+    pub(crate) fn take_landed(&mut self) -> Vec<(crate::runs::InboxItem, Option<u32>)> {
+        std::mem::take(&mut self.landed)
     }
 
     /// Call before [`Self::with_mirror`], which publishes.
