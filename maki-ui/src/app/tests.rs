@@ -12563,7 +12563,6 @@ fn a_session_opened_under_a_moved_call_works_once_it_runs() {
 
     assert_eq!(app.chats[tab].task_status(), TaskStatus::Working);
 }
-}
 
 #[test]
 fn native_run_creates_tab_keyed_by_handle() {

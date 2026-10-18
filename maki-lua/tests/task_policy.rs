@@ -343,7 +343,15 @@ fn load_background_host() -> (Arc<ToolRegistry>, PluginHost) {
 fn load_task_host_with_opts(
     opts: serde_json::Map<String, serde_json::Value>,
 ) -> (Arc<ToolRegistry>, PluginHost) {
-    let reg = Arc::new(ToolRegistry::new());
+    load_task_host_in(Arc::new(ToolRegistry::new()), opts)
+}
+
+/// The same host, over a registry the caller filled: the native run tools are
+/// registered before the task plugin loads, so both are there.
+fn load_task_host_in(
+    reg: Arc<ToolRegistry>,
+    opts: serde_json::Map<String, serde_json::Value>,
+) -> (Arc<ToolRegistry>, PluginHost) {
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     let prelude = STUB_PRELUDE
         .replace("@PLAIN_TEXT@", PLAIN_TEXT)
@@ -894,8 +902,8 @@ impl maki_providers::provider::Provider for FixedReply {
 
 /// `[agent.runs] enabled` with the Lua `task` plugin loaded: both tools are
 /// registered, both complete, and neither disturbs the other.
-#[test]
-fn native_and_legacy_task_enabled() {
+#[tokio::test]
+async fn native_and_legacy_task_enabled() {
     use maki_agent::runs::{RunsCtx, SystemClock, UnitHub, UnitLimits};
 
     let reg = Arc::new(ToolRegistry::new());
@@ -922,35 +930,43 @@ fn native_and_legacy_task_enabled() {
         self_run: hub.main(),
         hub: Arc::clone(&hub),
     });
-    let run = |name: &str, input: Value| -> Result<String, String> {
-        let inv = reg.get(name).unwrap().tool.parse(&input).unwrap();
-        smol::block_on(inv.execute(&ctx))
-            .output
-            .map(|out| match out {
+    let run = |name: &'static str, input: Value| {
+        let reg = Arc::clone(&reg);
+        let ctx = ctx.clone();
+        async move {
+            let inv = reg.get(name).unwrap().tool.parse(&input).unwrap();
+            inv.execute(&ctx).await.output.map(|out| match out {
                 ToolOutput::Plain(s) | ToolOutput::Markdown(s) => s.text,
                 other => panic!("unexpected output: {other:?}"),
             })
+        }
     };
 
-    let legacy = run(TASK_TOOL, task_input(SCENARIO_PLAIN, None)).unwrap();
+    let legacy = run(TASK_TOOL, task_input(SCENARIO_PLAIN, None))
+        .await
+        .unwrap();
     assert_eq!(legacy, PLAIN_TEXT);
 
     let started = run(
         "spawn",
         json!({"kind": "agent", "description": "reader", "prompt": "say hi", "one_shot": true}),
     )
+    .await
     .unwrap();
     let handle = started.split_whitespace().nth(1).unwrap().to_owned();
     assert!(
         handle.starts_with("ag-") && !handle.starts_with("toolu_"),
         "{handle}"
     );
-    let waited = run("wait", json!({"ids": [handle]})).unwrap();
+    let waited = run("wait", json!({"ids": [handle]})).await.unwrap();
     assert!(waited.contains("native says hi"), "{waited}");
     assert!(waited.contains("completed"), "{waited}");
 
     // And the legacy tool still works after a native run existed.
     assert_eq!(
-        run(TASK_TOOL, task_input(SCENARIO_PLAIN, None)).unwrap(),
+        run(TASK_TOOL, task_input(SCENARIO_PLAIN, None))
+            .await
+            .unwrap(),
         PLAIN_TEXT
     );
+}
