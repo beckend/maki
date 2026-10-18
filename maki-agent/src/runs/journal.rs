@@ -229,11 +229,6 @@ impl UnitHub {
                 self.jot(JournalRecord::Term(term));
             }
             report.requeued_notices = self.requeue_notices(&replay);
-            if let Some((info, wake, text)) = &notice {
-                self.jot(JournalRecord::Notice(notice_record(
-                    info, *wake, text, "queued",
-                )));
-            }
         }
         if let Some((info, wake, text)) = notice {
             self.push_notice(self.main, info, text, wake);
