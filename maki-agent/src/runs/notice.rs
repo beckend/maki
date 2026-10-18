@@ -1,5 +1,6 @@
-//! Run-originated text for the model. Phase 2 only queues notices in the
-//! hub; `wait` and `runs` hand them out until delivery lands in phase 4b.
+//! Run-originated text for the model. A notice is an inbox item of kind
+//! `Notice`; the hub creates it when a run settles and the owner's drains
+//! deliver it (design 2.6, 4.8).
 
 use std::fmt::Write;
 use std::time::SystemTime;
@@ -12,6 +13,34 @@ pub enum NoticeKind {
     Settled,
     /// The ping-pong guard held messages between two runs.
     Guard,
+    /// Notices were dropped or demoted to protect the owner's context.
+    Overflow,
+}
+
+impl NoticeKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Settled => "settled",
+            Self::Guard => "guard",
+            Self::Overflow => "overflow",
+        }
+    }
+}
+
+/// What an inbox item of kind `Notice` knows about itself beyond its text.
+#[derive(Debug, Clone)]
+pub struct NoticeInfo {
+    pub kind: NoticeKind,
+    /// The run the notice is about.
+    pub run: UnitId,
+    pub handle: String,
+    pub name: String,
+    /// Which settle of the run it reports; a read that saw settle N consumes
+    /// the notices up to N and never a later one.
+    pub generation: u64,
+    /// Identical notices collapse into one with a count.
+    pub count: u32,
+    pub created: SystemTime,
 }
 
 #[derive(Debug, Clone)]

@@ -721,7 +721,14 @@ mod inbox {
         let to = rig.hub.resolve(ack.id, "parent").unwrap();
         assert_eq!(to, rig.hub.main());
         say(&rig, ack.id, to, "may I?", DeliveryKind::Steer);
-        let items = rig.hub.inbox_of(to).unwrap().drain_step();
+        let items: Vec<_> = rig
+            .hub
+            .inbox_of(to)
+            .unwrap()
+            .drain_step()
+            .into_iter()
+            .filter(|i| i.notice.is_none())
+            .collect();
         assert_eq!(items.len(), 1);
         let text = crate::runs::inbox::frame(&items, None);
         assert!(text.starts_with("<run-message from=\"work\""), "{text}");

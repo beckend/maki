@@ -1129,10 +1129,23 @@ pub(super) async fn process_tool_calls(
 
     let mut all_results = results;
     all_results.extend(immediate_errors);
+    let result_ids: Vec<String> = all_results.iter().map(|r| r.id.clone()).collect();
     let tool_msg = crate::types::tool_results(all_results);
-    event_tx.send(AgentEvent::ToolResultsSubmitted {
+    let submitted = event_tx.send(AgentEvent::ToolResultsSubmitted {
         message: Box::new(tool_msg.clone()),
-    })?;
+    });
+    if let Some(runs) = &ctx.runs {
+        // A read's claim on a notice becomes consumption only here, once the
+        // result that carries it is in history (design 4.8).
+        if submitted.is_ok() {
+            history.push(tool_msg);
+            runs.hub.commit_claims(runs.self_run, &result_ids);
+        } else {
+            runs.hub.release_claims(&result_ids);
+        }
+        return submitted;
+    }
+    submitted?;
     history.push(tool_msg);
     Ok(())
 }

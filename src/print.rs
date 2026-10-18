@@ -321,6 +321,7 @@ pub fn run(params: PrintParams) -> Result<()> {
             | AgentEvent::PromptProgress { .. }
             | AgentEvent::RunStarted { .. }
             | AgentEvent::RunStateChanged { .. }
+            | AgentEvent::RunNotice { .. }
             | AgentEvent::RunFinished { .. }
             | AgentEvent::StreamClosed => {}
             AgentEvent::Steered { .. } => {

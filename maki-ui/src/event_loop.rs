@@ -1196,7 +1196,10 @@ impl<'t> EventLoop<'t> {
                     return None;
                 }
                 let preamble = runtime.handles.claim_mailbox_wake();
-                (!preamble.is_empty()).then_some((index, preamble))
+                // A waking run notice in `main`'s inbox starts a turn that
+                // drains it; the budget decides (design 4.3).
+                let woken = runtime.handles.claim_run_wake();
+                (!preamble.is_empty() || woken).then_some((index, preamble))
             })
             .collect();
 

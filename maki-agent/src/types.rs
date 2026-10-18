@@ -777,6 +777,11 @@ pub enum AgentEvent {
         reason: String,
         detail: Option<String>,
     },
+    /// A notice reached `main`'s inbox. With `wake` the frontend may start a
+    /// turn for it (`UnitHub::claim_main_wake` decides).
+    RunNotice {
+        wake: bool,
+    },
     /// End of a session's event stream. Emitted only by
     /// [`EventStreamGuard::drop`] and swallowed by [`SessionEvents::next`], so
     /// a consumer sees `None` and never this variant.
