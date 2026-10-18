@@ -1361,6 +1361,10 @@ pub struct SubagentInfo {
     pub parent_call: Option<String>,
 }
 
+/// The `run_id` of events from background runs. They belong to no turn, so a
+/// frontend must not drop them as stale when its own turn counter moves on.
+pub const BACKGROUND_RUN_ID: u64 = u64::MAX - 1;
+
 #[derive(Debug, Clone)]
 pub struct EventSender {
     tx: Sender<Envelope>,

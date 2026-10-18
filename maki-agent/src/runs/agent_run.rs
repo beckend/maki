@@ -99,7 +99,7 @@ impl Provider for Script {
                     let _ = gate.recv_async().await;
                     Ok(r)
                 }
-                Step::Hang => futures_lite::future::pending().await,
+                Step::Hang => std::future::pending().await,
             }
         })
     }
@@ -189,38 +189,41 @@ fn agent_req(prompt: &str, extra: Value) -> SpawnRequest {
     serde_json::from_value(input).unwrap()
 }
 
-fn spawn_as(rig: &Rig, caller: UnitId, req: SpawnRequest) -> SpawnAck {
+async fn spawn_as(rig: &Rig, caller: UnitId, req: SpawnRequest) -> SpawnAck {
     let spec = match req.clone().into_kind().unwrap() {
         UnitKind::Agent(spec) => spec,
         UnitKind::Shell(_) => unreachable!(),
     };
-    let launch = smol::block_on(AgentLaunch::prepare(&rig.ctx, &spec)).unwrap();
+    let launch = AgentLaunch::prepare(&rig.ctx, &spec).await.unwrap();
     rig.hub.spawn_agent(caller, req, launch).unwrap()
 }
 
-fn spawn(rig: &Rig, prompt: &str, extra: Value) -> SpawnAck {
-    spawn_as(rig, rig.hub.main(), agent_req(prompt, extra))
+async fn spawn(rig: &Rig, prompt: &str, extra: Value) -> SpawnAck {
+    spawn_as(rig, rig.hub.main(), agent_req(prompt, extra)).await
 }
 
 /// Settled means `Idle` or `Done`; the manual clock never fires the timeout.
-fn settle(rig: &Rig, id: UnitId) -> UnitView {
-    let views = smol::block_on(rig.hub.wait(
-        rig.hub.main(),
-        &[id],
-        WaitMode::All,
-        Duration::from_secs(10_000_000),
-        &CancelToken::none(),
-    ));
+async fn settle(rig: &Rig, id: UnitId) -> UnitView {
+    let views = rig
+        .hub
+        .wait(
+            rig.hub.main(),
+            &[id],
+            WaitMode::All,
+            Duration::from_secs(10_000_000),
+            &CancelToken::none(),
+        )
+        .await;
     views.into_iter().next().unwrap()
 }
 
 /// Until the scripted provider has been asked `n` times; bounded, no sleeps.
-fn await_requests(script: &Script, route: &str, n: usize) {
+async fn await_requests(script: &Script, route: &str, n: usize) {
     for _ in 0..50_000_000u64 {
         if script.requests(route) >= n {
             return;
         }
-        std::thread::yield_now();
+        tokio::task::yield_now().await;
     }
     panic!("provider never saw {n} requests on {route}");
 }
@@ -245,24 +248,24 @@ fn finished_order(rig: &Rig) -> Vec<String> {
         .collect()
 }
 
-#[test]
-fn completes_with_result_and_goes_idle() {
+#[tokio::test]
+async fn completes_with_result_and_goes_idle() {
     let script = Script::new(vec![(CHILD, vec![Step::Reply(reply("found it"))])]);
     let rig = rig(&script);
-    let ack = spawn(&rig, CHILD, json!({}));
-    let view = settle(&rig, ack.id);
+    let ack = spawn(&rig, CHILD, json!({})).await;
+    let view = settle(&rig, ack.id).await;
     assert_eq!(view.state.label(), "idle");
     let result = view.result.unwrap();
     assert_eq!(result.summary, "found it");
     assert_eq!(result.turns, 1);
 }
 
-#[test]
-fn one_shot_completes() {
+#[tokio::test]
+async fn one_shot_completes() {
     let script = Script::new(vec![(CHILD, vec![Step::Reply(reply("all done"))])]);
     let rig = rig(&script);
-    let ack = spawn(&rig, CHILD, json!({"one_shot": true}));
-    let view = settle(&rig, ack.id);
+    let ack = spawn(&rig, CHILD, json!({"one_shot": true})).await;
+    let view = settle(&rig, ack.id).await;
     assert_eq!(done_reason(&view), DoneReason::Completed);
     match view.state {
         UnitState::Done(t) => assert_eq!(t.result.summary, "all done"),
@@ -270,23 +273,23 @@ fn one_shot_completes() {
     }
 }
 
-#[test]
-fn survives_parent_turn_end() {
+#[tokio::test]
+async fn survives_parent_turn_end() {
     let (release, gate) = flume::bounded::<()>(1);
     let script = Script::new(vec![(CHILD, vec![Step::Gate(gate, reply("still here"))])]);
     let rig = rig(&script);
-    let ack = spawn(&rig, CHILD, json!({}));
+    let ack = spawn(&rig, CHILD, json!({})).await;
     // What the frontend does when the parent's turn ends.
     rig.ctx.subagent_cancels.cancel_all();
     assert_eq!(rig.hub.get(ack.id).unwrap().state.label(), "running");
     release.send(()).unwrap();
-    let view = settle(&rig, ack.id);
+    let view = settle(&rig, ack.id).await;
     assert_eq!(view.state.label(), "idle");
     assert_eq!(view.result.unwrap().summary, "still here");
 }
 
-#[test]
-fn cost_rolls_up_once() {
+#[tokio::test]
+async fn cost_rolls_up_once() {
     let usage = TokenUsage {
         input: 1000,
         output: 100,
@@ -301,16 +304,16 @@ fn cost_rolls_up_once() {
         ))],
     )]);
     let rig = rig(&script);
-    let ack = spawn(&rig, CHILD, json!({}));
-    let result = settle(&rig, ack.id).result.unwrap();
+    let ack = spawn(&rig, CHILD, json!({})).await;
+    let result = settle(&rig, ack.id).await.result.unwrap();
     assert_eq!(result.usage.input, 1000);
     let parent = rig.ctx.ledger.totals();
     assert_eq!(parent.usage.input, 1000, "the chain adds a child once");
     assert_eq!(parent.cost, Some(result.cost));
 }
 
-#[test]
-fn structured_output_lands_in_result() {
+#[tokio::test]
+async fn structured_output_lands_in_result() {
     let script = Script::new(vec![(
         CHILD,
         vec![
@@ -320,18 +323,18 @@ fn structured_output_lands_in_result() {
     )]);
     let rig = rig(&script);
     let schema = json!({"type": "object", "properties": {"answer": {"type": "integer"}}, "required": ["answer"]});
-    let ack = spawn(&rig, CHILD, json!({"output_schema": schema}));
-    let result = settle(&rig, ack.id).result.unwrap();
+    let ack = spawn(&rig, CHILD, json!({"output_schema": schema})).await;
+    let result = settle(&rig, ack.id).await.result.unwrap();
     assert_eq!(result.structured, Some(json!({"answer": 42})));
 }
 
-#[test]
-fn long_result_spills_to_disk() {
+#[tokio::test]
+async fn long_result_spills_to_disk() {
     let long = "x".repeat(RESULT_LIMIT * 3);
     let script = Script::new(vec![(CHILD, vec![Step::Reply(reply(&long))])]);
     let rig = rig(&script);
-    let ack = spawn(&rig, CHILD, json!({}));
-    let result = settle(&rig, ack.id).result.unwrap();
+    let ack = spawn(&rig, CHILD, json!({})).await;
+    let result = settle(&rig, ack.id).await.result.unwrap();
     assert!(result.truncated);
     assert!(result.summary.len() < long.len());
     let body = result.body_ref.expect("spilled");
@@ -339,36 +342,35 @@ fn long_result_spills_to_disk() {
     assert_eq!(std::fs::read_to_string(&body.0).unwrap(), long);
 }
 
-#[test]
-fn wait_returns_on_idle() {
+#[tokio::test]
+async fn wait_returns_on_idle() {
     let (release, gate) = flume::bounded::<()>(1);
     let script = Script::new(vec![(CHILD, vec![Step::Gate(gate, reply("hi"))])]);
     let rig = rig(&script);
-    let ack = spawn(&rig, CHILD, json!({}));
-    let waited = smol::block_on(async {
-        release.send_async(()).await.unwrap();
-        rig.hub
-            .wait(
-                rig.hub.main(),
-                &[ack.id],
-                WaitMode::Any,
-                Duration::from_secs(10_000_000),
-                &CancelToken::none(),
-            )
-            .await
-    });
+    let ack = spawn(&rig, CHILD, json!({})).await;
+    release.send_async(()).await.unwrap();
+    let waited = rig
+        .hub
+        .wait(
+            rig.hub.main(),
+            &[ack.id],
+            WaitMode::Any,
+            Duration::from_secs(10_000_000),
+            &CancelToken::none(),
+        )
+        .await;
     assert_eq!(waited[0].state.label(), "idle");
 }
 
-#[test]
-fn stop_settles_killed_and_history_sanitized() {
+#[tokio::test]
+async fn stop_settles_killed_and_history_sanitized() {
     let script = Script::new(vec![(CHILD, vec![Step::Hang])]);
     let rig = rig(&script);
-    let ack = spawn(&rig, CHILD, json!({}));
-    await_requests(&script, CHILD, 1);
+    let ack = spawn(&rig, CHILD, json!({})).await;
+    await_requests(&script, CHILD, 1).await;
     let outcomes = rig.hub.stop(rig.hub.main(), &[ack.id], StopOpts::default());
     assert_eq!(outcomes[0].status, Ok(StopStatus::Requested));
-    let view = settle(&rig, ack.id);
+    let view = settle(&rig, ack.id).await;
     assert_eq!(done_reason(&view), DoneReason::Killed);
     let history: Vec<Message> = rig
         .events
@@ -392,8 +394,8 @@ fn stop_settles_killed_and_history_sanitized() {
     assert_eq!(script.requests(CHILD), 1);
 }
 
-#[test]
-fn stop_cascades_children_first() {
+#[tokio::test]
+async fn stop_cascades_children_first() {
     let spawn_child = tool_use(
         "t1",
         "spawn",
@@ -404,9 +406,9 @@ fn stop_cascades_children_first() {
         (CHILD, vec![Step::Hang]),
     ]);
     let rig = rig(&script);
-    let parent = spawn(&rig, PARENT, json!({}));
+    let parent = spawn(&rig, PARENT, json!({})).await;
     // The parent's second request means its spawn call has returned.
-    await_requests(&script, PARENT, 2);
+    await_requests(&script, PARENT, 2).await;
     let kids = rig.hub.list(parent.id, Scope::Children);
     assert_eq!(kids.len(), 1);
     let kid = kids[0].id;
@@ -414,7 +416,7 @@ fn stop_cascades_children_first() {
         .hub
         .stop(rig.hub.main(), &[parent.id], StopOpts::default());
     assert_eq!(outcomes[0].status, Ok(StopStatus::Requested));
-    let view = settle(&rig, parent.id);
+    let view = settle(&rig, parent.id).await;
     assert_eq!(done_reason(&view), DoneReason::Killed);
     assert_eq!(done_reason(&rig.hub.get(kid).unwrap()), DoneReason::Killed);
     let order = finished_order(&rig);
@@ -425,20 +427,20 @@ fn stop_cascades_children_first() {
     assert_eq!(order, [handles.0, handles.1], "child settles before parent");
 }
 
-#[test]
-fn stopped_agent_makes_no_more_requests() {
+#[tokio::test]
+async fn stopped_agent_makes_no_more_requests() {
     let script = Script::new(vec![(CHILD, vec![Step::Reply(reply("one")), Step::Hang])]);
     let rig = rig(&script);
-    let ack = spawn(&rig, CHILD, json!({}));
-    settle(&rig, ack.id);
+    let ack = spawn(&rig, CHILD, json!({})).await;
+    settle(&rig, ack.id).await;
     rig.hub.stop(rig.hub.main(), &[ack.id], StopOpts::default());
-    let view = settle(&rig, ack.id);
+    let view = settle(&rig, ack.id).await;
     assert_eq!(done_reason(&view), DoneReason::Killed);
     assert_eq!(script.requests(CHILD), 1);
 }
 
-#[test]
-fn fork_excludes_inflight_turn() {
+#[tokio::test]
+async fn fork_excludes_inflight_turn() {
     let script = Script::new(vec![(
         "EARLIER-QUESTION",
         vec![Step::Reply(reply("forked"))],
@@ -458,8 +460,8 @@ fn fork_excludes_inflight_turn() {
         .publish_fork_snapshot(&["toolu_spawn".to_owned()], earlier);
     let mut req = agent_req("FORK-TASK", json!({"context": "fork"}));
     req.origin_tool_use_id = Some(Arc::from("toolu_spawn"));
-    let ack = spawn_as(&rig, rig.hub.main(), req);
-    settle(&rig, ack.id);
+    let ack = spawn_as(&rig, rig.hub.main(), req).await;
+    settle(&rig, ack.id).await;
     let sent = script.messages_of("EARLIER-QUESTION", 0);
     let text = serde_json::to_string(&sent).unwrap();
     assert_eq!(sent.len(), 3, "{text}");
@@ -470,8 +472,8 @@ fn fork_excludes_inflight_turn() {
     );
 }
 
-#[test]
-fn fork_without_a_snapshot_is_rejected() {
+#[tokio::test]
+async fn fork_without_a_snapshot_is_rejected() {
     let script = Script::new(vec![(CHILD, vec![])]);
     let rig = rig(&script);
     let req = agent_req(CHILD, json!({"context": "fork"}));
@@ -479,7 +481,7 @@ fn fork_without_a_snapshot_is_rejected() {
         UnitKind::Agent(spec) => spec,
         UnitKind::Shell(_) => unreachable!(),
     };
-    let launch = smol::block_on(AgentLaunch::prepare(&rig.ctx, &spec)).unwrap();
+    let launch = AgentLaunch::prepare(&rig.ctx, &spec).await.unwrap();
     let err = rig
         .hub
         .spawn_agent(rig.hub.main(), req, launch)
@@ -487,19 +489,22 @@ fn fork_without_a_snapshot_is_rejected() {
     assert!(err.to_string().starts_with("BAD_FIELD"), "{err}");
 }
 
-#[test]
-fn wait_and_stop_are_caller_scoped() {
+#[tokio::test]
+async fn wait_and_stop_are_caller_scoped() {
     let script = Script::new(vec![(CHILD, vec![Step::Hang])]);
     let rig = rig(&script);
-    let a = spawn(&rig, CHILD, json!({}));
-    let b = spawn(&rig, CHILD, json!({"description": "other"}));
-    let waited = smol::block_on(rig.hub.wait(
-        a.id,
-        &[b.id],
-        WaitMode::All,
-        Duration::from_secs(10_000_000),
-        &CancelToken::none(),
-    ));
+    let a = spawn(&rig, CHILD, json!({})).await;
+    let b = spawn(&rig, CHILD, json!({"description": "other"})).await;
+    let waited = rig
+        .hub
+        .wait(
+            a.id,
+            &[b.id],
+            WaitMode::All,
+            Duration::from_secs(10_000_000),
+            &CancelToken::none(),
+        )
+        .await;
     assert!(waited.is_empty(), "a sibling is out of scope");
     assert!(!rig.hub.can_reach(a.id, b.id));
     let outcomes = rig.hub.stop(a.id, &[b.id], StopOpts::default());

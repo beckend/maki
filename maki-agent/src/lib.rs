@@ -57,11 +57,12 @@ pub use maki_providers::{
     EMPTY_RESPONSE_MARKER, ImageMediaType, ImageSource, TaskEnd, ThinkingConfig,
 };
 pub use types::{
-    AgentEvent, BufWatch, BufferSnapshot, CallRecord, CostTally, DoneReason, Envelope, EventSender,
-    EventStreamGuard, GrepFileEntry, GrepLine, GrepMatchGroup, InstructionBlock, NO_FILES_FOUND,
-    PartStatus, RunLedger, RunTotals, SessionEndReason, SessionEvents, SharedBuf, SnapshotLine,
-    SnapshotSpan, SpanColor, SpanStyle, SteerKind, SubagentInfo, TextOutput, ToolDoneEvent,
-    ToolInput, ToolOutput, ToolPart, ToolStartEvent, TurnCompleteEvent, UiWaker, event_stream,
+    AgentEvent, BACKGROUND_RUN_ID, BufWatch, BufferSnapshot, CallRecord, CostTally, DoneReason,
+    Envelope, EventSender, EventStreamGuard, GrepFileEntry, GrepLine, GrepMatchGroup,
+    InstructionBlock, NO_FILES_FOUND, PartStatus, RunLedger, RunTotals, SessionEndReason,
+    SessionEvents, SharedBuf, SnapshotLine, SnapshotSpan, SpanColor, SpanStyle, SteerKind,
+    SubagentInfo, TextOutput, ToolDoneEvent, ToolInput, ToolOutput, ToolPart, ToolStartEvent,
+    TurnCompleteEvent, UiWaker, event_stream,
 };
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
