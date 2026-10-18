@@ -310,8 +310,15 @@ pub(super) struct AgentRun {
     pub(super) info: SubagentInfo,
     /// What other runs and the user send to this agent.
     pub(super) inbox: Arc<Inbox>,
+    /// Test hooks: a named point of the driver parks until released.
+    #[cfg(test)]
+    pub(super) pauses: Mutex<std::collections::HashMap<&'static str, PauseHook>>,
     task: Mutex<Option<smol::Task<()>>>,
 }
+
+/// Reached signal out, release signal in.
+#[cfg(test)]
+pub(super) type PauseHook = (flume::Sender<()>, flume::Receiver<()>);
 
 impl AgentRun {
     pub(super) fn new(root: &CancelToken, info: SubagentInfo) -> Arc<Self> {
@@ -324,6 +331,8 @@ impl AgentRun {
             timed_out: AtomicBool::new(false),
             info,
             inbox: Arc::new(Inbox::new(Phase::Running)),
+            #[cfg(test)]
+            pauses: Mutex::default(),
             task: Mutex::new(None),
         })
     }
@@ -422,6 +431,19 @@ enum Judged {
 }
 
 impl Driver {
+    /// One-shot test hook; a no-op outside tests.
+    #[cfg(test)]
+    async fn pause(&self, at: &'static str) {
+        let hook = lock(&self.run.pauses).remove(at);
+        if let Some((reached, go)) = hook {
+            let _ = reached.send(());
+            let _ = go.recv_async().await;
+        }
+    }
+
+    #[cfg(not(test))]
+    async fn pause(&self, _at: &'static str) {}
+
     fn hub(&self) -> Option<Arc<UnitHub>> {
         self.hub.upgrade()
     }
@@ -491,11 +513,12 @@ impl Driver {
             result.cost = ledger.cost.unwrap_or(0.0);
             self.spill(&mut result).await;
 
+            self.pause("before_settle").await;
             match verdict {
                 Verdict::Idle { interrupted } if !spec.one_shot => {
                     match self.settle(result, !interrupted) {
                         Settled::Restart(text) => message = text,
-                        Settled::Idle => match self.wait_for_wake().await {
+                        Settled::Idle => match self.idle_until_woken().await {
                             Some(text) => message = text,
                             None => {
                                 self.finish(UnitDone::Killed, None, UnitResult::default())
@@ -546,6 +569,11 @@ impl Driver {
         }
     }
 
+    async fn idle_until_woken(&self) -> Option<String> {
+        self.pause("after_idle").await;
+        self.wait_for_wake().await
+    }
+
     /// Parks an `Idle` agent until something wakes it (the text to start the
     /// next turn with) or its stop arrives (`None`).
     async fn wait_for_wake(&self) -> Option<String> {
@@ -568,6 +596,7 @@ impl Driver {
             if matches!(woke, Woke::Cancel) {
                 return None;
             }
+            self.pause("woken").await;
             let mut guard = self.run.inbox.lock();
             match guard.phase() {
                 Phase::Closed => return None,
