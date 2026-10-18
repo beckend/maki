@@ -7,6 +7,7 @@
 //! We adopt new fields when Claude Code adds them but never invent our own.
 //! Check their docs before changing anything here.
 
+use std::collections::HashMap;
 use std::io::{self, Read};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -33,16 +34,127 @@ use maki_storage::sessions::SessionClaim;
 use serde::Serialize;
 use serde_json::Value;
 
-/// Environment override of the join timeout in seconds, until `--join-timeout`
-/// lands (design phase 7b).
+/// Fallback for the join timeout in seconds when `--join-timeout` is absent.
 const JOIN_TIMEOUT_ENV: &str = "MAKI_JOIN_TIMEOUT_SECS";
 const DEFAULT_JOIN_TIMEOUT: Duration = Duration::from_secs(600);
 
-fn join_timeout() -> Duration {
-    std::env::var(JOIN_TIMEOUT_ENV)
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
+/// The flag wins, then the environment, then the default. An unparsable
+/// environment value falls back to the default.
+fn resolve_join_timeout(flag: Option<u64>, env: Option<&str>) -> Duration {
+    flag.or_else(|| env.and_then(|v| v.parse::<u64>().ok()))
         .map_or(DEFAULT_JOIN_TIMEOUT, Duration::from_secs)
+}
+
+fn run_label(handle: &str, names: &HashMap<String, String>) -> String {
+    match names.get(handle) {
+        Some(name) => format!("{handle} {name}"),
+        None => handle.to_owned(),
+    }
+}
+
+/// The stderr line for a run transition, `None` for events that are not one.
+/// `names` maps a handle to the name it started with.
+fn run_line(event: &AgentEvent, names: &mut HashMap<String, String>) -> Option<String> {
+    match event {
+        AgentEvent::RunStarted {
+            handle,
+            name,
+            kind,
+            parent,
+            ..
+        } => {
+            names.insert(handle.clone(), name.clone());
+            let by = parent
+                .as_deref()
+                .map_or(String::new(), |p| format!(" (from {p})"));
+            Some(format!("maki: run {handle} {name} started [{kind}]{by}"))
+        }
+        AgentEvent::RunStateChanged { handle, state } => {
+            Some(format!("maki: run {} {state}", run_label(handle, names)))
+        }
+        AgentEvent::RunFinished {
+            handle,
+            reason,
+            detail,
+        } => {
+            let detail = detail
+                .as_deref()
+                .map_or(String::new(), |d| format!(": {d}"));
+            Some(format!(
+                "maki: run {} finished, {reason}{detail}",
+                run_label(handle, names)
+            ))
+        }
+        _ => None,
+    }
+}
+
+#[derive(Serialize)]
+struct RunObject<'a> {
+    #[serde(rename = "type")]
+    event_type: &'static str,
+    handle: &'a str,
+    session_id: &'a SessionRef,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kind: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parent: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    depth: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<&'a str>,
+}
+
+/// The `run_*` stream object for a run event.
+fn run_object<'a>(event: &'a AgentEvent, session_id: &'a SessionRef) -> Option<RunObject<'a>> {
+    let base = |event_type, handle| RunObject {
+        event_type,
+        handle,
+        session_id,
+        name: None,
+        kind: None,
+        parent: None,
+        depth: None,
+        state: None,
+        reason: None,
+        detail: None,
+    };
+    match event {
+        AgentEvent::RunStarted {
+            handle,
+            name,
+            kind,
+            parent,
+            depth,
+            ..
+        } => Some(RunObject {
+            name: Some(name),
+            kind: Some(kind),
+            parent: parent.as_deref(),
+            depth: Some(*depth),
+            ..base("run_started", handle)
+        }),
+        AgentEvent::RunStateChanged { handle, state } => Some(RunObject {
+            state: Some(state),
+            ..base("run_state", handle)
+        }),
+        AgentEvent::RunFinished {
+            handle,
+            reason,
+            detail,
+        } => Some(RunObject {
+            reason: Some(reason),
+            detail: detail.as_deref(),
+            ..base("run_finished", handle)
+        }),
+        _ => None,
+    }
 }
 
 const SESSION_LINE_PREFIX: &str = "session: ";
@@ -160,6 +272,10 @@ pub struct PrintParams {
     pub image_paths: Vec<PathBuf>,
     pub format: OutputFormat,
     pub verbose: bool,
+    /// `--join-timeout` in seconds.
+    pub join_timeout: Option<u64>,
+    /// `--quiet-runs`: no run transition lines on stderr.
+    pub quiet_runs: bool,
     pub config: AgentConfig,
     pub permissions_config: PermissionsConfig,
     pub timeouts: maki_providers::Timeouts,
@@ -184,6 +300,8 @@ pub fn run(params: PrintParams) -> Result<()> {
         image_paths,
         format,
         verbose,
+        join_timeout,
+        quiet_runs,
         config,
         permissions_config,
         timeouts,
@@ -238,7 +356,10 @@ pub fn run(params: PrintParams) -> Result<()> {
         model_policy,
         plugin_rules,
         project_config,
-        join_timeout: join_timeout(),
+        join_timeout: resolve_join_timeout(
+            join_timeout,
+            std::env::var(JOIN_TIMEOUT_ENV).ok().as_deref(),
+        ),
     });
 
     let HeadlessHandle {
@@ -292,7 +413,18 @@ pub fn run(params: PrintParams) -> Result<()> {
         || MODE_BUILD,
     );
 
+    let mut run_names = HashMap::new();
     while let Some(envelope) = smol::block_on(events.next()) {
+        if let Some(line) = run_line(&envelope.event, &mut run_names)
+            && !quiet_runs
+        {
+            eprintln!("{line}");
+        }
+        if let Some(out) = &mut verbose_out
+            && let Some(obj) = run_object(&envelope.event, &session_id)
+        {
+            out.emit(&obj)?;
+        }
         // Folded in first, so a plugin handling `TurnEnd` finds the finished
         // totals when it calls `maki.session.read()`.
         snapshot.observe(&envelope);
@@ -480,6 +612,63 @@ mod tests {
     use super::*;
     use maki_providers::TokenUsage;
     use test_case::test_case;
+
+    #[test_case(Some(30), Some("5"), 30 ; "flag_wins")]
+    #[test_case(None, Some("5"), 5 ; "env_fallback")]
+    #[test_case(None, Some("junk"), 600 ; "bad_env_default")]
+    #[test_case(None, None, 600 ; "default")]
+    fn join_timeout_flag_parsed(flag: Option<u64>, env: Option<&str>, secs: u64) {
+        assert_eq!(resolve_join_timeout(flag, env), Duration::from_secs(secs));
+    }
+
+    #[test]
+    fn run_lines_on_stderr() {
+        let mut names = HashMap::new();
+        let started = AgentEvent::RunStarted {
+            handle: "r1".into(),
+            name: "build".into(),
+            kind: "shell".into(),
+            parent: None,
+            depth: 0,
+            one_shot: true,
+        };
+        assert_eq!(
+            run_line(&started, &mut names).unwrap(),
+            "maki: run r1 build started [shell]"
+        );
+        let idle = AgentEvent::RunStateChanged {
+            handle: "r1".into(),
+            state: "idle".into(),
+        };
+        assert_eq!(
+            run_line(&idle, &mut names).unwrap(),
+            "maki: run r1 build idle"
+        );
+        let fin = AgentEvent::RunFinished {
+            handle: "r1".into(),
+            reason: "failed".into(),
+            detail: Some("exit 2".into()),
+        };
+        assert_eq!(
+            run_line(&fin, &mut names).unwrap(),
+            "maki: run r1 build finished, failed: exit 2"
+        );
+        assert!(run_line(&AgentEvent::Nudge, &mut names).is_none());
+    }
+
+    #[test]
+    fn run_objects_are_typed() {
+        let sid = SessionRef::generate();
+        let fin = AgentEvent::RunFinished {
+            handle: "r1".into(),
+            reason: "completed".into(),
+            detail: None,
+        };
+        let v = serde_json::to_value(run_object(&fin, &sid).unwrap()).unwrap();
+        assert_eq!(v["type"], "run_finished");
+        assert_eq!(v["handle"], "r1");
+        assert!(v.get("detail").is_none());
+    }
 
     const DROP_REASON: &str = "blocked by a plugin";
     const PARENT_TOOL_USE_ID: &str = "toolu_parent";
