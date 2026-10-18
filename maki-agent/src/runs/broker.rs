@@ -40,15 +40,28 @@ const QUIET_AFTER: Duration = Duration::from_secs(60);
 
 pub type AnswerRx = Arc<smol::lock::Mutex<flume::Receiver<String>>>;
 
+type PendingMap = Arc<Mutex<HashMap<String, Pending>>>;
+
+/// Every answer a frontend or the timer gives comes in on `tx` and goes through
+/// a pump that only passes on one that names a prompt still on screen, by the
+/// id this prompt was shown under. That id is made fresh for each prompt, so
+/// an answer that arrives after its prompt is over cannot be taken for the
+/// answer to a later prompt of a call that reuses the tool call id.
 pub(super) struct PermissionBroker {
     tx: flume::Sender<String>,
+    /// What `enforce` reads: answers that passed the pump, and the broker's own.
+    out: flume::Sender<String>,
     rx: AnswerRx,
-    pending: Mutex<HashMap<String, Pending>>,
+    pending: PendingMap,
     total: Arc<AtomicUsize>,
+    seq: AtomicUsize,
+    _pump: smol::Task<()>,
 }
 
 /// One prompt on screen. Dropping it stops its timer and gives its count back.
 struct Pending {
+    /// The id the prompt was shown and is answered under.
+    wire: String,
     /// This prompt released the run's slot, so resolving it takes one again.
     released: bool,
     total: Arc<AtomicUsize>,
@@ -73,12 +86,35 @@ pub(super) struct Begin<'a> {
 
 impl PermissionBroker {
     pub(super) fn new(total: Arc<AtomicUsize>) -> Arc<Self> {
-        let (tx, rx) = flume::unbounded();
+        let (tx, raw_rx) = flume::unbounded::<String>();
+        let (out, rx) = flume::unbounded();
+        let pending = PendingMap::default();
+        let pump = smol::spawn({
+            let (pending, out) = (Arc::clone(&pending), out.clone());
+            async move {
+                while let Ok(raw) = raw_rx.recv_async().await {
+                    let Some(tagged) = TaggedAnswer::decode(&raw) else {
+                        continue;
+                    };
+                    // Checked and passed on under the lock `resolve` takes, so
+                    // nothing gets through once the prompt is over.
+                    let pending = pending.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some((original, _)) =
+                        pending.iter().find(|(_, p)| p.wire == tagged.request_id)
+                    {
+                        let _ = out.send(TaggedAnswer::new(original, tagged.answer).encode());
+                    }
+                }
+            }
+        });
         Arc::new(Self {
             tx,
+            out,
             rx: Arc::new(smol::lock::Mutex::new(rx)),
-            pending: Mutex::default(),
+            pending,
             total,
+            seq: AtomicUsize::new(0),
+            _pump: pump,
         })
     }
 
@@ -92,13 +128,13 @@ impl PermissionBroker {
     }
 
     fn answer(&self, request: &str, answer: PermissionAnswer) {
-        let _ = self.tx.send(TaggedAnswer::new(request, answer).encode());
+        let _ = self.out.send(TaggedAnswer::new(request, answer).encode());
     }
 
     /// Decides what happens to a prompt the run just raised. True when the
-    /// request is to be shown to the user; false when it was already answered
-    /// here and must not reach the frontend.
-    pub(super) fn begin(&self, b: Begin<'_>) -> bool {
+    /// request is to be shown to the user, with the id to show it under; None
+    /// when it was already answered here and must not reach the frontend.
+    pub(super) fn begin(&self, b: Begin<'_>) -> Option<String> {
         let hub = b.hub;
         if !hub.attended.load(Ordering::Relaxed) {
             let allow = hub.limits.unattended == UnattendedMode::InheritYolo && b.yolo;
@@ -110,7 +146,7 @@ impl PermissionBroker {
                     PermissionAnswer::Unavailable(unattended_reason())
                 },
             );
-            return false;
+            return None;
         }
         if self.total.fetch_add(1, Ordering::AcqRel) >= MAX_PENDING_PROMPTS {
             self.total.fetch_sub(1, Ordering::AcqRel);
@@ -122,8 +158,9 @@ impl PermissionBroker {
                     b.scope
                 )),
             );
-            return false;
+            return None;
         }
+        let wire = format!("{}~{}", b.request, self.seq.fetch_add(1, Ordering::Relaxed));
         let released = hub.release_slot(b.run, None);
         let timeout = hub.limits.permission_timeout;
         let start = b.clock.now();
@@ -131,7 +168,7 @@ impl PermissionBroker {
             let (tx, clock) = (self.tx.clone(), Arc::clone(b.clock));
             let (events, info) = (hub.events.clone(), b.info.clone());
             let (hub, run) = (Arc::downgrade(hub), b.run);
-            let (request, scope) = (b.request.to_owned(), b.scope);
+            let (wire_id, scope) = (wire.clone(), b.scope);
             async move {
                 if timeout > QUIET_AFTER {
                     clock.sleep_until(start + QUIET_AFTER).await;
@@ -142,8 +179,8 @@ impl PermissionBroker {
                 clock.sleep_until(start + timeout).await;
                 let reason = prompt_timeout_reason(&scope, timeout.as_secs());
                 let answer = PermissionAnswer::Unavailable(reason);
-                let _ = tx.send(TaggedAnswer::new(&request, answer).encode());
-                withdraw(&events, &info, &request);
+                let _ = tx.send(TaggedAnswer::new(&wire_id, answer).encode());
+                withdraw(&events, &info, &wire_id);
             }
         });
         self.pending
@@ -152,19 +189,20 @@ impl PermissionBroker {
             .insert(
                 b.request.to_owned(),
                 Pending {
+                    wire: wire.clone(),
                     released,
                     total: Arc::clone(&self.total),
                     _timer: timer,
                 },
             );
-        true
+        Some(wire)
     }
 
     /// The call that asked has returned. `Some(released)` when a prompt of
     /// this request was waiting, with whether it gave the slot up. Whatever
     /// answer is still queued belongs to a prompt that is over, so it goes
     /// before a later prompt can read it.
-    fn resolve(&self, request: &str) -> Option<bool> {
+    fn resolve(&self, request: &str) -> Option<(bool, String)> {
         let pending = self
             .pending
             .lock()
@@ -173,14 +211,14 @@ impl PermissionBroker {
         if let Some(rx) = self.rx.try_lock() {
             while rx.try_recv().is_ok() {}
         }
-        Some(pending.released)
+        Some((pending.released, pending.wire.clone()))
     }
 
     /// The turn is over, so no prompt of it can still be waited on.
     pub(super) fn clear(&self, events: &EventSender, info: &SubagentInfo) {
         let gone: Vec<String> = {
             let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-            pending.drain().map(|(id, _)| id).collect()
+            pending.drain().map(|(_, p)| p.wire.clone()).collect()
         };
         for id in gone {
             withdraw(events, info, &id);
@@ -220,10 +258,10 @@ impl UnitHub {
         if !answers.is_some_and(|rx| Arc::ptr_eq(rx, &agent.broker.receiver())) {
             return;
         }
-        let Some(released) = agent.broker.resolve(request) else {
+        let Some((released, wire)) = agent.broker.resolve(request) else {
             return;
         };
-        withdraw(&self.events, &agent.info, request);
+        withdraw(&self.events, &agent.info, &wire);
         // A cancelled call is on its way out; the run's next turn queues for
         // a slot itself, and a stop settles the run, which frees it.
         if released && !cancel.is_cancelled() {

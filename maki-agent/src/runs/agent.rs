@@ -878,11 +878,19 @@ impl Driver {
             | AgentEvent::StreamClosed => return,
             _ => {}
         }
-        if let AgentEvent::PermissionRequest { id, scopes, .. } = &envelope.event
+        if let AgentEvent::PermissionRequest { id, scopes, .. } = &mut envelope.event
             && envelope.subagent.is_none()
-            && !(self.run.turn_active() && self.begin_prompt(&hub, id, scopes))
         {
-            return;
+            // Shown and answered under a fresh id, which the broker maps back.
+            let wire = self
+                .run
+                .turn_active()
+                .then(|| self.begin_prompt(&hub, id, scopes))
+                .flatten();
+            match wire {
+                Some(wire) => *id = wire,
+                None => return,
+            }
         }
         envelope.run_id = crate::BACKGROUND_RUN_ID;
         envelope
@@ -893,7 +901,7 @@ impl Driver {
 
     /// A prompt of this run's own turn is about to be shown: the broker gives
     /// the slot up and starts the timeout. False when it answered at once.
-    fn begin_prompt(&self, hub: &Arc<UnitHub>, request: &str, scopes: &[String]) -> bool {
+    fn begin_prompt(&self, hub: &Arc<UnitHub>, request: &str, scopes: &[String]) -> Option<String> {
         self.run.broker.begin(Begin {
             hub,
             run: self.id,

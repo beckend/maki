@@ -218,7 +218,7 @@ mod tests {
         assert_eq!(err, UnitError::QueueFull);
         assert_eq!(err.to_string(), "QUEUE_FULL");
         // Shells do not use the queue.
-        assert!(hub.spawn(main, request(RunKind::Shell, "sh")).is_ok());
+        assert!(hub.spawn(main, request(RunKind::Shell, "sleep 60")).is_ok());
         finish(&hub, a);
         assert!(hub.spawn(main, request(RunKind::Agent, "e")).is_ok());
     }
@@ -428,7 +428,9 @@ mod tests {
         let mut req = request(RunKind::Agent, "c");
         req.timeout_secs = Some(10_000_000);
         assert_eq!(timeout_of(&hub, hub.spawn(main, req).unwrap().id), 86_400);
-        let shell = hub.spawn(main, request(RunKind::Shell, "sh")).unwrap();
+        let shell = hub
+            .spawn(main, request(RunKind::Shell, "sleep 60"))
+            .unwrap();
         assert_eq!(timeout_of(&hub, shell.id), 3600);
     }
 
@@ -488,7 +490,7 @@ mod tests {
         });
         let main = hub.main();
         let other = agent(&hub, main, "other");
-        let sh = |h: &Arc<UnitHub>, owner| h.spawn(owner, request(RunKind::Shell, "sh"));
+        let sh = |h: &Arc<UnitHub>, owner| h.spawn(owner, request(RunKind::Shell, "sleep 60"));
         let first = sh(&hub, main).unwrap();
         sh(&hub, main).unwrap();
         assert_eq!(
@@ -593,9 +595,10 @@ mod tests {
                 let mut ids: Vec<super::UnitId> = Vec::new();
                 let mut waits: Vec<Fut> = Vec::new();
                 let mut acquires: Vec<Fut> = Vec::new();
+                let mut prompting: Vec<super::UnitId> = Vec::new();
                 for step in 0..150 {
                     let ctx = format!("seed {seed} step {step}");
-                    match next(9) {
+                    match next(11) {
                         0 | 1 => {
                             let owner = if ids.is_empty() || next(2) == 0 {
                                 main
@@ -664,6 +667,31 @@ mod tests {
                                 let token = token.clone();
                                 let mut fut: Fut = Box::pin(async move {
                                     let _ = hub.acquire(id, &token, false).await;
+                                });
+                                if poll_once(fut.as_mut()).await.is_none() {
+                                    acquires.push(fut);
+                                }
+                            }
+                        }
+                        8 if !ids.is_empty() => {
+                            // A prompt opens: the run gives its slot up.
+                            let id = ids[next(ids.len())];
+                            if hub.release_slot(id, None) {
+                                prompting.push(id);
+                            }
+                        }
+                        9 if !prompting.is_empty() => {
+                            // The prompt resolves (answer, timeout): the run takes
+                            // a slot back unless it was stopped meanwhile.
+                            let id = prompting.swap_remove(next(prompting.len()));
+                            let running = hub
+                                .get(id)
+                                .is_some_and(|v| matches!(v.state, UnitState::Running));
+                            if running {
+                                let hub = Arc::clone(&hub);
+                                let token = token.clone();
+                                let mut fut: Fut = Box::pin(async move {
+                                    let _ = hub.acquire(id, &token, true).await;
                                 });
                                 if poll_once(fut.as_mut()).await.is_none() {
                                     acquires.push(fut);

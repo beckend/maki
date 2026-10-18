@@ -74,6 +74,16 @@ impl Script {
             .count()
     }
 
+    /// The routes of the requests in the order they came.
+    fn order(&self) -> Vec<String> {
+        self.seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(r, _)| r.to_string())
+            .collect()
+    }
+
     fn messages_of(&self, route: &str, n: usize) -> Vec<Value> {
         self.seen
             .lock()
@@ -1830,7 +1840,7 @@ mod perm {
         // The user was a moment too late; the run asks again with the same id.
         first.answer(PermissionAnswer::AllowOnce);
         let second = next_prompt(&rig);
-        assert_eq!(second.id, first.id);
+        assert_ne!(second.id, first.id, "each prompt is shown under a fresh id");
         assert_eq!(
             script.requests(CHILD),
             2,
@@ -1872,10 +1882,28 @@ mod perm {
         await_requests(&script, "BBB", 1);
         assert_eq!(script.requests("CCC"), 0);
         prompt.answer(PermissionAnswer::AllowOnce);
-        // A is back in line ahead of C, which never started.
+        // A is back in line ahead of C, which never started. It asks for its
+        // slot when its call wakes, so B must not finish before that.
+        for _ in 0..50_000_000u64 {
+            if rig.hub.table().pool.is_waiting(a.id) {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert!(
+            rig.hub.table().pool.is_waiting(a.id),
+            "A never queued again"
+        );
         open_b.send(()).unwrap();
         await_requests(&script, "AAA", 2);
-        assert_eq!(script.requests("CCC"), 0, "A resumes before C starts");
+        // C may run once A is done, but never ahead of A's second request.
+        let order = script.order();
+        let first_c = order.iter().position(|r| r == "CCC");
+        let second_a = order.iter().rposition(|r| r == "AAA").unwrap();
+        assert!(
+            first_c.is_none_or(|c| c > second_a),
+            "A resumes before C starts: {order:?}"
+        );
         for id in [a.id, b.id, c.id] {
             assert_eq!(done_reason(&settle(&rig, id)), DoneReason::Completed);
         }
@@ -2007,7 +2035,10 @@ mod perm {
             scope: "echo".into(),
             yolo,
         });
-        assert!(!shown, "an unattended prompt is answered, not shown");
+        assert!(
+            shown.is_none(),
+            "an unattended prompt is answered, not shown"
+        );
         let raw = broker.receiver().try_lock().unwrap().try_recv().unwrap();
         let tagged = TaggedAnswer::decode(&raw).unwrap();
         assert_eq!(tagged.request_id, "r1");
@@ -2127,7 +2158,16 @@ mod perm {
         let prompt = next_prompt(&rig);
         prompt.answer(PermissionAnswer::AllowOnce);
         assert_eq!(done_state(&settle(&rig, ack.id)), "idle");
-        assert_eq!(rig.hub.slots_in_use(), 0, "an idle agent holds no slot");
+        // The shell's own notice may already have woken the run, so state and
+        // slot are read under one lock: Idle never comes with a slot.
+        {
+            let table = rig.hub.table();
+            let idle = matches!(table.units[&ack.id].state, UnitState::Idle);
+            assert!(
+                !(idle && table.pool.holds(ack.id)),
+                "an idle agent holds no slot"
+            );
+        }
         say(
             &rig,
             rig.hub.main(),
