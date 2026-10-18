@@ -12,6 +12,7 @@ use crate::agent::default_instruction_files;
 use crate::cancel::CancelToken;
 use crate::mcp::McpSession;
 use crate::permissions::PermissionManager;
+use crate::runs::RunsCtx;
 use crate::tools::registry::HeaderFuture;
 use crate::tools::{BackgroundFor, FileAccess, ToolContext, ToolRegistry, interpreter_ctx};
 use crate::{AgentConfig, AgentMode, EventSender, ModelSlot, ToolOutputLines};
@@ -282,6 +283,9 @@ pub struct AgentSeed {
     pub timeouts: Timeouts,
     pub file_access: Arc<FileAccess>,
     pub model_policy: Arc<ModelPolicy>,
+    /// Set by the frontend when `[agent.runs]` is on, so a plugin's nested
+    /// tool calls reach the same hub as the chat.
+    pub runs: Option<RunsCtx>,
     /// The chat's thinking and whether it plans, as the user has them right
     /// now. The UI keeps them fresh even before the first message, so
     /// background work never thinks harder than the user asked. We keep a bool
@@ -564,9 +568,17 @@ impl AgentSeed {
             timeouts,
             file_access: FileAccess::fresh(),
             model_policy,
+            runs: None,
             chat_settings: Mutex::default(),
             instruction_files: ArcSwap::from_pointee(default_instruction_files()),
         }
+    }
+
+    /// Sets the hub the session's background work belongs to, when the
+    /// frontend runs with `[agent.runs]` on.
+    pub fn with_runs(mut self, runs: Option<RunsCtx>) -> Self {
+        self.runs = runs;
+        self
     }
 
     /// `None` when the session is closed or has no interactive loop, like a
@@ -616,6 +628,7 @@ impl AgentSeed {
             opts: self.chat_opts(),
             model_policy: Arc::clone(&self.model_policy),
             instruction_files: self.instruction_files.load_full(),
+            runs: self.runs.clone(),
             ..interpreter_ctx(
                 &AgentMode::Build,
                 &EventSender::new(sink, UNATTENDED_RUN_ID),

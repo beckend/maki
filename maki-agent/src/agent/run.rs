@@ -28,6 +28,7 @@ use crate::cancel::{CancelMap, CancelToken};
 use crate::mcp::{McpSession, ToolDeferral};
 use crate::permissions::PermissionManager;
 use crate::prompt::ResolvedPrompts;
+use crate::runs::RunsCtx;
 use crate::tools::hook::Verdict;
 use crate::tools::{
     BackgroundFor, Deadline, FileAccess, LocalTools, ToolAudience, ToolContext, ToolFilter,
@@ -137,6 +138,8 @@ pub struct AgentParams {
     pub registry: Arc<crate::tools::ToolRegistry>,
     pub audience: ToolAudience,
     pub model_policy: Arc<ModelPolicy>,
+    /// The hub and this agent's identity in it; `None` when runs are off.
+    pub runs: Option<RunsCtx>,
 }
 
 pub struct AgentRunParams<'h> {
@@ -196,6 +199,7 @@ pub struct Agent<'h> {
     workflow: bool,
     local_tools: LocalTools,
     model_policy: Arc<ModelPolicy>,
+    runs: Option<RunsCtx>,
     model_sync: Option<Arc<ArcSwap<ModelSlot>>>,
     stop_continuations: u32,
     /// The last tool round moved a call to the background. Its receipt tells
@@ -246,6 +250,7 @@ impl<'h> Agent<'h> {
             workflow: false,
             local_tools: LocalTools::default(),
             model_policy: params.model_policy,
+            runs: params.runs,
             model_sync: None,
             stop_continuations: 0,
             moved_last_round: false,
@@ -1050,6 +1055,7 @@ impl<'h> Agent<'h> {
             local_tools: Arc::clone(&self.local_tools),
             live_sink: None,
             model_policy: Arc::clone(&self.model_policy),
+            runs: self.runs.clone(),
         }
     }
 
@@ -1279,6 +1285,7 @@ mod tests {
     use crate::prompt::{PromptId, Slot, SlotEntry};
     use crate::session::StoredSession;
     use crate::template::Vars;
+    use crate::test_support::{CapturedRequest, MockProvider, StubStreamProvider};
     use crate::tools::RequestTools;
     use crate::tools::{
         DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, MovedCall, ParseError, Tool,
@@ -1320,15 +1327,6 @@ mod tests {
         }
     }
 
-    /// Messages are kept serialized, because the cache and the thinking
-    /// bindings compare bytes, not values.
-    struct CapturedRequest {
-        model: String,
-        system: String,
-        tools: Value,
-        messages: Vec<Value>,
-    }
-
     /// The contract that keeps the cache and every thinking block valid:
     /// `system` and `tools` only ever grow at the end, and so do messages.
     #[track_caller]
@@ -1343,103 +1341,6 @@ mod tests {
             next.messages.starts_with(&prev.messages),
             "earlier messages were edited"
         );
-    }
-
-    struct MockProvider {
-        responses: Mutex<Vec<StreamResponse>>,
-        requests: Arc<Mutex<Vec<CapturedRequest>>>,
-        served_window: Option<u32>,
-        on_request: Option<Box<dyn Fn() + Send + Sync>>,
-    }
-
-    impl MockProvider {
-        fn new(responses: Vec<StreamResponse>) -> Self {
-            Self {
-                responses: Mutex::new(responses),
-                requests: Arc::default(),
-                served_window: None,
-                on_request: None,
-            }
-        }
-    }
-
-    impl Provider for MockProvider {
-        fn stream_message<'a>(
-            &'a self,
-            model: &'a Model,
-            messages: &'a [Message],
-            system: &'a str,
-            tools: &'a Value,
-            _: &'a flume::Sender<ProviderEvent>,
-            _: RequestOptions,
-            _: Option<&'a SessionRef>,
-        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
-            Box::pin(async {
-                self.requests.lock().unwrap().push(CapturedRequest {
-                    model: model.id.clone(),
-                    system: system.to_owned(),
-                    tools: tools.clone(),
-                    messages: messages
-                        .iter()
-                        .map(|m| serde_json::to_value(m).unwrap())
-                        .collect(),
-                });
-                if let Some(hook) = &self.on_request {
-                    hook();
-                }
-                let mut responses = self.responses.lock().unwrap();
-                assert!(!responses.is_empty(), "MockProvider: no more responses");
-                Ok(responses.remove(0))
-            })
-        }
-
-        fn list_models(&self) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, AgentError>> {
-            Box::pin(async { unimplemented!() })
-        }
-
-        fn served_context_window<'a>(&'a self, _: &'a Model) -> BoxFuture<'a, Option<u32>> {
-            Box::pin(async { self.served_window })
-        }
-    }
-
-    /// Streams `delta` (if any), fires `cancel_after_delta` (if any),
-    /// then fails with `fail_status` or hangs until cancelled.
-    #[derive(Default)]
-    struct StubStreamProvider {
-        delta: Option<&'static str>,
-        cancel_after_delta: Mutex<Option<crate::cancel::CancelTrigger>>,
-        fail_status: Option<u16>,
-    }
-
-    impl Provider for StubStreamProvider {
-        fn stream_message<'a>(
-            &'a self,
-            _: &'a Model,
-            _: &'a [Message],
-            _: &'a str,
-            _: &'a Value,
-            ptx: &'a flume::Sender<ProviderEvent>,
-            _: RequestOptions,
-            _: Option<&'a SessionRef>,
-        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
-            Box::pin(async move {
-                if let Some(text) = self.delta {
-                    ptx.send(ProviderEvent::TextDelta { text: text.into() })
-                        .unwrap();
-                }
-                if let Some(trigger) = self.cancel_after_delta.lock().unwrap().take() {
-                    trigger.cancel();
-                }
-                match self.fail_status {
-                    Some(status) => Err(AgentError::api(status, "stub")),
-                    None => std::future::pending().await,
-                }
-            })
-        }
-
-        fn list_models(&self) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, AgentError>> {
-            Box::pin(async { unimplemented!() })
-        }
     }
 
     fn default_model() -> Model {
@@ -1532,6 +1433,7 @@ mod tests {
                 registry: Arc::new(crate::tools::ToolRegistry::new()),
                 audience: ToolAudience::MAIN,
                 model_policy: Arc::new(ModelPolicy::default()),
+                runs: None,
             },
             AgentRunParams {
                 history,

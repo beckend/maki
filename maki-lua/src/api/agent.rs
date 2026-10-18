@@ -121,6 +121,8 @@ fn config_filter(base: ToolFilter, agent: &AgentContext, model: &Model) -> ToolF
         .map(String::as_str)
         .collect();
     base.excluding(&disabled)
+        // A Lua subagent has no identity in the hub, so it could only be refused.
+        .excluding(&maki_agent::tools::runs::RUN_TOOL_NAMES)
         .excluding(maki_agent::tools::capability_exclusions(model))
 }
 
@@ -1253,6 +1255,7 @@ async fn session(
             registry: Arc::clone(maki_agent::tools::ToolRegistry::global_arc()),
             audience,
             model_policy: Arc::clone(&agent_ctx.model_policy),
+            runs: None,
         },
         context,
         opts,
@@ -2822,20 +2825,18 @@ mod tests {
 
     /// `close` is the plugin's way to say it is done, so the id must stop
     /// answering at once, not whenever the GC finalises the handle.
-    #[test]
-    fn a_closed_subagent_stops_being_addressable() {
+    #[tokio::test]
+    async fn a_closed_subagent_stops_being_addressable() {
         let lua = Lua::new();
         let ctx = stub_ctx_with(&AgentMode::Build, None, Some(PARENT_ID));
-        smol::block_on(async {
-            let sess = native_session(&lua, &ctx).await;
-            let id: MakiId = session_id(&lua, &sess.borrow::<LuaSession>().unwrap())
-                .unwrap()
-                .parse()
-                .unwrap();
-            assert!(notify(id).is_ok());
-            close(lua.clone(), sess.borrow().unwrap()).await.unwrap();
-            assert_eq!(notify(id).map_err(|e| e.to_string()), Err(not_live(id)));
-        });
+        let sess = native_session(&lua, &ctx).await;
+        let id: MakiId = session_id(&lua, &sess.borrow::<LuaSession>().unwrap())
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(notify(id).is_ok());
+        close(lua.clone(), sess.borrow().unwrap()).await.unwrap();
+        assert_eq!(notify(id).map_err(|e| e.to_string()), Err(not_live(id)));
     }
 
     /// The id is for messaging only. `AgentParams.session_id` stays the
@@ -2923,8 +2924,7 @@ mod tests {
                 lua.load("local s = agent.session({ session = sid }); return s and s:session_id()")
                     .eval_async::<Option<String>>(),
             )
-            .await
-            .unwrap();
+            .await;
         let id: MakiId = opened
             .expect("a ctx-less session must open for a live chat")
             .expect("and it must hand back an id")

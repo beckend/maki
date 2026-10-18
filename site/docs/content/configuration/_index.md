@@ -132,6 +132,15 @@ How many lines of output to show per tool in the UI. All values are `usize` with
 | `rtk` | bool | `true` | - | Rewrite the model's bash commands with [rtk](https://github.com/rtk-ai/rtk) when it is installed |
 | `shell` | string | `auto` | - | Shell for string commands on Windows (`jobstart`, UI `!`): `auto` (Git Bash if installed, else `cmd.exe`), `cmd`, or a path to an executable |
 
+### `agent.runs`
+
+| Field | Type | Default | Min | Description |
+|-------|------|---------|-----|-------------|
+| `enabled` | bool | `false` | - | Register the `spawn`, `send`, `runs`, `wait` and `stop` tools for background agents and shell jobs |
+| `max_depth` | u32 | `2` | 1 | Deepest agent nesting (the main agent is 0); an agent at this depth cannot spawn agents |
+| `max_children_per_run` | u32 | `8` | 1 | Most unfinished runs one run may have started |
+| `session_max_runs` | u32 | `64` | 1 | Most runs one session may start in total |
+
 ### `provider`
 
 | Field | Type | Default | Min | Description |

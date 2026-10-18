@@ -498,6 +498,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
     let (model_tx, model_rx) = flume::unbounded::<Model>();
     let (mode_tx, mode_rx) = flume::unbounded::<AgentMode>();
 
+    let runs = crate::runs::start_session(&params.config.runs, base_tx.clone());
     let session_ref = params.resumed.id.clone();
     let mailbox = open_mailbox(&params.resumed);
 
@@ -628,6 +629,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
                     registry: Arc::clone(ToolRegistry::global_arc()),
                     audience: ToolAudience::MAIN,
                     model_policy: Arc::clone(&params.model_policy),
+                    runs: runs.clone(),
                 },
                 turn.run_params(event_tx, Arc::clone(&context)),
             )

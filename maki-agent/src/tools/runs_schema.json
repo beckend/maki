@@ -1,0 +1,215 @@
+{
+  "runs": {
+    "properties": {
+      "from_offset": {
+        "description": "shell: byte offset in the log; the reply gives next_offset.",
+        "minimum": 0,
+        "type": "integer"
+      },
+      "full": {
+        "type": "boolean"
+      },
+      "id": {
+        "type": "string"
+      },
+      "include_finished": {
+        "description": "List only. Default true, finished runs retained for the session.",
+        "type": "boolean"
+      },
+      "scope": {
+        "description": "No id only. Default children. all includes siblings and ancestors.",
+        "enum": [
+          "children",
+          "descendants",
+          "all"
+        ],
+        "type": "string"
+      },
+      "tail": {
+        "description": "shell: last N lines. Default 40.",
+        "maximum": 200,
+        "minimum": 1,
+        "type": "integer"
+      }
+    },
+    "type": "object"
+  },
+  "send": {
+    "properties": {
+      "message": {
+        "description": "Up to 16 KiB. Be self-contained.",
+        "type": "string"
+      },
+      "mode": {
+        "description": "steer (default): next step of a running recipient, wakes an idle one. followup: after the recipient's current turn ends, as its own turn. quiet: delivered at the recipient's next model request, never wakes.",
+        "enum": [
+          "steer",
+          "followup",
+          "quiet"
+        ],
+        "type": "string"
+      },
+      "to": {
+        "description": "Run id or name, or \"parent\" / \"main\".",
+        "type": "string"
+      }
+    },
+    "required": [
+      "to",
+      "message"
+    ],
+    "type": "object"
+  },
+  "spawn": {
+    "properties": {
+      "command": {
+        "description": "shell only. Command line run with the user's shell.",
+        "type": "string"
+      },
+      "context": {
+        "description": "agent only. fork seeds the run with your completed turns, excluding the turn in flight (default fresh).",
+        "enum": [
+          "fresh",
+          "fork"
+        ],
+        "type": "string"
+      },
+      "cwd": {
+        "type": "string"
+      },
+      "description": {
+        "description": "3-8 word label for display and for default naming.",
+        "type": "string"
+      },
+      "kind": {
+        "enum": [
+          "agent",
+          "shell"
+        ],
+        "type": "string"
+      },
+      "model_tier": {
+        "description": "agent only. Clamped to your tier.",
+        "enum": [
+          "weak",
+          "medium",
+          "strong"
+        ],
+        "type": "string"
+      },
+      "name": {
+        "description": "Optional unique name others can address this run by. `main` and `parent` are reserved.",
+        "pattern": "^[a-z][a-z0-9-]{0,31}$",
+        "type": "string"
+      },
+      "notify": {
+        "description": "On finish: wake starts a turn if you are idle (default), quiet waits for your next turn, never sends nothing (read with runs).",
+        "enum": [
+          "wake",
+          "quiet",
+          "never"
+        ],
+        "type": "string"
+      },
+      "one_shot": {
+        "description": "agent only. Complete after the first result instead of staying available. Default false.",
+        "type": "boolean"
+      },
+      "output_schema": {
+        "description": "agent only. JSON Schema the final result must satisfy.",
+        "type": "object"
+      },
+      "prompt": {
+        "description": "agent only. The complete, self-contained task.",
+        "type": "string"
+      },
+      "subagent_type": {
+        "description": "agent only. research is read-only; general can edit. Default general.",
+        "enum": [
+          "research",
+          "general"
+        ],
+        "type": "string"
+      },
+      "thinking": {
+        "type": "string"
+      },
+      "timeout_secs": {
+        "description": "Wall clock limit. Default: 1800 for agents, 3600 for shell. Expiry ends the run as timed_out.",
+        "minimum": 1,
+        "type": "integer"
+      },
+      "watch": {
+        "description": "shell only. Regex; each matching output line becomes a notice (max 1 per second, then batched).",
+        "type": "string"
+      }
+    },
+    "required": [
+      "kind",
+      "description"
+    ],
+    "type": "object"
+  },
+  "stop": {
+    "properties": {
+      "detach": {
+        "type": "boolean"
+      },
+      "ids": {
+        "items": {
+          "type": "string"
+        },
+        "maxItems": 16,
+        "minItems": 1,
+        "type": "array"
+      },
+      "reason": {
+        "description": "Forwarded to the run as its last message.",
+        "type": "string"
+      },
+      "soft": {
+        "description": "Agents only. Cancel the current turn, stay idle, keep the inbox.",
+        "type": "boolean"
+      },
+      "wait_secs": {
+        "description": "Default 10.",
+        "maximum": 30,
+        "minimum": 0,
+        "type": "integer"
+      }
+    },
+    "required": [
+      "ids"
+    ],
+    "type": "object"
+  },
+  "wait": {
+    "properties": {
+      "ids": {
+        "items": {
+          "type": "string"
+        },
+        "maxItems": 16,
+        "minItems": 1,
+        "type": "array"
+      },
+      "mode": {
+        "enum": [
+          "all",
+          "any"
+        ],
+        "type": "string"
+      },
+      "timeout_secs": {
+        "description": "Default 60.",
+        "maximum": 600,
+        "minimum": 1,
+        "type": "integer"
+      }
+    },
+    "required": [
+      "ids"
+    ],
+    "type": "object"
+  }
+}
