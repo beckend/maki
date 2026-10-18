@@ -115,8 +115,9 @@ fn many_spawns_and_stops_leak_nothing_and_stay_bounded() {
         shown <= SPAWNS,
         "listing holds {shown} rows for {SPAWNS} runs"
     );
-    // Finished runs past `max_retained` become one-line tombstones; only
-    // those are bounded by the session run cap, the full units by retention.
+    // Finished runs past `max_retained` become one-line tombstones. Full
+    // units are bounded by retention, units plus tombstones by the session
+    // run cap (`session_max_runs`), which counts every spawn of this process.
     let (full, tombs) = {
         let table = hub.table();
         (table.units.len(), table.tombstones.len())

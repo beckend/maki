@@ -600,6 +600,10 @@ struct UnitTable {
     agents: HashMap<UnitId, Arc<AgentRun>>,
     /// Finished runs that left memory (design 7.4), kept to revive by handle or name.
     tombstones: HashMap<UnitId, Unit>,
+    /// Runs spawned by this process; what `session_max_runs` limits. Tombstones
+    /// adopted from an earlier process are not counted, or a restart with a
+    /// full history would refuse every spawn.
+    spawned: usize,
     /// The last turn's result of each `Idle` agent.
     idle_results: HashMap<UnitId, UnitResult>,
     /// Committed history a `context=fork` spawn starts from, by the id of the
@@ -1042,8 +1046,7 @@ impl UnitHub {
         }
         let live = table.live_children(caller);
         if live >= usize::from(self.limits.max_children_per_run)
-            || table.units.len() + table.tombstones.len()
-                >= usize::from(self.limits.session_max_runs)
+            || table.spawned >= usize::from(self.limits.session_max_runs)
         {
             return Err(UnitError::SpawnLimit);
         }
@@ -1144,6 +1147,7 @@ impl UnitHub {
         if !running {
             self.jot_state(handle.as_str(), "queued");
         }
+        table.spawned += 1;
         table.units.insert(id, unit);
         if is_agent {
             table.pool.request(id, false);
