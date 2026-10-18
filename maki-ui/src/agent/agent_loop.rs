@@ -82,8 +82,11 @@ impl AgentLoop {
         model_policy: Arc<ModelPolicy>,
     ) -> Self {
         let mcp = mcp_handle.map(|h| McpSession::new(h, &resumed.history));
-        let runs =
-            maki_agent::runs::start_session(&config.runs, EventSender::new(agent_tx.clone(), 0));
+        let runs = maki_agent::runs::start_session(
+            &config.runs,
+            EventSender::new(agent_tx.clone(), 0),
+            resumed.id.id(),
+        );
         let seed = mailbox.publish_seed(
             AgentSeed::new(
                 resumed.id,
