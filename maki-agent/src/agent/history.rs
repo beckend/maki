@@ -114,7 +114,7 @@ impl History {
         self.landed.extend(
             items
                 .iter()
-                .filter(|i| i.id.0 != 0)
+                .filter(|i| i.id.0 != 0 || i.notice.is_some())
                 .cloned()
                 .map(|i| (i, step)),
         );

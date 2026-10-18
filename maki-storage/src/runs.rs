@@ -483,6 +483,11 @@ impl RunJournal {
             LockError::Held { .. } => JournalError::Locked,
             LockError::Io { source, .. } => JournalError::Io(source),
         })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(dir.join(LOCK_FILE), fs::Permissions::from_mode(0o600));
+        }
         let replay = Replay::read(&dir);
         let dropped = Arc::new(AtomicU64::new(0));
         let degraded = Arc::new(AtomicBool::new(false));
