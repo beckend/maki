@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
+use std::time::{Duration, SystemTime};
 
 use etcetera::base_strategy::BaseStrategy;
 
@@ -9,6 +10,10 @@ use crate::StateDir;
 const FALLBACK_DIR: &str = ".maki";
 const APP_NAME: &str = "maki";
 const PROJECTS_DIR: &str = "projects";
+const RUNS_DIR: &str = "runs";
+const RUN_LOG_EXT: &str = "log";
+const RUN_LOG_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 3600);
+const RUN_LOG_SESSION_BUDGET: u64 = 512 * 1024 * 1024;
 pub(crate) const GIT_MARKER: &str = ".git";
 const UNNAMED_PROJECT: &str = "root";
 const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
@@ -286,6 +291,73 @@ pub fn state_dir() -> Result<PathBuf, std::io::Error> {
     ensure(&p.state)
 }
 
+/// Where one session's background shell logs live (`0700`). Creating it also
+/// prunes old logs, so retention needs no separate hook.
+pub fn runs_dir(session: &str) -> Result<PathBuf, std::io::Error> {
+    let root = state_dir()?.join(RUNS_DIR);
+    let dir = root.join(session);
+    create_private_dir(&dir)?;
+    prune_run_logs(&root, &dir, RUN_LOG_MAX_AGE, RUN_LOG_SESSION_BUDGET);
+    Ok(dir)
+}
+
+fn create_private_dir(dir: &Path) -> Result<(), std::io::Error> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder.create(dir)
+}
+
+/// Deletes logs older than `max_age` under every session dir of `root`, then
+/// the oldest logs of `own` until it fits `own_budget`. Other sessions may be
+/// live in another process, so only their stale logs go.
+pub fn prune_run_logs(root: &Path, own: &Path, max_age: Duration, own_budget: u64) {
+    let now = SystemTime::now();
+    let Ok(sessions) = fs::read_dir(root) else {
+        return;
+    };
+    for session in sessions.flatten().map(|e| e.path()) {
+        let mut logs = run_logs(&session);
+        logs.retain(|(path, _, modified)| {
+            let stale = now
+                .duration_since(*modified)
+                .is_ok_and(|age| age >= max_age);
+            if stale {
+                let _ = fs::remove_file(path);
+            }
+            !stale
+        });
+        if session != own {
+            continue;
+        }
+        logs.sort_by_key(|(_, _, modified)| *modified);
+        let mut total: u64 = logs.iter().map(|(_, len, _)| len).sum();
+        for (path, len, _) in logs {
+            if total <= own_budget {
+                break;
+            }
+            if fs::remove_file(path).is_ok() {
+                total -= len;
+            }
+        }
+    }
+}
+
+fn run_logs(dir: &Path) -> Vec<(PathBuf, u64, SystemTime)> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x == RUN_LOG_EXT))
+        .filter_map(|e| {
+            let meta = e.metadata().ok()?;
+            Some((e.path(), meta.len(), meta.modified().ok()?))
+        })
+        .collect()
+}
+
 pub fn logs_dir() -> Result<PathBuf, std::io::Error> {
     let p = resolve().ok_or_else(err)?;
     ensure(&p.logs)
@@ -368,6 +440,28 @@ mod tests {
     const KEYED_FILE: &str = "f.rs";
     const SUBDIR: &str = "sub";
     const STATE_SUBDIR: &str = "state";
+
+    #[test]
+    fn prune_drops_stale_logs_and_trims_own_session_to_budget() {
+        let root = tempfile::tempdir().unwrap();
+        let own = root.path().join("own");
+        let other = root.path().join("other");
+        for dir in [&own, &other] {
+            fs::create_dir_all(dir).unwrap();
+            fs::write(dir.join("a.log"), [0u8; 10]).unwrap();
+            fs::write(dir.join("b.log"), [0u8; 10]).unwrap();
+            fs::write(dir.join("keep.txt"), [0u8; 10]).unwrap();
+        }
+
+        prune_run_logs(root.path(), &own, Duration::from_secs(3600), 10);
+        assert_eq!(run_logs(&own).len(), 1);
+        assert_eq!(run_logs(&other).len(), 2);
+        assert!(own.join("keep.txt").exists());
+
+        prune_run_logs(root.path(), &own, Duration::ZERO, u64::MAX);
+        assert!(run_logs(&own).is_empty() && run_logs(&other).is_empty());
+        assert!(other.join("keep.txt").exists());
+    }
 
     #[test_case(b"", 0xcbf29ce484222325 ; "empty")]
     #[test_case(b"a", 0xaf63dc4c8601ec8c ; "single_byte")]
