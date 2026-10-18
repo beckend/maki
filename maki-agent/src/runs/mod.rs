@@ -1,8 +1,11 @@
 //! Background runs: subagents and shell jobs behind one id scheme, state
-//! machine and hub. Phase 1 only records and lists them, nothing executes.
+//! machine and hub. Shell runs execute (`shell.rs`); agent runs stay queued
+//! until phase 3.
 
 pub mod clock;
 pub mod limits;
+pub mod notice;
+pub mod shell;
 mod topology;
 
 use std::collections::HashMap;
@@ -10,7 +13,10 @@ use std::fmt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
+
+use event_listener::Event;
+use futures_lite::future::or;
 
 use maki_providers::TokenUsage;
 use maki_storage::id::MakiId;
@@ -18,11 +24,15 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::EventSender;
+use crate::cancel::CancelToken;
 use crate::tools::ToolAudience;
 use crate::tools::registry::Tool;
 
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use limits::UnitLimits;
+pub use notice::{Notice, NoticeKind};
+use shell::ShellRun;
+pub use shell::{OutputSlice, ShellOptions};
 
 const AGENT_HANDLE_PREFIX: &str = "ag";
 const SHELL_HANDLE_PREFIX: &str = "sh";
@@ -477,9 +487,39 @@ pub struct UnitView {
     pub command: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitMode {
+    All,
+    Any,
+}
+
+/// `soft` and `detach` only mean something to agents (phase 3).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StopOpts {
+    pub soft: bool,
+    pub detach: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StopStatus {
+    /// Signalled or already on its way down; it settles on its own.
+    Requested,
+    AlreadyFinished(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StopOutcome {
+    pub id: UnitId,
+    pub status: Result<StopStatus, UnitError>,
+}
+
 #[derive(Default)]
 struct UnitTable {
     units: HashMap<UnitId, Unit>,
+    shells: HashMap<UnitId, Arc<ShellRun>>,
+    /// Queued for the owner, oldest first; delivery is phase 4b.
+    notices: HashMap<UnitId, Vec<Notice>>,
+    notice_seq: HashMap<UnitId, u64>,
     /// Creation order, which is the order every listing uses.
     order: Vec<UnitId>,
     handles: HashMap<UnitHandle, UnitId>,
@@ -506,6 +546,12 @@ impl UnitTable {
             if !self.handles.contains_key(&handle) {
                 return (id, handle);
             }
+        }
+    }
+
+    fn drop_notices_of(&mut self, run: UnitId) {
+        for queue in self.notices.values_mut() {
+            queue.retain(|n| n.run != run);
         }
     }
 
@@ -542,7 +588,11 @@ impl UnitTable {
             state: unit.state.clone(),
             age_secs: unit.created_at.elapsed().map_or(0, |d| d.as_secs()),
             cost: unit.cost,
-            progress: unit.progress.clone(),
+            progress: unit.progress.clone().or_else(|| {
+                matches!(unit.state, UnitState::Running)
+                    .then(|| self.shells.get(&id)?.last_line())
+                    .flatten()
+            }),
             command: match &unit.kind {
                 UnitKind::Shell(s) => Some(s.command.clone()),
                 UnitKind::Agent(_) => None,
@@ -557,17 +607,31 @@ pub struct UnitHub {
     units: Mutex<UnitTable>,
     limits: UnitLimits,
     clock: Arc<dyn Clock>,
+    shell: ShellOptions,
+    /// Fired after any run settles; `wait` listens before it looks.
+    settled: Event,
     #[expect(dead_code, reason = "run events are emitted from phase 3 on")]
     events: EventSender,
 }
 
 impl UnitHub {
     pub fn new(limits: UnitLimits, events: EventSender, clock: Arc<dyn Clock>) -> Arc<Self> {
+        Self::with_shell_options(limits, events, clock, ShellOptions::default())
+    }
+
+    pub fn with_shell_options(
+        limits: UnitLimits,
+        events: EventSender,
+        clock: Arc<dyn Clock>,
+        shell: ShellOptions,
+    ) -> Arc<Self> {
         Arc::new(Self {
             main: UnitId::new(),
             units: Mutex::default(),
             limits,
             clock,
+            shell,
+            settled: Event::new(),
             events,
         })
     }
@@ -592,7 +656,13 @@ impl UnitHub {
             .ok_or(UnitError::UnknownRun)
     }
 
-    pub fn spawn(&self, caller: UnitId, mut req: SpawnRequest) -> Result<SpawnAck, UnitError> {
+    /// Shell runs start at once (capacity is the spawn limits); agent runs
+    /// wait in the queue until phase 3 gives them a driver.
+    pub fn spawn(
+        self: &Arc<Self>,
+        caller: UnitId,
+        mut req: SpawnRequest,
+    ) -> Result<SpawnAck, UnitError> {
         let description = req.description.clone();
         let name = req.name.take();
         let notice_policy = req.notify.unwrap_or_default();
@@ -632,6 +702,15 @@ impl UnitHub {
             return Err(UnitError::SpawnLimit);
         }
         let (id, handle) = table.fresh_identity(kind.kind());
+        let shell_spec = match &kind {
+            UnitKind::Shell(spec) => Some(spec.clone()),
+            UnitKind::Agent(_) => None,
+        };
+        let state = if shell_spec.is_some() {
+            UnitState::Running
+        } else {
+            UnitState::Queued
+        };
         let unit = Unit {
             id,
             handle: handle.clone(),
@@ -642,9 +721,9 @@ impl UnitHub {
             kind,
             description,
             origin_tool_use_id,
-            state: UnitState::Queued,
+            state: state.clone(),
             created_at: SystemTime::now(),
-            started_at: None,
+            started_at: shell_spec.is_some().then(SystemTime::now),
             finished_at: None,
             last_activity: self.clock.now(),
             progress: None,
@@ -658,14 +737,267 @@ impl UnitHub {
         table.children.entry(caller).or_default().push(id);
         table.order.push(id);
         table.units.insert(id, unit);
+        let queue_position = table.queue_position(id);
+        let started = shell_spec.map(|spec| {
+            let log = self
+                .shell
+                .dir
+                .as_ref()
+                .map(|dir| dir.join(format!("{handle}.log")));
+            let run = ShellRun::new(log);
+            table.shells.insert(id, Arc::clone(&run));
+            (spec, run)
+        });
+        drop(table);
+        if let Some((spec, run)) = started {
+            shell::start(
+                Arc::downgrade(self),
+                id,
+                run,
+                spec,
+                Arc::clone(&self.clock),
+                self.shell.clone(),
+            );
+        }
         Ok(SpawnAck {
             id,
             handle,
             name,
             kind,
-            state: UnitState::Queued,
-            queue_position: table.queue_position(id),
+            state,
+            queue_position,
         })
+    }
+
+    /// First transition into `Done` wins. The notice is queued in the same
+    /// critical section, so a `wait` racing this settle cannot miss it.
+    pub(crate) fn settle(&self, id: UnitId, terminal: Terminal, output_bytes: u64) {
+        let mut table = self.table();
+        self.settle_locked(&mut table, id, terminal, output_bytes);
+        drop(table);
+        self.settled.notify(usize::MAX);
+    }
+
+    fn settle_locked(
+        &self,
+        table: &mut UnitTable,
+        id: UnitId,
+        terminal: Terminal,
+        output_bytes: u64,
+    ) {
+        let Some(unit) = table.units.get_mut(&id) else {
+            return;
+        };
+        if unit.state.is_done() {
+            return;
+        }
+        let text = match &unit.kind {
+            UnitKind::Shell(spec) if unit.notice_policy != NoticePolicy::Never => {
+                Some(notice::shell_settled(
+                    &unit.handle,
+                    &unit.name,
+                    &terminal,
+                    spec.timeout_secs,
+                    output_bytes,
+                ))
+            }
+            _ => None,
+        };
+        unit.state = UnitState::Done(Box::new(terminal));
+        unit.finished_at = Some(SystemTime::now());
+        unit.last_activity = self.clock.now();
+        let (owner, wake) = (unit.owner, unit.notice_policy == NoticePolicy::Wake);
+        if let Some(text) = text {
+            let seq = table.notice_seq.entry(owner).or_default();
+            *seq += 1;
+            let notice = Notice {
+                seq: *seq,
+                run: id,
+                kind: NoticeKind::Settled,
+                wake,
+                text,
+                created: SystemTime::now(),
+            };
+            table.notices.entry(owner).or_default().push(notice);
+        }
+    }
+
+    pub(crate) fn mark_stopping(&self, id: UnitId) {
+        if let Some(unit) = self.table().units.get_mut(&id)
+            && matches!(unit.state, UnitState::Running)
+        {
+            unit.state = UnitState::Stopping;
+        }
+    }
+
+    fn is_below(&self, table: &UnitTable, caller: UnitId, id: UnitId) -> bool {
+        if caller == self.main {
+            return table.units.contains_key(&id);
+        }
+        let mut cur = id;
+        while let Some(unit) = table.units.get(&cur) {
+            if unit.parent == caller {
+                return true;
+            }
+            cur = unit.parent;
+        }
+        false
+    }
+
+    /// Starts the stop and returns without waiting: a shell gets SIGTERM, then
+    /// SIGKILL once the grace period is over, and settles as `Killed`. The
+    /// owner asked, so no notice follows. Safe to repeat.
+    pub fn stop(&self, caller: UnitId, ids: &[UnitId], _opts: StopOpts) -> Vec<StopOutcome> {
+        let mut table = self.table();
+        let mut settled_queued = false;
+        let outcomes = ids
+            .iter()
+            .map(|&id| {
+                let status = if !self.is_below(&table, caller, id) {
+                    Err(UnitError::NotReachable)
+                } else {
+                    let unit = table.units.get_mut(&id).expect("checked by is_below");
+                    match unit.state.clone() {
+                        UnitState::Done(t) => {
+                            Ok(StopStatus::AlreadyFinished(t.reason.as_str().to_owned()))
+                        }
+                        UnitState::Queued => {
+                            unit.notice_policy = NoticePolicy::Never;
+                            let terminal = Terminal {
+                                reason: DoneReason::Killed,
+                                exit_code: None,
+                                detail: None,
+                                result: UnitResult::default(),
+                            };
+                            self.settle_locked(&mut table, id, terminal, 0);
+                            settled_queued = true;
+                            Ok(StopStatus::Requested)
+                        }
+                        state => {
+                            unit.notice_policy = NoticePolicy::Never;
+                            if matches!(state, UnitState::Running) {
+                                unit.state = UnitState::Stopping;
+                            }
+                            match table.shells.get(&id) {
+                                Some(run) => {
+                                    run.request_stop();
+                                    Ok(StopStatus::Requested)
+                                }
+                                // Agents run from phase 3.
+                                None => Err(UnitError::NotReachable),
+                            }
+                        }
+                    }
+                };
+                StopOutcome { id, status }
+            })
+            .collect();
+        drop(table);
+        if settled_queued {
+            self.settled.notify(usize::MAX);
+        }
+        outcomes
+    }
+
+    /// Returns the current view of `ids` once they are settled (`Done` or
+    /// `Idle`) per `mode`, or when `timeout` or `cancel` ends the wait; the
+    /// caller can tell which from the states. Results returned as settled
+    /// are consumed, so they do not come again as notices; a timeout claims
+    /// nothing, and a cancel leaves the runs alone.
+    pub async fn wait(
+        &self,
+        _caller: UnitId,
+        ids: &[UnitId],
+        mode: WaitMode,
+        timeout: Duration,
+        cancel: &CancelToken,
+    ) -> Vec<UnitView> {
+        let deadline = self.clock.now() + timeout;
+        loop {
+            let listener = self.settled.listen();
+            let (views, satisfied) = {
+                let mut table = self.table();
+                let views: Vec<UnitView> = ids
+                    .iter()
+                    .filter(|id| table.units.contains_key(id))
+                    .map(|&id| table.view(id))
+                    .collect();
+                let settled =
+                    |v: &UnitView| matches!(v.state, UnitState::Done(_) | UnitState::Idle);
+                let satisfied = match mode {
+                    WaitMode::All => views.iter().all(settled),
+                    WaitMode::Any => views.iter().any(settled),
+                };
+                if satisfied {
+                    for view in views.iter().filter(|v| settled(v)) {
+                        table.drop_notices_of(view.id);
+                    }
+                }
+                (views, satisfied)
+            };
+            if satisfied || cancel.is_cancelled() {
+                return views;
+            }
+            let ended = or(
+                or(
+                    async {
+                        listener.await;
+                        false
+                    },
+                    async {
+                        self.clock.sleep_until(deadline).await;
+                        true
+                    },
+                ),
+                async {
+                    cancel.cancelled().await;
+                    true
+                },
+            )
+            .await;
+            if ended {
+                let table = self.table();
+                return ids
+                    .iter()
+                    .filter(|id| table.units.contains_key(id))
+                    .map(|&id| table.view(id))
+                    .collect();
+            }
+        }
+    }
+
+    /// Output of a shell run since `reader` last consumed, or a byte page
+    /// when `from` is given. `consume` moves the reader's cursor; observers
+    /// pass false. Agents have no output.
+    pub fn read_output(
+        &self,
+        reader: UnitId,
+        id: UnitId,
+        from: Option<u64>,
+        tail: usize,
+        consume: bool,
+    ) -> OutputSlice {
+        let run = self.table().shells.get(&id).cloned();
+        run.map(|run| run.read(reader, from, tail, consume))
+            .unwrap_or_default()
+    }
+
+    pub fn pending_notices(&self, owner: UnitId) -> Vec<Notice> {
+        self.table()
+            .notices
+            .get(&owner)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Hands out everything queued for `owner`.
+    pub fn take_notices(&self, owner: UnitId) -> Vec<Notice> {
+        self.table().notices.remove(&owner).unwrap_or_default()
+    }
+
+    /// The caller has the run's result in hand, so its notice is moot.
+    pub fn consume_notice_of(&self, run: UnitId) {
+        self.table().drop_notices_of(run);
     }
 
     pub fn list(&self, caller: UnitId, scope: Scope) -> Vec<UnitView> {
@@ -710,6 +1042,16 @@ impl UnitHub {
                     table.units.contains_key(&id).then_some(id)
                 })
                 .ok_or(UnitError::UnknownRun),
+        }
+    }
+}
+
+impl Drop for UnitHub {
+    /// No grace: nobody is left to wait for it.
+    fn drop(&mut self) {
+        let table = self.units.get_mut().unwrap_or_else(|e| e.into_inner());
+        for run in table.shells.values() {
+            run.kill_now();
         }
     }
 }
@@ -759,9 +1101,25 @@ pub fn sync_registration(
 
 /// The hub for one root session and the root agent's handle on it, or `None`
 /// when `[agent.runs]` is off.
-pub fn start_session(config: &maki_config::RunsConfig, events: EventSender) -> Option<RunsCtx> {
+pub fn start_session(
+    config: &maki_config::RunsConfig,
+    events: EventSender,
+    session: MakiId,
+) -> Option<RunsCtx> {
     config.enabled.then(|| {
-        let hub = UnitHub::new(UnitLimits::from(config), events, Arc::new(SystemClock));
+        let dir = maki_storage::paths::runs_dir(&session.to_string())
+            .inspect_err(|e| tracing::warn!(%e, "run logs unavailable, keeping output in memory"))
+            .ok();
+        let shell = ShellOptions {
+            dir,
+            ..ShellOptions::default()
+        };
+        let hub = UnitHub::with_shell_options(
+            UnitLimits::from(config),
+            events,
+            Arc::new(SystemClock),
+            shell,
+        );
         let self_run = hub.main();
         RunsCtx { hub, self_run }
     })
@@ -965,16 +1323,22 @@ mod tests {
     }
 
     #[test]
-    fn spawned_runs_are_queued_in_order() {
+    fn agents_queue_in_order_and_shells_start() {
         let hub = hub();
         let main = hub.main();
         let a = hub.spawn(main, request(RunKind::Agent, "a")).unwrap();
-        let b = hub.spawn(main, request(RunKind::Shell, "b")).unwrap();
+        let b = hub.spawn(main, request(RunKind::Agent, "b")).unwrap();
+        let sh = hub.spawn(main, request(RunKind::Shell, "c")).unwrap();
         assert_eq!(a.queue_position, Some((1, 1)));
         assert_eq!(b.queue_position, Some((2, 2)));
+        assert_eq!((sh.queue_position, sh.state.label()), (None, "running"));
         let views = hub.list(main, Scope::Children);
-        assert_eq!(views.len(), 2);
-        assert!(views.iter().all(|v| matches!(v.state, UnitState::Queued)));
+        assert_eq!(views.len(), 3);
+        assert!(
+            views[..2]
+                .iter()
+                .all(|v| matches!(v.state, UnitState::Queued))
+        );
     }
 
     #[test]

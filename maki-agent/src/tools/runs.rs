@@ -4,6 +4,7 @@
 use std::borrow::Cow;
 use std::fmt::Write;
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -18,7 +19,12 @@ use super::{
     compact_duration,
 };
 use crate::ToolOutput;
-use crate::runs::{RunKind, RunsCtx, Scope, SpawnRequest, UnitView};
+use crate::cancel::CancelToken;
+use crate::runs::shell::command_scopes;
+use crate::runs::{
+    OutputSlice, RunKind, RunsCtx, Scope, SpawnRequest, StopOpts, StopStatus, UnitId, UnitState,
+    UnitView, WaitMode,
+};
 use maki_config::Permission;
 
 pub const SPAWN_TOOL_NAME: &str = "spawn";
@@ -36,6 +42,9 @@ pub const RUN_TOOL_NAMES: [&str; 5] = [
 
 const NOT_IMPLEMENTED: &str = "NOT_IMPLEMENTED";
 const NO_RUNS: &str = "no runs";
+const DEFAULT_WAIT_SECS: u64 = 60;
+const DEFAULT_STOP_WAIT_SECS: u64 = 10;
+const DEFAULT_TAIL_LINES: usize = 40;
 const NO_RUNTIME: &str = "runs are not available in this session";
 const SPAWNERS: ToolAudience = ToolAudience::MAIN.union(ToolAudience::GENERAL_SUB);
 
@@ -118,19 +127,31 @@ struct RunsArgs {
     id: Option<String>,
     scope: Option<String>,
     include_finished: Option<bool>,
+    tail: Option<usize>,
+    from_offset: Option<u64>,
 }
 
 #[derive(Deserialize)]
-struct IdsArgs {
+struct WaitArgs {
     ids: Vec<String>,
+    mode: Option<String>,
+    timeout_secs: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct StopArgs {
+    ids: Vec<String>,
+    soft: Option<bool>,
+    detach: Option<bool>,
+    wait_secs: Option<u64>,
 }
 
 enum Call {
     Spawn(Box<SpawnRequest>),
     Send(SendArgs),
     Runs(RunsArgs),
-    Wait(IdsArgs),
-    Stop(IdsArgs),
+    Wait(WaitArgs),
+    Stop(StopArgs),
 }
 
 impl Which {
@@ -289,7 +310,8 @@ impl ToolInvocation for RunInvocation {
             Call::Spawn(req) => req.name.clone().unwrap_or_else(|| req.description.clone()),
             Call::Send(args) => args.to.clone(),
             Call::Runs(args) => args.id.clone().unwrap_or_default(),
-            Call::Wait(args) | Call::Stop(args) => args.ids.join(", "),
+            Call::Wait(args) => args.ids.join(", "),
+            Call::Stop(args) => args.ids.join(", "),
         };
         HeaderFuture::Ready(HeaderResult::plain(header))
     }
@@ -297,7 +319,13 @@ impl ToolInvocation for RunInvocation {
     fn permission_scopes(&self) -> BoxFuture<'_, Option<PermissionScopes>> {
         let scopes = match &self.0 {
             Call::Spawn(req) if req.kind == RunKind::Shell => {
-                req.command.clone().map(PermissionScopes::single)
+                req.command.as_deref().map(|command| {
+                    let (scopes, force_prompt) = command_scopes(command);
+                    PermissionScopes {
+                        scopes,
+                        force_prompt,
+                    }
+                })
             }
             _ => None,
         };
@@ -305,20 +333,20 @@ impl ToolInvocation for RunInvocation {
     }
 
     fn execute<'a>(self: Box<Self>, ctx: &'a ToolContext) -> ExecFuture<'a> {
-        let result = match (self.0, ctx.runs.as_ref()) {
-            (_, None) => Err(NO_RUNTIME.to_owned()),
-            (Call::Spawn(mut req), Some(runs)) => {
-                req.origin_tool_use_id = ctx.tool_use_id.as_deref().map(Arc::from);
-                spawn(runs, *req)
-            }
-            (Call::Runs(args), Some(runs)) => list_or_show(runs, args),
-            (Call::Send(_) | Call::Wait(_) | Call::Stop(_), Some(_)) => {
-                Err(NOT_IMPLEMENTED.to_owned())
-            }
-        };
-        Box::pin(std::future::ready(ToolExecResult::from(
-            result.map(|text| ToolOutput::Plain(text.into())),
-        )))
+        Box::pin(async move {
+            let result = match (self.0, ctx.runs.as_ref()) {
+                (_, None) => Err(NO_RUNTIME.to_owned()),
+                (Call::Spawn(mut req), Some(runs)) => {
+                    req.origin_tool_use_id = ctx.tool_use_id.as_deref().map(Arc::from);
+                    spawn(runs, *req)
+                }
+                (Call::Runs(args), Some(runs)) => list_or_show(runs, args),
+                (Call::Wait(args), Some(runs)) => wait(runs, args, &ctx.cancel).await,
+                (Call::Stop(args), Some(runs)) => stop(runs, args, &ctx.cancel).await,
+                (Call::Send(_), Some(_)) => Err(NOT_IMPLEMENTED.to_owned()),
+            };
+            ToolExecResult::from(result.map(|text| ToolOutput::Plain(text.into())))
+        })
     }
 }
 
@@ -339,17 +367,133 @@ fn spawn(runs: &RunsCtx, req: SpawnRequest) -> Result<String, String> {
     ))
 }
 
+fn resolve_all(runs: &RunsCtx, keys: &[String]) -> Result<Vec<UnitId>, String> {
+    keys.iter()
+        .map(|key| {
+            runs.hub
+                .resolve(runs.self_run, key)
+                .map_err(|e| format!("{e}: {key}"))
+        })
+        .collect()
+}
+
+async fn wait(runs: &RunsCtx, args: WaitArgs, cancel: &CancelToken) -> Result<String, String> {
+    let ids = resolve_all(runs, &args.ids)?;
+    let mode = match args.mode.as_deref() {
+        Some("any") => WaitMode::Any,
+        _ => WaitMode::All,
+    };
+    let timeout = Duration::from_secs(args.timeout_secs.unwrap_or(DEFAULT_WAIT_SECS));
+    let views = runs
+        .hub
+        .wait(runs.self_run, &ids, mode, timeout, cancel)
+        .await;
+    let settled = |v: &UnitView| matches!(v.state, UnitState::Done(_) | UnitState::Idle);
+    let satisfied = match mode {
+        WaitMode::All => views.iter().all(settled),
+        WaitMode::Any => views.iter().any(settled),
+    };
+    if !satisfied && cancel.is_cancelled() {
+        return Err("cancelled; the runs keep running".to_owned());
+    }
+    let mut out = String::new();
+    for view in &views {
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        out.push_str(&record(view));
+        if let UnitState::Done(t) = &view.state
+            && !t.result.summary.is_empty()
+        {
+            let _ = write!(out, "\nlast output:\n{}", t.result.summary);
+        }
+    }
+    if !satisfied {
+        let pending: Vec<String> = views
+            .iter()
+            .filter(|v| !settled(v))
+            .map(|v| v.handle.to_string())
+            .collect();
+        let _ = write!(
+            out,
+            "\n\nStill running: {}. Do not wait again immediately; do other work, you will be notified when they finish.",
+            pending.join(", ")
+        );
+    }
+    Ok(out)
+}
+
+async fn stop(runs: &RunsCtx, args: StopArgs, cancel: &CancelToken) -> Result<String, String> {
+    let ids = resolve_all(runs, &args.ids)?;
+    let opts = StopOpts {
+        soft: args.soft.unwrap_or(false),
+        detach: args.detach.unwrap_or(false),
+    };
+    let outcomes = runs.hub.stop(runs.self_run, &ids, opts);
+    let requested: Vec<UnitId> = outcomes
+        .iter()
+        .filter(|o| o.status == Ok(StopStatus::Requested))
+        .map(|o| o.id)
+        .collect();
+    let timeout = Duration::from_secs(args.wait_secs.unwrap_or(DEFAULT_STOP_WAIT_SECS));
+    let settled = runs
+        .hub
+        .wait(runs.self_run, &requested, WaitMode::All, timeout, cancel)
+        .await;
+    let mut lines = Vec::new();
+    let mut any_ok = false;
+    for (key, outcome) in args.ids.iter().zip(&outcomes) {
+        let label = runs
+            .hub
+            .get(outcome.id)
+            .map_or_else(|| key.clone(), |v| format!("{} \"{}\"", v.handle, v.name));
+        let verdict = match &outcome.status {
+            Err(e) => format!("{e}"),
+            Ok(StopStatus::AlreadyFinished(reason)) => {
+                any_ok = true;
+                format!("already_finished({reason})")
+            }
+            Ok(StopStatus::Requested) => {
+                any_ok = true;
+                match settled
+                    .iter()
+                    .find(|v| v.id == outcome.id)
+                    .map(|v| &v.state)
+                {
+                    Some(UnitState::Done(_)) => "stopped".to_owned(),
+                    _ => "still_stopping".to_owned(),
+                }
+            }
+        };
+        lines.push(format!("{label}: {verdict}"));
+    }
+    let text = lines.join("\n");
+    if any_ok { Ok(text) } else { Err(text) }
+}
+
 fn list_or_show(runs: &RunsCtx, args: RunsArgs) -> Result<String, String> {
     if let Some(key) = args.id {
         let id = runs
             .hub
             .resolve(runs.self_run, &key)
             .map_err(|e| format!("{e}: {key}"))?;
-        return runs
+        let view = runs
             .hub
             .get(id)
-            .map(|view| record(&view))
-            .ok_or_else(|| format!("UNKNOWN_RUN: {key}"));
+            .ok_or_else(|| format!("UNKNOWN_RUN: {key}"))?;
+        let mut out = record(&view);
+        if view.kind == RunKind::Shell {
+            let from = args.from_offset;
+            let tail = args.tail.unwrap_or(DEFAULT_TAIL_LINES);
+            let slice = runs
+                .hub
+                .read_output(runs.self_run, id, from, tail, from.is_none());
+            let _ = write!(out, "\n{}", render_output(&slice));
+        }
+        if view.state.is_done() {
+            runs.hub.consume_notice_of(id);
+        }
+        return Ok(out);
     }
     let scope = match args.scope.as_deref() {
         Some("descendants") => Scope::Descendants,
@@ -363,13 +507,22 @@ fn list_or_show(runs: &RunsCtx, args: RunsArgs) -> Result<String, String> {
         .into_iter()
         .filter(|v| include_finished || !v.state.is_done())
         .collect();
-    if views.is_empty() {
+    let notices = runs.hub.take_notices(runs.self_run);
+    if views.is_empty() && notices.is_empty() {
         return Ok(NO_RUNS.to_owned());
+    }
+    let mut out = String::new();
+    for notice in &notices {
+        let _ = writeln!(out, "{}\n", notice.text);
+    }
+    if views.is_empty() {
+        out.truncate(out.trim_end().len());
+        return Ok(out);
     }
     let caller = runs.hub.get(runs.self_run);
     let base_depth = caller.as_ref().map_or(0, |v| v.depth);
     let me = caller.map_or_else(|| "main".to_owned(), |v| v.name.to_string());
-    let mut out = format!("{me} (you)\n");
+    let _ = writeln!(out, "{me} (you)");
     for v in &views {
         let indent = "  ".repeat(usize::from(v.depth.saturating_sub(base_depth)));
         let detail = v
@@ -392,6 +545,29 @@ fn list_or_show(runs: &RunsCtx, args: RunsArgs) -> Result<String, String> {
     Ok(out)
 }
 
+fn render_output(slice: &OutputSlice) -> String {
+    let mut out = format!(
+        "output (offsets {}..{}, next_offset={}):",
+        slice.start_offset, slice.next_offset, slice.next_offset
+    );
+    if slice.skipped_bytes > 0 {
+        let _ = write!(
+            out,
+            "\n[{} earlier bytes not shown; from_offset=0 pages the log]",
+            slice.skipped_bytes
+        );
+    }
+    if slice.text.is_empty() {
+        out.push_str("\n(no new output)");
+    } else {
+        let _ = write!(out, "\n{}", slice.text.trim_end());
+    }
+    if let Some(log) = &slice.log {
+        let _ = write!(out, "\nlog: {}", log.display());
+    }
+    out
+}
+
 fn record(v: &UnitView) -> String {
     let mut out = format!(
         "{} \"{}\" ({}, {})\ndescription: {}\nage: {}",
@@ -404,6 +580,19 @@ fn record(v: &UnitView) -> String {
     );
     if let Some(command) = &v.command {
         let _ = write!(out, "\ncommand: {command}");
+    }
+    if let UnitState::Done(t) = &v.state {
+        if let Some(code) = t.exit_code {
+            let _ = write!(out, "\nexit_code: {code}");
+        }
+        if let Some(detail) = &t.detail {
+            let _ = write!(out, "\ndetail: {detail}");
+        }
+        let _ = write!(
+            out,
+            "\nelapsed: {}",
+            compact_duration(t.result.elapsed_ms / 1000)
+        );
     }
     out
 }
@@ -423,15 +612,16 @@ mod tests {
     }
 
     fn ctx() -> ToolContext {
+        ctx_with_clock().0
+    }
+
+    fn ctx_with_clock() -> (ToolContext, Arc<ManualClock>) {
         let mut ctx = stub_ctx(&AgentMode::Build);
-        let hub = UnitHub::new(
-            UnitLimits::default(),
-            ctx.event_tx.clone(),
-            Arc::new(ManualClock::default()),
-        );
+        let clock = Arc::new(ManualClock::default());
+        let hub = UnitHub::new(UnitLimits::default(), ctx.event_tx.clone(), clock.clone());
         let self_run = hub.main();
         ctx.runs = Some(RunsCtx { hub, self_run });
-        ctx
+        (ctx, clock)
     }
 
     fn call(which: Which, ctx: &ToolContext, input: Value) -> Result<String, String> {
@@ -481,18 +671,15 @@ mod tests {
         let shell = call(
             Which::Spawn,
             &ctx,
-            json!({"kind": "shell", "description": "build", "command": "make"}),
+            json!({"kind": "shell", "description": "build", "command": "sleep 600"}),
         )
         .unwrap();
-        assert!(
-            shell.ends_with("(shell, queued, position 2 of 2)"),
-            "{shell}"
-        );
+        assert!(shell.ends_with("(shell, running)"), "{shell}");
 
         let listing = call(Which::Runs, &ctx, json!({})).unwrap();
         assert!(listing.starts_with("main (you)\n"), "{listing}");
         assert!(listing.contains("audit-auth  agent  queued"), "{listing}");
-        assert!(listing.contains("build  shell  queued"), "{listing}");
+        assert!(listing.contains("build  shell  running"), "{listing}");
 
         let record = call(Which::Runs, &ctx, json!({"id": "audit-auth"})).unwrap();
         assert!(record.contains("description: Audit auth"), "{record}");
@@ -509,11 +696,133 @@ mod tests {
         assert!(err.starts_with("UNKNOWN_RUN"), "{err}");
     }
 
-    #[test_case(Which::Send, json!({"to": "main", "message": "hi"}) ; "send")]
-    #[test_case(Which::Wait, json!({"ids": ["a"]}) ; "wait")]
-    #[test_case(Which::Stop, json!({"ids": ["a"]}) ; "stop")]
-    fn later_phase_tools_are_stubs(which: Which, input: Value) {
-        assert_eq!(call(which, &ctx(), input).unwrap_err(), NOT_IMPLEMENTED);
+    #[test]
+    fn send_is_still_a_stub() {
+        let input = json!({"to": "main", "message": "hi"});
+        assert_eq!(
+            call(Which::Send, &ctx(), input).unwrap_err(),
+            NOT_IMPLEMENTED
+        );
+    }
+
+    fn handle_of(started: &str) -> &str {
+        started.split_whitespace().nth(1).unwrap()
+    }
+
+    #[test]
+    fn shell_lifecycle_through_the_tools() {
+        let ctx = ctx();
+        let started = call(
+            Which::Spawn,
+            &ctx,
+            json!({"kind": "shell", "description": "count", "command": "echo one; echo two"}),
+        )
+        .unwrap();
+        let id = handle_of(&started);
+        let done = call(Which::Wait, &ctx, json!({"ids": [id]})).unwrap();
+        assert!(
+            done.contains("(shell, completed)") && done.contains("exit_code: 0"),
+            "{done}"
+        );
+        assert!(done.contains("last output:\none\ntwo"), "{done}");
+        assert!(!done.contains("Still running"), "{done}");
+
+        let first = call(Which::Runs, &ctx, json!({"id": id})).unwrap();
+        assert!(first.contains("one\ntwo"), "{first}");
+        let second = call(Which::Runs, &ctx, json!({"id": id})).unwrap();
+        assert!(
+            second.contains("(no new output)") && !second.contains("one\ntwo"),
+            "{second}"
+        );
+        assert_eq!(
+            call(Which::Runs, &ctx, json!({}))
+                .unwrap()
+                .matches("Run sh-")
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn wait_consumes_the_settled_notice() {
+        let ctx = ctx();
+        let started = call(
+            Which::Spawn,
+            &ctx,
+            json!({"kind": "shell", "description": "quick", "command": "true"}),
+        )
+        .unwrap();
+        let hub = &ctx.runs.as_ref().unwrap().hub;
+        let id = hub.resolve(hub.main(), handle_of(&started)).unwrap();
+        smol::block_on(hub.wait(
+            id_owner(&ctx),
+            &[id],
+            WaitMode::All,
+            Duration::from_secs(10_000_000),
+            &CancelToken::none(),
+        ));
+        assert!(
+            hub.pending_notices(hub.main()).is_empty(),
+            "wait consumed it"
+        );
+    }
+
+    fn id_owner(ctx: &ToolContext) -> UnitId {
+        ctx.runs.as_ref().unwrap().self_run
+    }
+
+    #[test]
+    fn wait_timeout_tells_the_model_to_do_other_work() {
+        let (ctx, clock) = ctx_with_clock();
+        let started = call(
+            Which::Spawn,
+            &ctx,
+            json!({"kind": "shell", "description": "long", "command": "sleep 600"}),
+        )
+        .unwrap();
+        let id = handle_of(&started).to_owned();
+        let invocation = tool(Which::Wait)
+            .parse(&json!({"ids": [id], "timeout_secs": 2}))
+            .unwrap();
+        let out = smol::block_on(async {
+            let mut fut = std::pin::pin!(invocation.execute(&ctx));
+            loop {
+                if let Some(v) = futures_lite::future::poll_once(&mut fut).await {
+                    break v;
+                }
+                clock.advance(Duration::from_secs(1));
+                futures_lite::future::yield_now().await;
+            }
+        });
+        let ToolOutput::Plain(t) = out.output.unwrap() else {
+            panic!("plain output expected")
+        };
+        assert!(t.text.contains("(shell, running)"), "{}", t.text);
+        assert!(
+            t.text.ends_with(&format!(
+                "Still running: {id}. Do not wait again immediately; do other work, you will be notified when they finish."
+            )),
+            "{}",
+            t.text
+        );
+    }
+
+    #[test]
+    fn stop_reports_truthfully_and_twice_is_fine() {
+        let ctx = ctx();
+        let started = call(
+            Which::Spawn,
+            &ctx,
+            json!({"kind": "shell", "description": "long", "command": "sleep 600"}),
+        )
+        .unwrap();
+        let id = handle_of(&started);
+        let first = call(Which::Stop, &ctx, json!({"ids": [id]})).unwrap();
+        assert!(first.ends_with(": stopped"), "{first}");
+        let again = call(Which::Stop, &ctx, json!({"ids": [id]})).unwrap();
+        assert!(again.ends_with(": already_finished(killed)"), "{again}");
+        let unknown = call(Which::Stop, &ctx, json!({"ids": ["sh-nope00"]})).unwrap_err();
+        assert!(unknown.starts_with("UNKNOWN_RUN"), "{unknown}");
     }
 
     #[test]
