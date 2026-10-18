@@ -876,14 +876,37 @@ pub struct RunsFileConfig {
 
 /// What a background run's permission prompt gets when nobody can answer it
 /// (`maki -p`, an SDK client with no handler).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UnattendedMode {
     /// Deny the call.
     #[default]
     Deny,
     /// Allow it when the session runs with `--yolo`, deny it otherwise.
-    InheritYolo,
+    AllowUnderYolo,
+}
+
+/// The pre-rename spelling of `allow_under_yolo`, still accepted.
+const DEPRECATED_INHERIT_YOLO: &str = "inherit_yolo";
+
+impl<'de> Deserialize<'de> for UnattendedMode {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(d)?;
+        match value.as_str() {
+            "deny" => Ok(Self::Deny),
+            "allow_under_yolo" => Ok(Self::AllowUnderYolo),
+            DEPRECATED_INHERIT_YOLO => {
+                warn!(
+                    "unattended_permissions = \"inherit_yolo\" is deprecated, use \"allow_under_yolo\""
+                );
+                Ok(Self::AllowUnderYolo)
+            }
+            other => Err(serde::de::Error::unknown_variant(
+                other,
+                &["deny", "allow_under_yolo"],
+            )),
+        }
+    }
 }
 
 impl RunsFileConfig {
@@ -1675,7 +1698,7 @@ pub struct RunsConfig {
         default = UnattendedMode::Deny,
         ty = "string",
         default_doc = "deny",
-        desc = "A run's permission prompt when nobody can answer (`maki -p`): `deny`, or `inherit_yolo` to allow it under `--yolo`"
+        desc = "A run's permission prompt when nobody can answer (`maki -p`): `deny`, or `allow_under_yolo` to allow it under `--yolo` (`inherit_yolo` is a deprecated alias)"
     )]
     pub unattended_permissions: UnattendedMode,
 
@@ -3130,6 +3153,25 @@ mod tests {
         let runs = base.into_config(&[]).unwrap().agent.runs;
         assert!(runs.enabled);
         assert_eq!(runs.max_depth, 1);
+    }
+
+    #[test_case("allow_under_yolo" ; "new_name")]
+    #[test_case("inherit_yolo" ; "deprecated_alias")]
+    fn unattended_permissions_accepts_new_name_and_old_alias(value: &str) {
+        let raw: RawConfig = toml::from_str(&format!(
+            "[agent.runs]\nunattended_permissions = \"{value}\"\n"
+        ))
+        .unwrap();
+        assert_eq!(
+            raw.agent.runs.unattended_permissions,
+            Some(UnattendedMode::AllowUnderYolo)
+        );
+    }
+
+    #[test]
+    fn unattended_permissions_rejects_unknown_value() {
+        let err = toml::from_str::<RawConfig>("[agent.runs]\nunattended_permissions = \"nope\"\n");
+        assert!(err.is_err());
     }
 
     #[test_case("session_max_runs" ; "session_max_runs")]
