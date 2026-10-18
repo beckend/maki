@@ -403,6 +403,9 @@ pub async fn run(params: PrintParams) -> Result<Interrupt> {
             | AgentEvent::Nudge
             | AgentEvent::Notice { .. }
             | AgentEvent::PromptProgress { .. }
+            | AgentEvent::RunStarted { .. }
+            | AgentEvent::RunStateChanged { .. }
+            | AgentEvent::RunFinished { .. }
             | AgentEvent::StreamClosed
             | AgentEvent::Steered { .. }
             | AgentEvent::Done { .. }

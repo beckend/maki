@@ -3706,6 +3706,7 @@ dependencies = [
  "ignore",
  "jiff",
  "jsonrepair",
+ "jsonschema",
  "libc",
  "maki-config",
  "maki-otel",

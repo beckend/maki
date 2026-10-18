@@ -22,8 +22,8 @@ use crate::ToolOutput;
 use crate::cancel::CancelToken;
 use crate::runs::shell::command_scopes;
 use crate::runs::{
-    OutputSlice, RunKind, RunsCtx, Scope, SpawnRequest, StopOpts, StopStatus, UnitId, UnitState,
-    UnitView, WaitMode,
+    AgentLaunch, OutputSlice, RunKind, RunsCtx, Scope, SpawnRequest, StopOpts, StopStatus,
+    UnitError, UnitId, UnitKind, UnitState, UnitView, WaitMode,
 };
 use maki_config::Permission;
 
@@ -41,6 +41,7 @@ pub const RUN_TOOL_NAMES: [&str; 5] = [
 ];
 
 const NOT_IMPLEMENTED: &str = "NOT_IMPLEMENTED";
+const PLAN_BLOCK: &str = "PLAN_MODE: only research agents may be spawned in plan mode";
 const NO_RUNS: &str = "no runs";
 const DEFAULT_WAIT_SECS: u64 = 60;
 const DEFAULT_STOP_WAIT_SECS: u64 = 10;
@@ -338,7 +339,7 @@ impl ToolInvocation for RunInvocation {
                 (_, None) => Err(NO_RUNTIME.to_owned()),
                 (Call::Spawn(mut req), Some(runs)) => {
                     req.origin_tool_use_id = ctx.tool_use_id.as_deref().map(Arc::from);
-                    spawn(runs, *req)
+                    spawn(runs, ctx, *req).await
                 }
                 (Call::Runs(args), Some(runs)) => list_or_show(runs, args),
                 (Call::Wait(args), Some(runs)) => wait(runs, args, &ctx.cancel).await,
@@ -350,11 +351,31 @@ impl ToolInvocation for RunInvocation {
     }
 }
 
-fn spawn(runs: &RunsCtx, req: SpawnRequest) -> Result<String, String> {
-    let ack = runs
-        .hub
-        .spawn(runs.self_run, req)
-        .map_err(|e| e.to_string())?;
+async fn spawn(runs: &RunsCtx, ctx: &ToolContext, req: SpawnRequest) -> Result<String, String> {
+    let agent_spec = if req.kind == RunKind::Agent {
+        match req.clone().into_kind().map_err(|e| e.to_string())? {
+            UnitKind::Agent(spec) => Some(spec),
+            UnitKind::Shell(_) => None,
+        }
+    } else {
+        None
+    };
+    let ack = match agent_spec {
+        Some(spec) => {
+            if ctx.mode.plan_path().is_some() && spec.subagent_type != "research" {
+                return Err(PLAN_BLOCK.to_owned());
+            }
+            let launch = AgentLaunch::prepare(ctx, &spec).await?;
+            runs.hub.spawn_agent(runs.self_run, req, launch)
+        }
+        None => {
+            if ctx.mode.plan_path().is_some() {
+                return Err(PLAN_BLOCK.to_owned());
+            }
+            runs.hub.spawn(runs.self_run, req)
+        }
+    }
+    .map_err(|e| e.to_string())?;
     let mut state = ack.state.label().to_owned();
     if let Some((at, of)) = ack.queue_position {
         let _ = write!(state, ", position {at} of {of}");
@@ -453,7 +474,7 @@ async fn stop(runs: &RunsCtx, args: StopArgs, cancel: &CancelToken) -> Result<St
                 any_ok = true;
                 format!("already_finished({reason})")
             }
-            Ok(StopStatus::Requested) => {
+            Ok(StopStatus::Requested | StopStatus::Interrupted) => {
                 any_ok = true;
                 match settled
                     .iter()
@@ -477,6 +498,9 @@ fn list_or_show(runs: &RunsCtx, args: RunsArgs) -> Result<String, String> {
             .hub
             .resolve(runs.self_run, &key)
             .map_err(|e| format!("{e}: {key}"))?;
+        if !runs.hub.can_reach(runs.self_run, id) {
+            return Err(format!("{}: {key}", UnitError::NotReachable));
+        }
         let view = runs
             .hub
             .get(id)
@@ -506,6 +530,7 @@ fn list_or_show(runs: &RunsCtx, args: RunsArgs) -> Result<String, String> {
         .list(runs.self_run, scope)
         .into_iter()
         .filter(|v| include_finished || !v.state.is_done())
+        .filter(|v| scope != Scope::All || runs.hub.can_reach(runs.self_run, v.id))
         .collect();
     let notices = runs.hub.take_notices(runs.self_run);
     if views.is_empty() && notices.is_empty() {
@@ -609,16 +634,6 @@ mod tests {
     use crate::runs::{ManualClock, UnitHub, UnitLimits};
     use crate::tools::test_support::stub_ctx;
 
-    /// The runtime the tools run on, for a test that drives a future from a
-    /// plain `#[test]`.
-    fn block_on<F: std::future::Future>(f: F) -> F::Output {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("the runtime starts")
-            .block_on(f)
-    }
-
     fn tool(which: Which) -> RunTool {
         RunTool(which)
     }
@@ -629,6 +644,7 @@ mod tests {
 
     fn ctx_with_clock() -> (ToolContext, Arc<ManualClock>) {
         let mut ctx = stub_ctx(&AgentMode::Build);
+        ctx.provider = Arc::new(crate::test_support::StubStreamProvider::default());
         let clock = Arc::new(ManualClock::default());
         let hub = UnitHub::new(UnitLimits::default(), ctx.event_tx.clone(), clock.clone());
         let self_run = hub.main();
@@ -636,9 +652,9 @@ mod tests {
         (ctx, clock)
     }
 
-    fn call(which: Which, ctx: &ToolContext, input: Value) -> Result<String, String> {
+    async fn call(which: Which, ctx: &ToolContext, input: Value) -> Result<String, String> {
         let invocation = tool(which).parse(&input).map_err(|e| e.to_string())?;
-        match block_on(invocation.execute(ctx)).output? {
+        match invocation.execute(ctx).await.output? {
             ToolOutput::Plain(t) => Ok(t.text),
             other => panic!("unexpected output {other:?}"),
         }
@@ -660,24 +676,26 @@ mod tests {
     #[test_case(json!({"kind": "agent", "description": "d", "prompt": "p", "watch": "x"}), "\"watch\" is for kind \"shell\"" ; "agent_with_watch")]
     #[test_case(json!({"kind": "agent", "description": "d", "prompt": "p", "name": "main"}), "BAD_FIELD: reserved name" ; "reserved_name")]
     #[test_case(json!({"kind": "agent", "description": "d"}), "\"prompt\" is required" ; "agent_without_prompt")]
-    fn cross_kind_fields_rejected(input: Value, expected: &str) {
-        let err = call(Which::Spawn, &ctx(), input).unwrap_err();
+    #[tokio::test]
+    async fn cross_kind_fields_rejected(input: Value, expected: &str) {
+        let err = call(Which::Spawn, &ctx(), input).await.unwrap_err();
         assert!(err.starts_with("BAD_FIELD"), "{err}");
         assert!(err.contains(expected), "{err}");
     }
 
-    #[test]
-    fn spawn_returns_queued_record() {
+    #[tokio::test]
+    async fn spawn_starts_an_agent_record() {
         let ctx = ctx();
         let started = call(
             Which::Spawn,
             &ctx,
             json!({"kind": "agent", "description": "Audit auth", "prompt": "look"}),
         )
+        .await
         .unwrap();
         assert!(
             started.starts_with("started ag-")
-                && started.ends_with("\"audit-auth\" (agent, queued, position 1 of 1)"),
+                && started.ends_with("\"audit-auth\" (agent, running)"),
             "{started}"
         );
         let shell = call(
@@ -685,34 +703,39 @@ mod tests {
             &ctx,
             json!({"kind": "shell", "description": "build", "command": "sleep 600"}),
         )
+        .await
         .unwrap();
         assert!(shell.ends_with("(shell, running)"), "{shell}");
 
-        let listing = call(Which::Runs, &ctx, json!({})).unwrap();
+        let listing = call(Which::Runs, &ctx, json!({})).await.unwrap();
         assert!(listing.starts_with("main (you)\n"), "{listing}");
-        assert!(listing.contains("audit-auth  agent  queued"), "{listing}");
+        assert!(listing.contains("audit-auth  agent  running"), "{listing}");
         assert!(listing.contains("build  shell  running"), "{listing}");
 
-        let record = call(Which::Runs, &ctx, json!({"id": "audit-auth"})).unwrap();
+        let record = call(Which::Runs, &ctx, json!({"id": "audit-auth"}))
+            .await
+            .unwrap();
         assert!(record.contains("description: Audit auth"), "{record}");
     }
 
-    #[test]
-    fn runs_without_any_says_so() {
-        assert_eq!(call(Which::Runs, &ctx(), json!({})).unwrap(), NO_RUNS);
+    #[tokio::test]
+    async fn runs_without_any_says_so() {
+        assert_eq!(call(Which::Runs, &ctx(), json!({})).await.unwrap(), NO_RUNS);
     }
 
-    #[test]
-    fn unknown_run_id_is_reported() {
-        let err = call(Which::Runs, &ctx(), json!({"id": "ag-nope00"})).unwrap_err();
+    #[tokio::test]
+    async fn unknown_run_id_is_reported() {
+        let err = call(Which::Runs, &ctx(), json!({"id": "ag-nope00"}))
+            .await
+            .unwrap_err();
         assert!(err.starts_with("UNKNOWN_RUN"), "{err}");
     }
 
-    #[test]
-    fn send_is_still_a_stub() {
+    #[tokio::test]
+    async fn send_is_still_a_stub() {
         let input = json!({"to": "main", "message": "hi"});
         assert_eq!(
-            call(Which::Send, &ctx(), input).unwrap_err(),
+            call(Which::Send, &ctx(), input).await.unwrap_err(),
             NOT_IMPLEMENTED
         );
     }
@@ -721,17 +744,18 @@ mod tests {
         started.split_whitespace().nth(1).unwrap()
     }
 
-    #[test]
-    fn shell_lifecycle_through_the_tools() {
+    #[tokio::test]
+    async fn shell_lifecycle_through_the_tools() {
         let ctx = ctx();
         let started = call(
             Which::Spawn,
             &ctx,
             json!({"kind": "shell", "description": "count", "command": "echo one; echo two"}),
         )
+        .await
         .unwrap();
         let id = handle_of(&started);
-        let done = call(Which::Wait, &ctx, json!({"ids": [id]})).unwrap();
+        let done = call(Which::Wait, &ctx, json!({"ids": [id]})).await.unwrap();
         assert!(
             done.contains("(shell, completed)") && done.contains("exit_code: 0"),
             "{done}"
@@ -739,15 +763,16 @@ mod tests {
         assert!(done.contains("last output:\none\ntwo"), "{done}");
         assert!(!done.contains("Still running"), "{done}");
 
-        let first = call(Which::Runs, &ctx, json!({"id": id})).unwrap();
+        let first = call(Which::Runs, &ctx, json!({"id": id})).await.unwrap();
         assert!(first.contains("one\ntwo"), "{first}");
-        let second = call(Which::Runs, &ctx, json!({"id": id})).unwrap();
+        let second = call(Which::Runs, &ctx, json!({"id": id})).await.unwrap();
         assert!(
             second.contains("(no new output)") && !second.contains("one\ntwo"),
             "{second}"
         );
         assert_eq!(
             call(Which::Runs, &ctx, json!({}))
+                .await
                 .unwrap()
                 .matches("Run sh-")
                 .count(),
@@ -763,6 +788,7 @@ mod tests {
             &ctx,
             json!({"kind": "shell", "description": "quick", "command": "true"}),
         )
+        .await
         .unwrap();
         let hub = &ctx.runs.as_ref().unwrap().hub;
         let id = hub.resolve(hub.main(), handle_of(&started)).unwrap();
@@ -792,6 +818,7 @@ mod tests {
             &ctx,
             json!({"kind": "shell", "description": "long", "command": "sleep 600"}),
         )
+        .await
         .unwrap();
         let id = handle_of(&started).to_owned();
         let invocation = tool(Which::Wait)
@@ -821,37 +848,43 @@ mod tests {
         );
     }
 
-    #[test]
-    fn stop_reports_truthfully_and_twice_is_fine() {
+    #[tokio::test]
+    async fn stop_reports_truthfully_and_twice_is_fine() {
         let ctx = ctx();
         let started = call(
             Which::Spawn,
             &ctx,
             json!({"kind": "shell", "description": "long", "command": "sleep 600"}),
         )
+        .await
         .unwrap();
         let id = handle_of(&started);
-        let first = call(Which::Stop, &ctx, json!({"ids": [id]})).unwrap();
+        let first = call(Which::Stop, &ctx, json!({"ids": [id]})).await.unwrap();
         assert!(first.ends_with(": stopped"), "{first}");
-        let again = call(Which::Stop, &ctx, json!({"ids": [id]})).unwrap();
+        let again = call(Which::Stop, &ctx, json!({"ids": [id]})).await.unwrap();
         assert!(again.ends_with(": already_finished(killed)"), "{again}");
-        let unknown = call(Which::Stop, &ctx, json!({"ids": ["sh-nope00"]})).unwrap_err();
+        let unknown = call(Which::Stop, &ctx, json!({"ids": ["sh-nope00"]}))
+            .await
+            .unwrap_err();
         assert!(unknown.starts_with("UNKNOWN_RUN"), "{unknown}");
     }
 
-    #[test]
-    fn tools_refuse_without_a_hub() {
+    #[tokio::test]
+    async fn tools_refuse_without_a_hub() {
         let mut ctx = ctx();
         ctx.runs = None;
-        assert_eq!(call(Which::Runs, &ctx, json!({})).unwrap_err(), NO_RUNTIME);
+        assert_eq!(
+            call(Which::Runs, &ctx, json!({})).await.unwrap_err(),
+            NO_RUNTIME
+        );
     }
 
-    #[test]
-    fn shell_spawn_prompts_on_its_command() {
+    #[tokio::test]
+    async fn shell_spawn_prompts_on_its_command() {
         let invocation = tool(Which::Spawn)
             .parse(&json!({"kind": "shell", "description": "d", "command": "make -j8"}))
             .unwrap();
-        let scopes = block_on(invocation.permission_scopes()).unwrap();
+        let scopes = invocation.permission_scopes().await.unwrap();
         assert_eq!(scopes.scopes, ["make -j8"]);
     }
 }

@@ -61,3 +61,79 @@ pub(super) fn shell_settled(
     );
     text
 }
+
+/// Suffix of the file that holds an agent's untruncated result.
+pub(super) const BODY_FILE_SUFFIX: &str = ".result.txt";
+
+fn result_tail(text: &mut String, handle: &UnitHandle, result: &super::UnitResult) {
+    if !result.summary.is_empty() {
+        let _ = write!(text, "\nResult:\n{}", result.summary);
+    }
+    if let Some(structured) = &result.structured
+        && result.summary != *structured
+    {
+        let _ = write!(text, "\nStructured: {structured}");
+    }
+    if result.truncated {
+        let _ = write!(text, "\nFull result: runs(id=\"{handle}\", full=true)");
+    }
+}
+
+fn stats(result: &super::UnitResult) -> String {
+    format!(
+        "{}, {} turns, ${:.2}",
+        compact_duration(result.elapsed_ms / 1000),
+        result.turns,
+        result.cost
+    )
+}
+
+/// 3.7 wording for an agent that finished a turn and went idle.
+pub(super) fn agent_idle(
+    handle: &UnitHandle,
+    name: &UnitName,
+    result: &super::UnitResult,
+) -> String {
+    let mut text = format!(
+        "Run {handle} \"{name}\" (agent) finished its turn and is idle; send it a message to continue. {}.",
+        stats(result)
+    );
+    result_tail(&mut text, handle, result);
+    text
+}
+
+/// 3.7 wording for an agent that reached `Done`.
+pub(super) fn agent_settled(
+    handle: &UnitHandle,
+    name: &UnitName,
+    terminal: &Terminal,
+    timeout_secs: u64,
+) -> String {
+    let mut text = format!("Run {handle} \"{name}\" (agent) ");
+    match terminal.reason {
+        DoneReason::Completed => text.push_str("finished and will do no further work."),
+        DoneReason::Killed => text.push_str("was stopped before it finished."),
+        DoneReason::MaxTokens | DoneReason::MaxTurns => {
+            text.push_str("ran out of room before it finished.");
+        }
+        DoneReason::TimedOut => {
+            let _ = write!(text, "timed out after {timeout_secs}s.");
+        }
+        DoneReason::Failed => {
+            let _ = write!(
+                text,
+                "failed: {}.",
+                terminal.detail.as_deref().unwrap_or("unknown error")
+            );
+        }
+        DoneReason::Refused => text.push_str("declined the task."),
+        DoneReason::Lost => text.push_str(
+            "was lost: the session ended while it was running; its transcript up to the last saved turn is available with runs(id).",
+        ),
+    }
+    if terminal.reason == DoneReason::Completed {
+        let _ = write!(text, " {}.", stats(&terminal.result));
+    }
+    result_tail(&mut text, handle, &terminal.result);
+    text
+}
