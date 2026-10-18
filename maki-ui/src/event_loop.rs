@@ -1726,6 +1726,12 @@ impl<'t> EventLoop<'t> {
             Action::CancelSubagent { tool_use_id } => {
                 self.sessions[idx].handles.cancel_subagent(tool_use_id);
             }
+            Action::StopRuns { target } => {
+                self.sessions[idx].handles.stop_runs(&target);
+            }
+            Action::SendToRun { handle, text } => {
+                self.sessions[idx].handles.send_to_run(handle, text);
+            }
             Action::CancelPluginTask { id } => {
                 self.ctx.lua_event_handle.cancel_plugin_session(&id);
             }

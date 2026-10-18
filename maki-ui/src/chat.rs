@@ -479,6 +479,13 @@ impl Chat {
         self.finish.is_some()
     }
 
+    /// A finished run that was revived takes events and input again. Its old
+    /// ending stays in the transcript as history.
+    pub(crate) fn reopen(&mut self) {
+        self.finish = None;
+        self.idle = false;
+    }
+
     pub fn update_tool_summary(&mut self, tool_id: &str, summary: &str) {
         self.messages_panel.update_tool_summary(tool_id, summary);
     }

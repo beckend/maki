@@ -8289,3 +8289,271 @@ mod run_prompts_after_main_turn {
         );
     }
 }
+
+const RUN_A: &str = "ag-aaaaaa";
+const RUN_B: &str = "ag-bbbbbb";
+
+fn run_event(app: &mut App, handle: &str, name: &str, event: AgentEvent) {
+    app.update(subagent_msg_with_run_id(
+        event,
+        handle,
+        Some(name),
+        maki_agent::BACKGROUND_RUN_ID,
+    ));
+}
+
+fn start_run(app: &mut App, handle: &str, name: &str, parent: Option<&str>, one_shot: bool) {
+    run_event(
+        app,
+        handle,
+        name,
+        AgentEvent::RunStarted {
+            handle: handle.into(),
+            name: name.into(),
+            kind: "agent".into(),
+            parent: parent.map(Into::into),
+            depth: 1,
+            one_shot,
+        },
+    );
+}
+
+fn finish_run(app: &mut App, handle: &str, name: &str, reason: &str) {
+    run_event(
+        app,
+        handle,
+        name,
+        AgentEvent::RunFinished {
+            handle: handle.into(),
+            reason: reason.into(),
+            detail: None,
+        },
+    );
+}
+
+fn start_shell(app: &mut App, handle: &str) {
+    app.update(agent_msg_with_run_id(
+        AgentEvent::RunStarted {
+            handle: handle.into(),
+            name: "build".into(),
+            kind: "shell".into(),
+            parent: None,
+            depth: 1,
+            one_shot: true,
+        },
+        maki_agent::BACKGROUND_RUN_ID,
+    ));
+}
+
+#[test]
+fn status_segment_hidden_at_zero() {
+    let mut app = streaming_app();
+    assert!(!rendered(&mut app).contains("runs "));
+    start_run(&mut app, RUN_A, "reader", None, false);
+    start_shell(&mut app, "sh-cccccc");
+    assert!(rendered(&mut app).contains("[runs 2 running]"));
+    finish_run(&mut app, RUN_A, "reader", "completed");
+    app.update(agent_msg_with_run_id(
+        AgentEvent::RunFinished {
+            handle: "sh-cccccc".into(),
+            reason: "completed".into(),
+            detail: None,
+        },
+        maki_agent::BACKGROUND_RUN_ID,
+    ));
+    assert!(!rendered(&mut app).contains("runs "));
+}
+
+#[test]
+fn permission_badge_shown() {
+    let mut app = streaming_app();
+    start_run(&mut app, RUN_A, "reader", None, false);
+    let (tx, _rx) = flume::unbounded();
+    app.update(Msg::Agent(Box::new(Envelope {
+        event: AgentEvent::PermissionRequest {
+            id: "ask-1".into(),
+            tool: ToolKey::native("bash"),
+            scopes: vec!["ls".into()],
+            reason: None,
+        },
+        subagent: Some(subagent_info_with_tx(RUN_A, "reader", Some(tx))),
+        run_id: maki_agent::BACKGROUND_RUN_ID,
+    })));
+    assert!(rendered(&mut app).contains("[runs 1 running !]"));
+    app.update(Msg::Agent(Box::new(Envelope {
+        event: AgentEvent::PermissionWithdrawn { id: "ask-1".into() },
+        subagent: Some(subagent_info_with_tx(RUN_A, "reader", None)),
+        run_id: maki_agent::BACKGROUND_RUN_ID,
+    })));
+    let screen = rendered(&mut app);
+    assert!(screen.contains("[runs 1 running]"), "{screen}");
+}
+
+#[test]
+fn runs_command_lists_tree_and_enter_focuses_the_tab() {
+    let mut app = streaming_app();
+    start_run(&mut app, RUN_A, "lead", None, false);
+    start_run(&mut app, RUN_B, "helper", Some(RUN_A), false);
+    start_shell(&mut app, "sh-cccccc");
+    type_and_submit(&mut app, "/runs");
+    assert!(app.runs_picker.is_open());
+    let screen = rendered(&mut app);
+    assert!(screen.contains("lead"), "{screen}");
+    assert!(screen.contains("  helper"), "{screen}");
+    assert!(screen.contains("sh-cccccc"), "{screen}");
+    app.update(Msg::Key(key(KeyCode::Down)));
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert!(!app.runs_picker.is_open());
+    assert_eq!(
+        app.chats[app.active_chat].task_id().unwrap().as_ref(),
+        RUN_B
+    );
+}
+
+#[test]
+fn runs_picker_on_a_shell_row_has_no_tab_to_focus() {
+    let mut app = streaming_app();
+    start_shell(&mut app, "sh-cccccc");
+    type_and_submit(&mut app, "/runs");
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert_eq!(app.active_chat, 0);
+    assert_eq!(app.status_bar.flash_text(), Some(NO_SHELL_TAB));
+}
+
+#[test]
+fn stop_command_all() {
+    let mut app = streaming_app();
+    let actions = type_and_submit(&mut app, "/stop all");
+    assert!(actions.is_empty());
+    assert_eq!(app.status_bar.flash_text(), Some(NO_LIVE_RUNS));
+    start_run(&mut app, RUN_A, "reader", None, false);
+    let actions = type_and_submit(&mut app, "/stop all");
+    assert!(matches!(&actions[..], [Action::StopRuns { target }] if target == "all"));
+    let actions = type_and_submit(&mut app, "/stop reader");
+    assert!(matches!(&actions[..], [Action::StopRuns { target }] if target == RUN_A));
+    let actions = type_and_submit(&mut app, "/stop nobody");
+    assert!(actions.is_empty());
+    assert_eq!(app.status_bar.flash_text(), Some("No such run: nobody"));
+    finish_run(&mut app, RUN_A, "reader", "completed");
+    type_and_submit(&mut app, "/stop reader");
+    assert_eq!(app.status_bar.flash_text(), Some(RUN_NOT_LIVE));
+}
+
+#[test]
+fn typing_into_a_finished_run_tab_revives_it() {
+    let mut app = streaming_app();
+    start_run(&mut app, RUN_A, "reader", None, false);
+    finish_run(&mut app, RUN_A, "reader", "completed");
+    let idx = app.chat_index[RUN_A];
+    assert!(app.chats[idx].is_finished());
+    app.set_active_chat(idx);
+    assert!(app.chat_accepts_input());
+    let actions = type_and_submit(&mut app, "one more thing");
+    assert!(matches!(
+        &actions[..],
+        [Action::SendToRun { handle, text }] if handle == RUN_A && text == "one more thing"
+    ));
+    assert_eq!(app.chats[idx].last_message_text(), "one more thing");
+    // The hub's revive announces itself with a state change.
+    run_event(
+        &mut app,
+        RUN_A,
+        "reader",
+        AgentEvent::RunStateChanged {
+            handle: RUN_A.into(),
+            state: "running".into(),
+        },
+    );
+    assert!(!app.chats[idx].is_finished());
+    assert_eq!(app.chats[idx].run.as_ref().unwrap().state, "running");
+    assert!(rendered(&mut app).contains("[runs 1 running]"));
+}
+
+#[test]
+fn a_completed_one_shot_run_tab_stays_read_only() {
+    let mut app = streaming_app();
+    start_run(&mut app, RUN_A, "reader", None, true);
+    finish_run(&mut app, RUN_A, "reader", "completed");
+    let idx = app.chat_index[RUN_A];
+    app.set_active_chat(idx);
+    assert!(!app.chat_accepts_input());
+    assert!(app.update(Msg::Key(key(KeyCode::Char('x')))).is_empty());
+}
+
+#[test]
+fn a_revived_run_answers_prompts_on_its_new_route() {
+    let mut app = streaming_app();
+    let (old_tx, old_rx) = flume::unbounded();
+    let (new_tx, new_rx) = flume::unbounded();
+    start_run(&mut app, RUN_A, "reader", None, false);
+    app.update(Msg::Agent(Box::new(Envelope {
+        event: AgentEvent::RunStateChanged {
+            handle: RUN_A.into(),
+            state: "running".into(),
+        },
+        subagent: Some(subagent_info_with_tx(RUN_A, "reader", Some(old_tx))),
+        run_id: maki_agent::BACKGROUND_RUN_ID,
+    })));
+    finish_run(&mut app, RUN_A, "reader", "completed");
+    app.update(Msg::Agent(Box::new(Envelope {
+        event: AgentEvent::RunStateChanged {
+            handle: RUN_A.into(),
+            state: "running".into(),
+        },
+        subagent: Some(subagent_info_with_tx(RUN_A, "reader", Some(new_tx.clone()))),
+        run_id: maki_agent::BACKGROUND_RUN_ID,
+    })));
+    app.update(Msg::Agent(Box::new(Envelope {
+        event: AgentEvent::PermissionRequest {
+            id: "ask-2".into(),
+            tool: ToolKey::native("bash"),
+            scopes: vec!["ls".into()],
+            reason: None,
+        },
+        subagent: Some(subagent_info_with_tx(RUN_A, "reader", Some(new_tx))),
+        run_id: maki_agent::BACKGROUND_RUN_ID,
+    })));
+    app.update(Msg::Key(key(KeyCode::Char('y'))));
+    assert!(old_rx.is_empty());
+    assert_eq!(new_rx.try_recv().unwrap(), allow_once("ask-2"));
+}
+
+fn restored_native_app(state_before_exit: &str) -> App {
+    let mut app = streaming_app();
+    start_run(&mut app, RUN_A, "reader", None, false);
+    if state_before_exit != "running" {
+        finish_run(&mut app, RUN_A, "reader", state_before_exit);
+    }
+    close_subagent_transcript(&mut app, RUN_A);
+    app.sync_subagents();
+    app.reset_ui_chrome();
+    app.restore_display();
+    app
+}
+
+#[test]
+fn restored_native_tab_is_read_only_until_a_message_revives_it() {
+    let mut app = restored_native_app("completed");
+    let idx = app.chat_index[RUN_A];
+    assert!(app.chats[idx].is_finished());
+    assert_eq!(app.chats[idx].run.as_ref().unwrap().state, "completed");
+    assert_eq!(app.runs.state_of(RUN_A), Some("completed"));
+    assert!(!rendered(&mut app).contains("runs "));
+    app.set_active_chat(idx);
+    let actions = type_and_submit(&mut app, "welcome back");
+    assert!(matches!(&actions[..], [Action::SendToRun { handle, .. }] if handle == RUN_A));
+}
+
+#[test]
+fn restored_run_that_was_live_reads_as_lost() {
+    let mut app = restored_native_app("running");
+    let idx = app.chat_index[RUN_A];
+    assert_eq!(app.chats[idx].run.as_ref().unwrap().state, "lost");
+    assert!(app.chats[idx].is_finished());
+    assert!(rendered(&mut app).contains("[runs 1 lost]"));
+    app.sync_subagents();
+    assert_eq!(
+        app.state.session.subagents()[0].run.as_ref().unwrap().state,
+        "lost"
+    );
+}

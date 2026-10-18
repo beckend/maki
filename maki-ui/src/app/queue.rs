@@ -8,6 +8,7 @@ use maki_agent::{AgentInput, AgentMode, ImageSource, InputSource};
 use super::{Action, App, Status};
 
 use crate::agent::shared_queue::{Compaction, QueueItem, QueueSender, QueuedInput};
+use crate::components::input::Submission;
 use crate::components::queue_panel::QueueEntry;
 use crate::theme;
 
@@ -151,6 +152,27 @@ impl App {
                 vec![]
             }
         }
+    }
+
+    /// A message typed in a native run's tab goes through the hub as a steer
+    /// from the user. The hub revives a finished run first, so the tab only
+    /// shows the text; the run's own events reopen it.
+    pub(super) fn send_to_run_tab(&mut self, sub: Submission) -> Vec<Action> {
+        if !self.run_tab_takes_input() {
+            self.flash(NO_INBOX_ERR.into());
+            return vec![];
+        }
+        let Some(handle) = self.chats[self.active_chat]
+            .task_id()
+            .map(|id| id.to_string())
+        else {
+            return vec![];
+        };
+        self.chats[self.active_chat].show_user_message(sub.text.clone(), sub.images);
+        vec![Action::SendToRun {
+            handle,
+            text: sub.text,
+        }]
     }
 
     /// A message typed in a subagent's chat is for that subagent: it waits in

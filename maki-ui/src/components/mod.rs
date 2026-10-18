@@ -20,6 +20,7 @@ pub(crate) mod plan_form;
 pub(crate) mod progress_bar;
 pub mod queue_panel;
 pub(crate) mod rewind_picker;
+pub(crate) mod runs_picker;
 pub(crate) mod scrollbar;
 pub(crate) mod search_modal;
 pub(crate) mod split_layout;
@@ -213,6 +214,17 @@ pub enum Action {
     },
     CancelSubagent {
         tool_use_id: String,
+    },
+    /// `/stop`: stops a native run (and what it started) through the hub.
+    /// `target` is a handle or name, `all` stops every live run.
+    StopRuns {
+        target: String,
+    },
+    /// Text typed into a native run's tab. A live run gets it as a steer; a
+    /// finished one is revived from its transcript first.
+    SendToRun {
+        handle: String,
+        text: String,
     },
     /// Esc in a plugin task's tab: closes the plugin session behind it.
     CancelPluginTask {

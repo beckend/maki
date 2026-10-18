@@ -9,6 +9,7 @@ mod image_paste;
 pub(crate) mod mode;
 mod mouse;
 mod queue;
+mod runs;
 mod session;
 pub(crate) mod session_state;
 pub(crate) mod shell;
@@ -45,6 +46,7 @@ use crate::components::pack_review::{PackReview, PackReviewAction};
 use crate::components::permission_prompt::PermissionPrompt;
 use crate::components::plan_form::{PlanForm, PlanFormAction, builtin_menu, builtin_rows};
 use crate::components::rewind_picker::{RewindPicker, RewindPickerAction};
+use crate::components::runs_picker::{RunsPicker, RunsPickerAction};
 use crate::components::scrollbar;
 use crate::components::search_modal::{SearchAction, SearchModal};
 use crate::components::status_bar::StatusBar;
@@ -91,6 +93,12 @@ use session_state::SessionState;
 
 const CANCEL_MSG: &str = "Cancelled.";
 const MAIN_CHAT: usize = 0;
+const NO_SHELL_TAB: &str = "Shell runs have no tab";
+const NO_RUN_TAB: &str = "That run has no tab in this session";
+const STOP_USAGE: &str = "Usage: /stop <name|handle|all>";
+const NO_LIVE_RUNS: &str = "No run is live";
+const RUN_NOT_LIVE: &str = "That run has already finished";
+const UNKNOWN_RUN: &str = "No such run: ";
 const EXIT_WORD: &str = "exit";
 /// Bypasses the per-run staleness filter because re-bake replies
 /// don't belong to any real agent run.
@@ -367,6 +375,8 @@ pub struct App {
     pub(super) model_picker: ModelPicker,
     pub(super) login_picker: LoginPicker,
     pub(super) mcp_picker: McpPicker,
+    pub(super) runs_picker: RunsPicker,
+    pub(super) runs: runs::RunsView,
     pub(super) rewind_picker: RewindPicker,
     pub(super) alert_modal: AlertModal,
     pub(super) help_modal: HelpModal,
@@ -493,6 +503,8 @@ impl App {
             model_picker: ModelPicker::new(available_models),
             login_picker: LoginPicker::new(),
             mcp_picker: McpPicker::new(mcp_reader, mcp_config_errors),
+            runs_picker: RunsPicker::new(),
+            runs: runs::RunsView::default(),
             rewind_picker: RewindPicker::new(),
             alert_modal: AlertModal::new(),
             help_modal: HelpModal::new(),
@@ -569,11 +581,82 @@ impl App {
         self.active_chat == MAIN_CHAT
     }
 
+    /// A native agent's tab: input goes to the hub, finished or not.
+    fn native_tab(&self, idx: usize) -> Option<&maki_storage::sessions::StoredRun> {
+        self.chats[idx]
+            .run
+            .as_ref()
+            .filter(|run| run.kind == "agent")
+    }
+
+    /// Whether a message typed in the active tab can reach its run: any live
+    /// one, and a finished one the hub can bring back (a one-shot that
+    /// completed cannot be).
+    fn run_tab_takes_input(&self) -> bool {
+        self.native_tab(self.active_chat)
+            .is_some_and(|run| !(run.one_shot && run.state == "completed"))
+    }
+
+    /// Keeps `RunsView` in step with the hub's run events, shells included.
+    fn track_run(&mut self, event: &AgentEvent) {
+        match event {
+            AgentEvent::RunStarted {
+                handle,
+                name,
+                kind,
+                parent,
+                ..
+            } => self
+                .runs
+                .started(handle, name, kind, parent.as_deref(), "running"),
+            AgentEvent::RunStateChanged { handle, state } => self.runs.set_state(handle, state),
+            AgentEvent::RunFinished { handle, reason, .. } => self.runs.set_state(handle, reason),
+            _ => return,
+        }
+        if self.runs_picker.is_open() {
+            let waiting = self.permission_prompt.waiting_runs();
+            self.runs_picker.refresh(self.runs.rows(&waiting));
+        }
+    }
+
+    /// `/stop <name|handle|all>`.
+    fn cmd_stop(&mut self, args: &str) -> Vec<Action> {
+        let target = args.trim();
+        if target.is_empty() {
+            self.flash(STOP_USAGE.into());
+            return vec![];
+        }
+        if target == "all" {
+            if self.runs.live_handles().is_empty() {
+                self.flash(NO_LIVE_RUNS.into());
+                return vec![];
+            }
+            return vec![Action::StopRuns {
+                target: "all".into(),
+            }];
+        }
+        match self.runs.find(target) {
+            Some(run) if runs::is_live(&run.state) => vec![Action::StopRuns {
+                target: run.handle.clone(),
+            }],
+            Some(_) => {
+                self.flash(RUN_NOT_LIVE.into());
+                vec![]
+            }
+            None => {
+                self.flash(format!("{UNKNOWN_RUN}{target}"));
+                vec![]
+            }
+        }
+    }
+
     /// Whether the chat in front shows the input box. A running subagent's
     /// chat does, so a message can be queued for that subagent while it is
     /// watched. A finished one is a transcript, so it does not.
     pub(super) fn chat_accepts_input(&self) -> bool {
-        self.is_main_chat() || !self.chats[self.active_chat].is_finished()
+        self.is_main_chat()
+            || !self.chats[self.active_chat].is_finished()
+            || self.run_tab_takes_input()
     }
 
     /// One input box serves every chat, so the draft in it moves to the chat
@@ -1168,6 +1251,22 @@ impl App {
             });
         }
 
+        if self.runs_picker.is_open() {
+            return Some(match self.runs_picker.handle_key(key) {
+                RunsPickerAction::Consumed | RunsPickerAction::Close => vec![],
+                RunsPickerAction::Focus { handle, kind } => {
+                    if self.focus_task(&handle).is_err() {
+                        self.flash(if kind == "shell" {
+                            NO_SHELL_TAB.into()
+                        } else {
+                            NO_RUN_TAB.into()
+                        });
+                    }
+                    vec![]
+                }
+            });
+        }
+
         if self.mcp_picker.is_open() {
             return Some(match self.mcp_picker.handle_key(key) {
                 McpPickerAction::Consumed => vec![],
@@ -1501,6 +1600,8 @@ impl App {
         let Some(prefix) = shell::parse_shell_prefix(&sub.text) else {
             return if self.is_main_chat() {
                 self.submit_or_queue(sub.into())
+            } else if self.native_tab(self.active_chat).is_some() {
+                self.send_to_run_tab(sub)
             } else {
                 self.queue_for_subagent(sub.into())
             };
@@ -1693,7 +1794,15 @@ impl App {
             return vec![];
         }
         let asker_name = envelope.subagent.as_ref().map(|s| s.name.clone());
-
+        self.track_run(&envelope.event);
+        // A revived run has a new broker, so its answers go to a new sender.
+        if let Some(info) = &envelope.subagent
+            && let Some(tx) = &info.answer_tx
+            && is_run_handle(&info.parent_tool_use_id)
+        {
+            self.subagent_answers
+                .insert(info.parent_tool_use_id.clone(), tx.clone());
+        }
         let is_plugin_task = plugin.is_some();
         let chat_idx = match envelope.subagent {
             Some(ref subagent) => self.resolve_or_create_chat(subagent, &plugin),
@@ -1735,6 +1844,11 @@ impl App {
                 AgentEvent::RunStateChanged { state, .. } => {
                     if let Some(run) = &mut self.chats[chat_idx].run {
                         run.state.clone_from(state);
+                    }
+                    // A finished run that is running again was revived by a
+                    // message: its tab takes input once more.
+                    if state != "idle" && self.chats[chat_idx].is_finished() {
+                        self.chats[chat_idx].reopen();
                     }
                     self.chats[chat_idx].idle = state == "idle";
                     if state == "idle" {
@@ -2091,6 +2205,12 @@ impl App {
                 self.mcp_picker.open();
                 vec![]
             }
+            "/runs" => {
+                let waiting = self.permission_prompt.waiting_runs();
+                self.runs_picker.open(self.runs.rows(&waiting));
+                vec![]
+            }
+            "/stop" => self.cmd_stop(&cmd.args),
             "/login" => {
                 self.login_picker.open(self.storage.clone());
                 vec![]
@@ -2299,7 +2419,7 @@ impl App {
         vec![]
     }
 
-    fn overlays(&self) -> [&dyn Overlay; 14] {
+    fn overlays(&self) -> [&dyn Overlay; 15] {
         [
             &self.alert_modal,
             &self.help_modal,
@@ -2313,12 +2433,13 @@ impl App {
             &self.model_picker,
             &self.login_picker,
             &self.mcp_picker,
+            &self.runs_picker,
             &self.pack_review,
             &self.permission_prompt,
         ]
     }
 
-    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 14] {
+    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 15] {
         [
             &mut self.alert_modal,
             &mut self.help_modal,
@@ -2332,6 +2453,7 @@ impl App {
             &mut self.model_picker,
             &mut self.login_picker,
             &mut self.mcp_picker,
+            &mut self.runs_picker,
             &mut self.pack_review,
             &mut self.permission_prompt,
         ]
@@ -2644,6 +2766,7 @@ impl App {
         try_picker!(self.theme_picker);
         try_picker!(self.model_picker);
         try_picker!(self.mcp_picker);
+        try_picker!(self.runs_picker);
         try_picker!(self.login_picker);
         if !self.chat_accepts_input() {
             return;

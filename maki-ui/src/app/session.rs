@@ -3,7 +3,9 @@ use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 use crate::app::tasks::TaskOutcome;
-use crate::chat::{Chat, DONE_TEXT, history_to_display};
+use crate::chat::{CANCELLED_TEXT, Chat, DONE_TEXT, ERROR_TEXT, history_to_display};
+
+const LOST_TEXT: &str = "Lost when maki exited";
 use crate::components::Action;
 use crate::components::rewind_picker::RewindEntry;
 use maki_lua::SessionEndReason;
@@ -212,6 +214,7 @@ impl App {
         self.active_chat = MAIN_CHAT;
         self.chat_index.clear();
         self.deleted_tasks.clear();
+        self.runs.clear();
         self.status = Status::Idle;
         self.clear_exit_request();
         self.queue.clear();
@@ -261,8 +264,13 @@ impl App {
             // leftovers from a kill mid-turn. It has nothing to show, and
             // restoring it would park a task no agent backs at the top of the
             // picker, running forever. `sync_subagents` below drops it for good.
-            let Some(messages) = self.state.session.subagent_messages().get(&sa.tool_use_id) else {
-                continue;
+            // A native run keeps its transcript in the journal, so it comes back
+            // even without one here: the tab is read-only until a message revives it.
+            let none = Vec::new();
+            let messages = match self.state.session.subagent_messages().get(&sa.tool_use_id) {
+                Some(messages) => messages,
+                None if sa.run.is_some() => &none,
+                None => continue,
             };
             if self.chat_of_task(&sa.tool_use_id).is_ok() {
                 continue;
@@ -293,9 +301,25 @@ impl App {
                 fast: sa.fast,
             });
             chat.load_messages(display);
-            // The session file keeps the transcript but never how it ended,
-            // so a reload admits that instead of guessing.
-            chat.mark_finished(TaskOutcome::Unknown, DONE_TEXT);
+            match sa.run {
+                Some(mut run) => {
+                    self.runs.restored(&run);
+                    if super::runs::is_live(&run.state) {
+                        run.state = super::runs::LOST.to_owned();
+                    }
+                    let (outcome, text) = match run.state.as_str() {
+                        "completed" => (TaskOutcome::Done, DONE_TEXT),
+                        "killed" => (TaskOutcome::Error, CANCELLED_TEXT),
+                        super::runs::LOST => (TaskOutcome::Error, LOST_TEXT),
+                        _ => (TaskOutcome::Error, ERROR_TEXT),
+                    };
+                    chat.run = Some(run);
+                    chat.mark_finished(outcome, text);
+                }
+                // The session file keeps the transcript but never how it ended,
+                // so a reload admits that instead of guessing.
+                None => chat.mark_finished(TaskOutcome::Unknown, DONE_TEXT),
+            }
             chat.request_restores(items);
             self.chats.push(chat);
         }
