@@ -10,6 +10,8 @@ use crate::tools::compact_duration;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NoticeKind {
     Settled,
+    /// The ping-pong guard held messages between two runs.
+    Guard,
 }
 
 #[derive(Debug, Clone)]

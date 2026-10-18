@@ -6,6 +6,7 @@ pub mod agent;
 #[cfg(test)]
 mod agent_run;
 pub mod clock;
+pub mod inbox;
 pub mod limits;
 pub mod notice;
 pub mod shell;
@@ -16,7 +17,7 @@ mod topology;
 use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -37,6 +38,8 @@ use crate::{AgentEvent, Envelope, SubagentInfo};
 use agent::AgentRun;
 pub use agent::{AgentLaunch, resolve_model};
 pub use clock::{Clock, ManualClock, SystemClock};
+use inbox::{Accepted, Phase};
+pub use inbox::{DeliveryKind, Inbox, InboxItem, MessageId, SendAck};
 pub use limits::UnitLimits;
 pub use notice::{Notice, NoticeKind};
 use shell::ShellRun;
@@ -547,6 +550,35 @@ struct UnitTable {
     handles: HashMap<UnitHandle, UnitId>,
     names: HashMap<UnitName, UnitId>,
     children: HashMap<UnitId, Vec<UnitId>>,
+    /// Ping-pong guard state per pair of agent runs, see [`UnitHub::send`].
+    pairs: HashMap<PairKey, PairState>,
+}
+
+/// An unordered pair of runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct PairKey(UnitId, UnitId);
+
+impl PairKey {
+    fn of(a: UnitId, b: UnitId) -> Self {
+        if a.0.to_string() <= b.0.to_string() {
+            Self(a, b)
+        } else {
+            Self(b, a)
+        }
+    }
+
+    fn has(&self, id: UnitId) -> bool {
+        self.0 == id || self.1 == id
+    }
+}
+
+#[derive(Default)]
+struct PairState {
+    /// Consecutive agent-to-agent messages since the last other work.
+    count: u32,
+    /// Messages kept back after the burst, released when the counter resets.
+    held: Vec<(UnitId, InboxItem)>,
+    notified: bool,
 }
 
 impl UnitTable {
@@ -659,7 +691,16 @@ pub struct UnitHub {
     /// turn leaves background agents alone.
     cancel: CancelToken,
     cancel_root: Mutex<Option<CancelTrigger>>,
+    /// `main`'s inbox. The root agent drains it like any run; waking an idle
+    /// `main` is phase 4b.
+    main_inbox: Arc<Inbox>,
+    /// The reserved sender of text the user types into a run's tab.
+    user: UnitId,
+    message_seq: AtomicU64,
 }
+
+/// Messages the ping-pong guard keeps per pair before it refuses more.
+const MAX_HELD_PER_PAIR: usize = 4;
 
 /// What `stop` decided under the lock and carries out after it.
 #[derive(Default)]
@@ -691,6 +732,9 @@ impl UnitHub {
             events: events.with_run_id(crate::BACKGROUND_RUN_ID),
             cancel,
             cancel_root: Mutex::new(Some(trigger)),
+            main_inbox: Arc::new(Inbox::new(Phase::Idle)),
+            user: UnitId::new(),
+            message_seq: AtomicU64::new(0),
         })
     }
 
@@ -1400,6 +1444,22 @@ impl UnitHub {
         table.units.contains_key(&id).then(|| table.view(id))
     }
 
+    /// The sender id for text the user types into a run's tab.
+    pub fn user(&self) -> UnitId {
+        self.user
+    }
+
+    /// The inbox `id` drains: a native agent run or `main`.
+    pub fn inbox_of(&self, id: UnitId) -> Option<Arc<Inbox>> {
+        if id == self.main {
+            return Some(Arc::clone(&self.main_inbox));
+        }
+        self.table()
+            .agents
+            .get(&id)
+            .map(|run| Arc::clone(&run.inbox))
+    }
+
     /// Accepts `main`, `parent`, a handle, a name or the full id.
     pub fn resolve(&self, caller: UnitId, key: &str) -> Result<UnitId, UnitError> {
         let table = self.table();
@@ -1432,6 +1492,229 @@ impl UnitHub {
 }
 
 impl UnitHub {
+    /// Queues a message from `from` for `to`. Reachability is the tree: a run
+    /// talks to its parent, its direct children and `main`; `main` and `user`
+    /// reach every agent. Siblings are not reachable (phase 4d adds the opt-in).
+    ///
+    /// The checks run under the hub lock; the enqueue runs under the
+    /// recipient's inbox lock after the hub lock is gone, and wakes an `Idle`
+    /// recipient (moving it to `Running`) in the same inbox critical section,
+    /// so the driver's settle cannot miss it.
+    pub fn send(
+        &self,
+        from: UnitId,
+        to: UnitId,
+        text: String,
+        kind: DeliveryKind,
+    ) -> Result<SendAck, UnitError> {
+        if from == to {
+            return Err(UnitError::SelfSend);
+        }
+        if text.len() > inbox::MAX_MESSAGE_BYTES {
+            return Err(UnitError::TooLarge {
+                max: inbox::MAX_MESSAGE_BYTES,
+            });
+        }
+        let id = MessageId(self.message_seq.fetch_add(1, Ordering::Relaxed) + 1);
+        let now = self.clock.now();
+        let mut table = self.table();
+        let label = if from == self.user {
+            "user".to_owned()
+        } else if from == self.main {
+            "main".to_owned()
+        } else {
+            let unit = table.units.get(&from).ok_or(UnitError::UnknownRun)?;
+            if matches!(unit.state, UnitState::Stopping | UnitState::Done(_)) {
+                return Err(UnitError::NotReachable);
+            }
+            unit.name.to_string()
+        };
+        let item = InboxItem::new(id, from, label, kind, text, now);
+        let (inbox, state) = if to == self.main {
+            if from == self.user {
+                return Err(UnitError::NotReachable);
+            }
+            (Arc::clone(&self.main_inbox), "next request or turn")
+        } else {
+            let unit = table.units.get(&to).ok_or(UnitError::UnknownRun)?;
+            if unit.kind.kind() != RunKind::Agent {
+                return Err(UnitError::NotAgent);
+            }
+            let reachable = from == self.main
+                || from == self.user
+                || unit.parent == from
+                || table.units.get(&from).is_some_and(|f| f.parent == to);
+            if !reachable {
+                return Err(UnitError::NotReachable);
+            }
+            let state = match unit.state {
+                UnitState::Running => "running",
+                UnitState::Idle => "idle",
+                UnitState::Queued => "queued",
+                UnitState::Stopping | UnitState::Done(_) => {
+                    return Err(UnitError::RecipientTerminal);
+                }
+            };
+            let run = table.agents.get(&to).ok_or(UnitError::RecipientTerminal)?;
+            (Arc::clone(&run.inbox), state)
+        };
+        let agents = from != self.user
+            && from != self.main
+            && to != self.main
+            && table.units.contains_key(&from);
+        let mut released = Vec::new();
+        if agents {
+            let key = PairKey::of(from, to);
+            let pair = table.pairs.entry(key).or_default();
+            if pair.count >= inbox::PAIR_BURST {
+                if pair.held.len() >= MAX_HELD_PER_PAIR {
+                    return Err(UnitError::RateLimited {
+                        retry_after: inbox::PAIR_WINDOW.as_secs(),
+                    });
+                }
+                pair.held.push((to, item));
+                let first = !std::mem::replace(&mut pair.notified, true);
+                if first {
+                    self.guard_notice(&mut table, from, to);
+                }
+                self.release(table);
+                return Ok(SendAck {
+                    id,
+                    state,
+                    held: true,
+                });
+            }
+        } else {
+            // A message from outside the pair resets it.
+            released = self.reset_pairs(&mut table, |key| key.has(to));
+        }
+        self.release(table);
+        self.deliver_all(released);
+        let delivered = self.deliver(to, &inbox, item, now, true);
+        if delivered.is_ok() && agents {
+            let mut table = self.table();
+            table.pairs.entry(PairKey::of(from, to)).or_default().count += 1;
+        }
+        delivered?;
+        Ok(SendAck {
+            id,
+            state,
+            held: false,
+        })
+    }
+
+    /// The pair `a`, `b` talked past the burst: the parent of the sender (or
+    /// `main`) hears it once, quietly.
+    fn guard_notice(&self, table: &mut UnitTable, from: UnitId, to: UnitId) {
+        let owner = table.units.get(&from).map_or(self.main, |u| u.parent);
+        let name = |id: UnitId| {
+            table
+                .units
+                .get(&id)
+                .map_or_else(|| "main".to_owned(), |u| u.name.to_string())
+        };
+        let text = format!(
+            "{} and {} exchanged {} messages without doing other work; further messages are held",
+            name(from),
+            name(to),
+            inbox::PAIR_BURST,
+        );
+        let seq = table.notice_seq.entry(owner).or_default();
+        *seq += 1;
+        let notice = Notice {
+            seq: *seq,
+            run: from,
+            kind: NoticeKind::Guard,
+            wake: false,
+            text,
+            created: SystemTime::now(),
+        };
+        table.notices.entry(owner).or_default().push(notice);
+    }
+
+    /// Resets the counter of every pair `which` selects and takes what the
+    /// guard held for them. Delivery is the caller's, after the lock.
+    fn reset_pairs(
+        &self,
+        table: &mut UnitTable,
+        which: impl Fn(&PairKey) -> bool,
+    ) -> Vec<(UnitId, InboxItem)> {
+        let mut released = Vec::new();
+        table.pairs.retain(|key, pair| {
+            if !which(key) {
+                return true;
+            }
+            released.append(&mut pair.held);
+            false
+        });
+        released
+    }
+
+    /// A run did other work than `send`, `runs` or `wait`: whatever the
+    /// ping-pong guard held for its pairs is released.
+    pub fn note_work(&self, who: UnitId) {
+        let released = {
+            let mut table = self.table();
+            if table.pairs.is_empty() {
+                return;
+            }
+            self.reset_pairs(&mut table, |key| key.has(who))
+        };
+        self.deliver_all(released);
+    }
+
+    fn deliver_all(&self, items: Vec<(UnitId, InboxItem)>) {
+        let now = self.clock.now();
+        for (to, item) in items {
+            if let Some(inbox) = self.inbox_of(to) {
+                let _ = self.deliver(to, &inbox, item, now, false);
+            }
+        }
+    }
+
+    /// The inbox critical section: enqueue, and when that wakes an idle
+    /// agent, move it to `Running` before anyone can look.
+    fn deliver(
+        &self,
+        to: UnitId,
+        inbox: &Inbox,
+        item: InboxItem,
+        now: Instant,
+        rated: bool,
+    ) -> Result<(), UnitError> {
+        let mut guard = inbox.lock();
+        let accepted = guard.enqueue_with(item, now, rated)?;
+        if accepted == Accepted::Wake && to != self.main {
+            guard.set_phase(Phase::Running);
+            self.mark_running(to);
+        }
+        drop(guard);
+        inbox.signal();
+        Ok(())
+    }
+
+    fn mark_running(&self, id: UnitId) {
+        let mut table = self.table();
+        let Some(unit) = table.units.get_mut(&id) else {
+            return;
+        };
+        if !matches!(unit.state, UnitState::Idle) {
+            return;
+        }
+        unit.state = UnitState::Running;
+        unit.last_activity = self.clock.now();
+        let handle = unit.handle.to_string();
+        let event = table.event_of(
+            id,
+            AgentEvent::RunStateChanged {
+                handle,
+                state: "running".to_owned(),
+            },
+        );
+        table.outbox.push(event);
+        self.release(table);
+    }
+
     /// Best-effort teardown for process exit: no new shell launches, SIGTERM to
     /// every running shell group, then SIGKILL after a short bounded grace.
     /// Idempotent, synchronous, needs no runtime; safe from a signal-handling

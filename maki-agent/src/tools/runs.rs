@@ -22,8 +22,8 @@ use crate::ToolOutput;
 use crate::cancel::CancelToken;
 use crate::runs::shell::command_scopes;
 use crate::runs::{
-    AgentLaunch, OutputSlice, RunKind, RunsCtx, Scope, SpawnRequest, StopOpts, StopStatus,
-    UnitError, UnitId, UnitKind, UnitState, UnitView, WaitMode,
+    AgentLaunch, DeliveryKind, OutputSlice, RunKind, RunsCtx, Scope, SpawnRequest, StopOpts,
+    StopStatus, UnitError, UnitId, UnitKind, UnitState, UnitView, WaitMode,
 };
 use maki_config::Permission;
 
@@ -40,7 +40,6 @@ pub const RUN_TOOL_NAMES: [&str; 5] = [
     STOP_TOOL_NAME,
 ];
 
-const NOT_IMPLEMENTED: &str = "NOT_IMPLEMENTED";
 const PLAN_BLOCK: &str = "PLAN_MODE: only research agents may be spawned in plan mode";
 const NO_RUNS: &str = "no runs";
 const DEFAULT_WAIT_SECS: u64 = 60;
@@ -121,6 +120,8 @@ pub fn all() -> Vec<Arc<dyn Tool>> {
 #[derive(Deserialize)]
 struct SendArgs {
     to: String,
+    message: String,
+    mode: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -345,7 +346,7 @@ impl ToolInvocation for RunInvocation {
                 (Call::Runs(args), Some(runs)) => list_or_show(runs, args),
                 (Call::Wait(args), Some(runs)) => wait(runs, args, &ctx.cancel).await,
                 (Call::Stop(args), Some(runs)) => stop(runs, args, &ctx.cancel).await,
-                (Call::Send(_), Some(_)) => Err(NOT_IMPLEMENTED.to_owned()),
+                (Call::Send(args), Some(runs)) => send(runs, args),
             };
             ToolExecResult::from(result.map(|text| ToolOutput::Plain(text.into())))
         })
@@ -387,6 +388,41 @@ async fn spawn(runs: &RunsCtx, ctx: &ToolContext, req: SpawnRequest) -> Result<S
         ack.name,
         ack.kind.as_str()
     ))
+}
+
+fn send(runs: &RunsCtx, args: SendArgs) -> Result<String, String> {
+    let kind = match args.mode.as_deref() {
+        None => DeliveryKind::Steer,
+        Some(mode) => DeliveryKind::parse(mode)
+            .ok_or_else(|| "BAD_FIELD: \"mode\" must be steer, followup or quiet".to_owned())?,
+    };
+    let to = runs
+        .hub
+        .resolve(runs.self_run, &args.to)
+        .map_err(|e| format!("{e}: {}", args.to))?;
+    let ack = runs
+        .hub
+        .send(runs.self_run, to, args.message, kind)
+        .map_err(|e| e.to_string())?;
+    let target = if to == runs.hub.main() {
+        "main".to_owned()
+    } else {
+        runs.hub
+            .get(to)
+            .map_or_else(|| args.to.clone(), |view| view.handle.to_string())
+    };
+    Ok(if ack.held {
+        format!(
+            "message {} held for {target}: the pair has exchanged {} messages without other work; it is delivered once either side does other work or the parent writes",
+            ack.id,
+            crate::runs::inbox::PAIR_BURST,
+        )
+    } else {
+        format!(
+            "message {} queued for {target} ({}); use runs(id) to see delivery",
+            ack.id, ack.state
+        )
+    })
 }
 
 fn resolve_all(runs: &RunsCtx, keys: &[String]) -> Result<Vec<UnitId>, String> {
@@ -758,15 +794,6 @@ mod tests {
     fn unknown_run_id_is_reported() {
         let err = call(Which::Runs, &ctx(), json!({"id": "ag-nope00"})).unwrap_err();
         assert!(err.starts_with("UNKNOWN_RUN"), "{err}");
-    }
-
-    #[test]
-    fn send_is_still_a_stub() {
-        let input = json!({"to": "main", "message": "hi"});
-        assert_eq!(
-            call(Which::Send, &ctx(), input).unwrap_err(),
-            NOT_IMPLEMENTED
-        );
     }
 
     fn handle_of(started: &str) -> &str {
