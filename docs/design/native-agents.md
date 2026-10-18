@@ -94,7 +94,7 @@ pub struct UnitName(Arc<str>);             // lower-kebab, 1..=32 chars, unique 
 
 The model-facing id is the handle; the name works anywhere an id is accepted. `main` (root
 agent) and `parent` (the caller's parent) are reserved and cannot be used as `name`. A handle
-is derived from the first 4 bytes of the `MakiId`; collisions inside one session tree are
+is derived from the last 4 bytes (a v7 uuid starts with a timestamp) of the `MakiId`; collisions inside one session tree are
 retried at spawn. Names default to a slug of `description`, suffixed `-2`, `-3` on clash.
 Display: name first, handle in parentheses.
 
@@ -132,7 +132,7 @@ pub struct Unit {
 }
 
 /// One field, no separate reason: the reason is part of Done.
-pub enum UnitState { Queued, Running, Idle, Stopping, Done(Terminal) }
+pub enum UnitState { Queued, Running, Idle, Stopping, Done(Box<Terminal>) }
 
 pub enum DoneReason {
     Completed,          // agent EndTurn of a one_shot agent, or idle expiry; shell exit 0
@@ -1279,6 +1279,7 @@ Tests: `runs::handle_is_prefixed_and_six_chars`, `runs::name_slug_suffixes_on_cl
 `tools::runs::cross_kind_fields_rejected`, `tools::runs::spawn_returns_queued_record`,
 `registry::native_tool_logs_source`, `registry::native_tools_declare_reach`.
 E2E: start, ask "call runs with no arguments", expect `no runs`.
+Notes from the build: the root id is `hub.main()` (not in the table, depth 0); native tools are registered by `runs::sync_registration` from `load_plugins` (`src/cmd/mod.rs`) before the Lua builtins; the run names count as built-in (MCP server name clash) only while `enabled` is true.
 Commit: `feat: add native run tool surface and hub skeleton`.
 
 ### Phase 2: native shell jobs (core)
