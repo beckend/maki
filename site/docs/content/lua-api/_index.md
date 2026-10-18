@@ -1593,7 +1593,8 @@ session, so opening one fails with "session not live". The
 
 The handle carries its own id, so you can deliver a message to the subagent
 from the outside with `maki.session.notify(..., { session = sess:session_id() })`.
-The message waits for the subagent's next `:prompt()`; see
+The message is read before the subagent's next request, or at its next
+`:prompt()` if it is idle; see
 [maki.agent.Session](#maki-agent-session).
 
 **Example:**
@@ -1664,7 +1665,8 @@ idle, so a session you only drop can stay open for the rest of the run.
 
 `:session_id()` is how anything else reaches this one: hand it to
 `maki.session.notify` to deliver an observation from the outside. The
-observation waits for the next `:prompt()` — a subagent has no turn of
+observation is read before the subagent's next request, or at its next
+`:prompt()` if it is idle. A subagent has no turn of
 its own to be woken into, and `maki.session.prompt` is a UI roundtrip
 that does not apply to it.
 
@@ -1687,9 +1689,11 @@ maki.session.notify("the build failed", { session = id })
 
 What reaches the subagent, and when:
 
-- The message becomes an observation in its history at the subagent's NEXT
-  `:prompt()`. Nothing starts a subagent's turn on its own, so a message
-  delivered while it is idle just waits for you to prompt it.
+- The message becomes an observation in its history before the subagent's
+  next request, so it sees it between tool calls. A call that is still
+  running is not interrupted: a subagent blocked in a long tool reads the
+  note when that tool returns. A message delivered while it is idle waits
+  for the next `:prompt()`, since nothing starts a subagent's turn on its own.
 - `wake` is read only by an interactive frontend loop. There is none here,
   so passing it changes nothing.
 - `maki.session.prompt()` does NOT work on a subagent: it is a roundtrip to
