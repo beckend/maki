@@ -1070,6 +1070,7 @@ impl EventPump {
             | AgentEvent::PromptProgress { .. }
             | AgentEvent::RunStarted { .. }
             | AgentEvent::RunStateChanged { .. }
+            | AgentEvent::RunNotice { .. }
             | AgentEvent::RunFinished { .. }
             | AgentEvent::StreamClosed => {}
             // A later kept message overwrites this with its own answer, so the

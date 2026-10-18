@@ -22,7 +22,7 @@ use crate::ToolOutput;
 use crate::cancel::CancelToken;
 use crate::runs::shell::command_scopes;
 use crate::runs::{
-    AgentLaunch, DeliveryKind, OutputSlice, RunKind, RunsCtx, Scope, SpawnRequest, StopOpts,
+    AgentLaunch, Claim, DeliveryKind, OutputSlice, RunKind, RunsCtx, Scope, SpawnRequest, StopOpts,
     StopStatus, UnitError, UnitId, UnitKind, UnitState, UnitView, WaitMode,
 };
 use maki_config::Permission;
@@ -343,13 +343,37 @@ impl ToolInvocation for RunInvocation {
                     req.origin_tool_use_id = ctx.tool_use_id.as_deref().map(Arc::from);
                     spawn(runs, ctx, *req).await
                 }
-                (Call::Runs(args), Some(runs)) => list_or_show(runs, args),
-                (Call::Wait(args), Some(runs)) => wait(runs, args, &ctx.cancel).await,
-                (Call::Stop(args), Some(runs)) => stop(runs, args, &ctx.cancel).await,
+                (Call::Runs(args), Some(runs)) => {
+                    engaged(runs);
+                    list_or_show(runs, args, ctx.tool_use_id.as_deref())
+                }
+                (Call::Wait(args), Some(runs)) => {
+                    engaged(runs);
+                    wait(runs, args, &ctx.cancel, ctx.tool_use_id.as_deref()).await
+                }
+                (Call::Stop(args), Some(runs)) => {
+                    stop(runs, args, &ctx.cancel, ctx.tool_use_id.as_deref()).await
+                }
                 (Call::Send(args), Some(runs)) => send(runs, args),
             };
             ToolExecResult::from(result.map(|text| ToolOutput::Plain(text.into())))
         })
+    }
+}
+
+/// The main agent itself reads run state: it is engaged, so the notice wake
+/// budget starts over (design 4.3).
+fn engaged(runs: &RunsCtx) {
+    if runs.self_run == runs.hub.main() {
+        runs.hub.note_engaged();
+    }
+}
+
+/// What a read returned, for the claim of 4.8.
+fn claim_of(views: &[&UnitView]) -> Claim {
+    Claim {
+        runs: views.iter().map(|v| (v.id, v.settle_gen)).collect(),
+        seqs: Vec::new(),
     }
 }
 
@@ -435,7 +459,12 @@ fn resolve_all(runs: &RunsCtx, keys: &[String]) -> Result<Vec<UnitId>, String> {
         .collect()
 }
 
-async fn wait(runs: &RunsCtx, args: WaitArgs, cancel: &CancelToken) -> Result<String, String> {
+async fn wait(
+    runs: &RunsCtx,
+    args: WaitArgs,
+    cancel: &CancelToken,
+    tool_use_id: Option<&str>,
+) -> Result<String, String> {
     let ids = resolve_all(runs, &args.ids)?;
     let mode = match args.mode.as_deref() {
         Some("any") => WaitMode::Any,
@@ -454,6 +483,9 @@ async fn wait(runs: &RunsCtx, args: WaitArgs, cancel: &CancelToken) -> Result<St
     if !satisfied && cancel.is_cancelled() {
         return Err("cancelled; the runs keep running".to_owned());
     }
+    let reported: Vec<&UnitView> = views.iter().filter(|v| settled(v)).collect();
+    runs.hub
+        .claim(runs.self_run, tool_use_id, claim_of(&reported));
     let mut out = String::new();
     for view in &views {
         if !out.is_empty() {
@@ -483,7 +515,12 @@ async fn wait(runs: &RunsCtx, args: WaitArgs, cancel: &CancelToken) -> Result<St
     Ok(out)
 }
 
-async fn stop(runs: &RunsCtx, args: StopArgs, cancel: &CancelToken) -> Result<String, String> {
+async fn stop(
+    runs: &RunsCtx,
+    args: StopArgs,
+    cancel: &CancelToken,
+    tool_use_id: Option<&str>,
+) -> Result<String, String> {
     let ids = resolve_all(runs, &args.ids)?;
     let opts = StopOpts {
         soft: args.soft.unwrap_or(false),
@@ -500,6 +537,12 @@ async fn stop(runs: &RunsCtx, args: StopArgs, cancel: &CancelToken) -> Result<St
         .hub
         .wait(runs.self_run, &requested, WaitMode::All, timeout, cancel)
         .await;
+    let reported: Vec<&UnitView> = settled
+        .iter()
+        .filter(|v| matches!(v.state, UnitState::Done(_)))
+        .collect();
+    runs.hub
+        .claim(runs.self_run, tool_use_id, claim_of(&reported));
     let mut lines = Vec::new();
     let mut any_ok = false;
     for (key, outcome) in args.ids.iter().zip(&outcomes) {
@@ -531,7 +574,11 @@ async fn stop(runs: &RunsCtx, args: StopArgs, cancel: &CancelToken) -> Result<St
     if any_ok { Ok(text) } else { Err(text) }
 }
 
-fn list_or_show(runs: &RunsCtx, args: RunsArgs) -> Result<String, String> {
+fn list_or_show(
+    runs: &RunsCtx,
+    args: RunsArgs,
+    tool_use_id: Option<&str>,
+) -> Result<String, String> {
     if let Some(key) = args.id {
         let id = runs
             .hub
@@ -556,8 +603,9 @@ fn list_or_show(runs: &RunsCtx, args: RunsArgs) -> Result<String, String> {
                 .read_output(runs.self_run, id, from, tail, from.is_none());
             let _ = write!(out, "\n{}", render_output(&slice));
         }
-        if view.state.is_done() {
-            runs.hub.consume_notice_of(id);
+        if matches!(view.state, UnitState::Done(_) | UnitState::Idle) {
+            runs.hub
+                .claim(runs.self_run, tool_use_id, claim_of(&[&view]));
         }
         return Ok(out);
     }
@@ -574,7 +622,15 @@ fn list_or_show(runs: &RunsCtx, args: RunsArgs) -> Result<String, String> {
         .filter(|v| include_finished || !v.state.is_done())
         .filter(|v| scope != Scope::All || runs.hub.can_reach(runs.self_run, v.id))
         .collect();
-    let notices = runs.hub.take_notices(runs.self_run);
+    let notices = runs.hub.pending_notices(runs.self_run);
+    runs.hub.claim(
+        runs.self_run,
+        tool_use_id,
+        Claim {
+            runs: Vec::new(),
+            seqs: notices.iter().map(|n| n.seq).collect(),
+        },
+    );
     if views.is_empty() && notices.is_empty() {
         return Ok(NO_RUNS.to_owned());
     }
@@ -879,22 +935,54 @@ mod tests {
         )
         .unwrap();
         let hub = &ctx.runs.as_ref().unwrap().hub;
-        let id = hub.resolve(hub.main(), handle_of(&started)).unwrap();
-        smol::block_on(hub.wait(
-            id_owner(&ctx),
-            &[id],
-            WaitMode::All,
-            Duration::from_secs(10_000_000),
-            &CancelToken::none(),
-        ));
+        call(
+            Which::Wait,
+            &ctx,
+            json!({"ids": [handle_of(&started)], "timeout_secs": 600}),
+        )
+        .unwrap();
         assert!(
             hub.pending_notices(hub.main()).is_empty(),
             "wait consumed it"
         );
     }
 
-    fn id_owner(ctx: &ToolContext) -> UnitId {
-        ctx.runs.as_ref().unwrap().self_run
+    #[test]
+    fn a_runs_read_by_main_resets_the_wake_budget() {
+        let ctx = ctx();
+        let hub = ctx.runs.as_ref().unwrap().hub.clone();
+        let finish_one = |n: usize| {
+            let started = call(
+                Which::Spawn,
+                &ctx,
+                json!({"kind": "shell", "description": format!("q{n}"), "command": "true"}),
+            )
+            .unwrap();
+            let id = hub.resolve(hub.main(), handle_of(&started)).unwrap();
+            smol::block_on(hub.wait(
+                hub.main(),
+                &[id],
+                WaitMode::All,
+                Duration::from_secs(10_000_000),
+                &CancelToken::none(),
+            ));
+            // The notice follows the state change by a moment.
+            let end = std::time::Instant::now() + Duration::from_secs(30);
+            while hub.pending_notices(hub.main()).is_empty() {
+                assert!(std::time::Instant::now() < end, "no notice");
+                std::thread::yield_now();
+            }
+        };
+        for n in 0..3 {
+            finish_one(n);
+            assert!(hub.claim_main_wake());
+            hub.inbox_of(hub.main()).unwrap().drain_step();
+        }
+        finish_one(3);
+        assert!(!hub.claim_main_wake());
+        call(Which::Runs, &ctx, json!({})).unwrap();
+        finish_one(4);
+        assert!(hub.claim_main_wake());
     }
 
     #[test]

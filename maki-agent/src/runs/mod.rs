@@ -9,6 +9,8 @@ pub mod clock;
 pub mod inbox;
 pub mod limits;
 pub mod notice;
+#[cfg(test)]
+mod notice_tests;
 pub mod shell;
 #[cfg(unix)]
 mod signals;
@@ -41,7 +43,7 @@ pub use clock::{Clock, ManualClock, SystemClock};
 use inbox::{Accepted, Phase};
 pub use inbox::{DeliveryKind, Inbox, InboxItem, MessageId, SendAck};
 pub use limits::UnitLimits;
-pub use notice::{Notice, NoticeKind};
+pub use notice::{Notice, NoticeInfo, NoticeKind};
 use shell::ShellRun;
 pub use shell::{OutputSlice, ShellOptions};
 
@@ -500,6 +502,8 @@ pub struct UnitView {
     pub command: Option<String>,
     /// The final result of a `Done` run, or the last turn's result of an `Idle` agent.
     pub result: Option<UnitResult>,
+    /// How many times the run settled or went idle; see [`UnitHub::claim`].
+    pub settle_gen: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -542,9 +546,16 @@ struct UnitTable {
     fork_snapshots: HashMap<String, Arc<Vec<Message>>>,
     /// Events produced under the lock, sent once it is released.
     outbox: Vec<Envelope>,
-    /// Queued for the owner, oldest first; delivery is phase 4b.
-    notices: HashMap<UnitId, Vec<Notice>>,
-    notice_seq: HashMap<UnitId, u64>,
+    /// Notices created under this lock, moved into the owner's inbox right
+    /// after it is released (inbox lock first, hub lock second).
+    pending_notices: Vec<PendingNotice>,
+    /// How many times each run settled or went idle.
+    settle_gen: HashMap<UnitId, u64>,
+    /// Highest settle of a run whose notice a committed read consumed.
+    consumed: HashMap<UnitId, u64>,
+    /// Reads that returned a result and wait for it to be committed, by the
+    /// `tool_use_id` of the call.
+    claims: HashMap<String, Claim>,
     /// Creation order, which is the order every listing uses.
     order: Vec<UnitId>,
     handles: HashMap<UnitHandle, UnitId>,
@@ -552,6 +563,44 @@ struct UnitTable {
     children: HashMap<UnitId, Vec<UnitId>>,
     /// Ping-pong guard state per pair of agent runs, see [`UnitHub::send`].
     pairs: HashMap<PairKey, PairState>,
+}
+
+fn settled_info(run: UnitId, handle: String, name: String, generation: u64) -> NoticeInfo {
+    NoticeInfo {
+        kind: NoticeKind::Settled,
+        run,
+        handle,
+        name,
+        generation,
+        count: 1,
+        created: SystemTime::now(),
+    }
+}
+
+struct PendingNotice {
+    owner: UnitId,
+    info: NoticeInfo,
+    text: String,
+    wake: bool,
+}
+
+/// A read's claim on notices (design 4.8): consumption only once the tool
+/// result that carries the read is committed to the reader's history.
+#[derive(Debug, Default, Clone)]
+pub struct Claim {
+    /// Runs whose result the read returned, with the settle it saw.
+    pub runs: Vec<(UnitId, u64)>,
+    /// Notices the read listed, by inbox `seq`.
+    pub seqs: Vec<u64>,
+}
+
+/// Consecutive notice-initiated turns of `main` before further notices are quiet.
+pub const WAKE_BUDGET: u32 = 3;
+
+#[derive(Default)]
+struct WakeBudget {
+    streak: u32,
+    marker_sent: bool,
 }
 
 /// An unordered pair of runs.
@@ -600,12 +649,6 @@ impl UnitTable {
             if !self.handles.contains_key(&handle) {
                 return (id, handle);
             }
-        }
-    }
-
-    fn drop_notices_of(&mut self, run: UnitId) {
-        for queue in self.notices.values_mut() {
-            queue.retain(|n| n.run != run);
         }
     }
 
@@ -672,6 +715,7 @@ impl UnitTable {
                 UnitState::Idle => self.idle_results.get(&id).cloned(),
                 _ => None,
             },
+            settle_gen: self.settle_gen.get(&id).copied().unwrap_or(0),
         }
     }
 }
@@ -691,9 +735,10 @@ pub struct UnitHub {
     /// turn leaves background agents alone.
     cancel: CancelToken,
     cancel_root: Mutex<Option<CancelTrigger>>,
-    /// `main`'s inbox. The root agent drains it like any run; waking an idle
-    /// `main` is phase 4b.
+    /// `main`'s inbox. The root agent drains it like any run; an idle `main`
+    /// is started by its frontend once [`UnitHub::claim_main_wake`] says so.
     main_inbox: Arc<Inbox>,
+    wake: Mutex<WakeBudget>,
     /// The reserved sender of text the user types into a run's tab.
     user: UnitId,
     message_seq: AtomicU64,
@@ -733,6 +778,7 @@ impl UnitHub {
             cancel,
             cancel_root: Mutex::new(Some(trigger)),
             main_inbox: Arc::new(Inbox::new(Phase::Idle)),
+            wake: Mutex::new(WakeBudget::default()),
             user: UnitId::new(),
             message_seq: AtomicU64::new(0),
         })
@@ -985,6 +1031,7 @@ impl UnitHub {
         let mut table = self.table();
         self.settle_locked(&mut table, id, terminal, output_bytes);
         self.release(table);
+        self.flush_notices();
         self.settled.notify(usize::MAX);
     }
 
@@ -1029,18 +1076,17 @@ impl UnitHub {
         unit.last_activity = self.clock.now();
         unit.progress = None;
         let (owner, wake) = (unit.owner, unit.notice_policy == NoticePolicy::Wake);
+        let (handle, name) = (unit.handle.to_string(), unit.name.to_string());
+        let generation = table.settle_gen.entry(id).or_default();
+        *generation += 1;
+        let generation = *generation;
         if let Some(text) = text {
-            let seq = table.notice_seq.entry(owner).or_default();
-            *seq += 1;
-            let notice = Notice {
-                seq: *seq,
-                run: id,
-                kind: NoticeKind::Settled,
-                wake,
+            table.pending_notices.push(PendingNotice {
+                owner,
+                info: settled_info(id, handle, name, generation),
                 text,
-                created: SystemTime::now(),
-            };
-            table.notices.entry(owner).or_default().push(notice);
+                wake,
+            });
         }
         let event = table.event_of(id, finished);
         table.outbox.push(event);
@@ -1061,24 +1107,23 @@ impl UnitHub {
         unit.progress = None;
         let text = (notify && unit.notice_policy != NoticePolicy::Never)
             .then(|| notice::agent_idle(&unit.handle, &unit.name, &result));
-        let (owner, wake, handle) = (
+        let (owner, wake, handle, name) = (
             unit.owner,
             unit.notice_policy == NoticePolicy::Wake,
             unit.handle.to_string(),
+            unit.name.to_string(),
         );
         table.idle_results.insert(id, result);
+        let generation = table.settle_gen.entry(id).or_default();
+        *generation += 1;
+        let generation = *generation;
         if let Some(text) = text {
-            let seq = table.notice_seq.entry(owner).or_default();
-            *seq += 1;
-            let notice = Notice {
-                seq: *seq,
-                run: id,
-                kind: NoticeKind::Settled,
-                wake,
+            table.pending_notices.push(PendingNotice {
+                owner,
+                info: settled_info(id, handle.clone(), name, generation),
                 text,
-                created: SystemTime::now(),
-            };
-            table.notices.entry(owner).or_default().push(notice);
+                wake,
+            });
         }
         let event = table.event_of(
             id,
@@ -1089,6 +1134,7 @@ impl UnitHub {
         );
         table.outbox.push(event);
         self.release(table);
+        self.flush_notices();
         self.settled.notify(usize::MAX);
         true
     }
@@ -1189,6 +1235,7 @@ impl UnitHub {
             })
             .collect();
         self.release(table);
+        self.flush_notices();
         if plan.settled {
             self.settled.notify(usize::MAX);
         }
@@ -1314,6 +1361,7 @@ impl UnitHub {
         };
         self.settle_locked(&mut table, id, terminal, 0);
         self.release(table);
+        self.flush_notices();
         self.settled.notify(usize::MAX);
         if let Some(run) = run {
             run.abort();
@@ -1345,7 +1393,7 @@ impl UnitHub {
         loop {
             let listener = self.settled.listen();
             let (views, satisfied) = {
-                let mut table = self.table();
+                let table = self.table();
                 let views: Vec<UnitView> = ids
                     .iter()
                     .filter(|id| table.units.contains_key(id))
@@ -1357,11 +1405,6 @@ impl UnitHub {
                     WaitMode::All => views.iter().all(settled),
                     WaitMode::Any => views.iter().any(settled),
                 };
-                if satisfied {
-                    for view in views.iter().filter(|v| settled(v)) {
-                        table.drop_notices_of(view.id);
-                    }
-                }
                 (views, satisfied)
             };
             if satisfied || cancel.is_cancelled() {
@@ -1411,22 +1454,182 @@ impl UnitHub {
             .unwrap_or_default()
     }
 
+    /// Notices queued for `owner` and not yet drained, oldest first.
     pub fn pending_notices(&self, owner: UnitId) -> Vec<Notice> {
-        self.table()
-            .notices
-            .get(&owner)
-            .cloned()
+        self.inbox_of(owner)
+            .map(|inbox| inbox.lock().queued_notices())
             .unwrap_or_default()
     }
 
-    /// Hands out everything queued for `owner`.
-    pub fn take_notices(&self, owner: UnitId) -> Vec<Notice> {
-        self.table().notices.remove(&owner).unwrap_or_default()
+    /// Moves what settling queued under the hub lock into the owners' inboxes.
+    /// Called with no lock held.
+    fn flush_notices(&self) {
+        let batch = std::mem::take(&mut self.table().pending_notices);
+        for pending in batch {
+            self.enqueue_notice(pending);
+        }
     }
 
-    /// The caller has the run's result in hand, so its notice is moot.
-    pub fn consume_notice_of(&self, run: UnitId) {
-        self.table().drop_notices_of(run);
+    /// The check of "already consumed" and the enqueue are one inbox critical
+    /// section, so a read finalised in between cannot lose or duplicate it.
+    fn enqueue_notice(&self, pending: PendingNotice) {
+        let PendingNotice {
+            owner,
+            info,
+            text,
+            wake,
+        } = pending;
+        let Some(inbox) = self.inbox_of(owner) else {
+            return;
+        };
+        let mut guard = inbox.lock();
+        if info.kind == NoticeKind::Settled
+            && self
+                .table()
+                .consumed
+                .get(&info.run)
+                .is_some_and(|&seen| seen >= info.generation)
+        {
+            return;
+        }
+        let item = InboxItem::notice(info, text, wake, self.clock.now());
+        let Some(accepted) = guard.enqueue_notice(item, self.clock.now()) else {
+            return;
+        };
+        if accepted == Accepted::Wake && owner != self.main {
+            guard.set_phase(Phase::Running);
+            self.mark_running(owner);
+        }
+        drop(guard);
+        inbox.signal();
+        if accepted == Accepted::Wake && owner == self.main {
+            self.events.try_send(AgentEvent::RunNotice { wake: true });
+        }
+    }
+
+    /// A read returned results. Records what it saw; the notices go only when
+    /// [`Self::commit_claims`] says the tool result is in the reader's
+    /// history. A call with no `tool_use_id` has no history to wait for and
+    /// commits at once. Only the owner's reads count: the notice is its own.
+    pub fn claim(&self, owner: UnitId, tool_use_id: Option<&str>, mut claim: Claim) {
+        {
+            let table = self.table();
+            claim
+                .runs
+                .retain(|(run, _)| table.units.get(run).is_some_and(|u| u.owner == owner));
+        }
+        if claim.runs.is_empty() && claim.seqs.is_empty() {
+            return;
+        }
+        match tool_use_id {
+            Some(id) => {
+                let mut table = self.table();
+                if table.claims.len() >= 64 {
+                    table.claims.clear();
+                }
+                let entry = table.claims.entry(id.to_owned()).or_default();
+                entry.runs.extend(claim.runs);
+                entry.seqs.extend(claim.seqs);
+            }
+            None => self.finalize(owner, &claim),
+        }
+    }
+
+    /// The tool results for `tool_use_ids` are in the reader's history.
+    pub fn commit_claims(&self, owner: UnitId, tool_use_ids: &[String]) {
+        let claims: Vec<Claim> = {
+            let mut table = self.table();
+            if table.claims.is_empty() {
+                return;
+            }
+            tool_use_ids
+                .iter()
+                .filter_map(|id| table.claims.remove(id))
+                .collect()
+        };
+        for claim in &claims {
+            self.finalize(owner, claim);
+        }
+    }
+
+    /// A read was cancelled or failed before it was committed: its claim goes.
+    pub fn release_claims(&self, tool_use_ids: &[String]) {
+        let mut table = self.table();
+        for id in tool_use_ids {
+            table.claims.remove(id);
+        }
+    }
+
+    /// Under the owner's inbox lock: a notice still queued is removed, one
+    /// already drained is out of reach (and the read still returned the result).
+    fn finalize(&self, owner: UnitId, claim: &Claim) {
+        let Some(inbox) = self.inbox_of(owner) else {
+            return;
+        };
+        let mut guard = inbox.lock();
+        {
+            let mut table = self.table();
+            for &(run, seen) in &claim.runs {
+                let at = table.consumed.entry(run).or_default();
+                *at = (*at).max(seen);
+            }
+        }
+        guard.remove_notices(|item| {
+            claim.seqs.contains(&item.seq())
+                || item.notice.as_ref().is_some_and(|n| {
+                    n.kind == NoticeKind::Settled
+                        && claim
+                            .runs
+                            .iter()
+                            .any(|&(run, seen)| run == n.run && n.generation <= seen)
+                })
+        });
+    }
+
+    /// Whether the frontend may start a turn for `main` now. True when a waking
+    /// item is queued; a notice-only wake spends the budget (design 4.3). When
+    /// the budget is gone the waking notices turn quiet and one marker says so.
+    pub fn claim_main_wake(&self) -> bool {
+        let mut guard = self.main_inbox.lock();
+        if !guard.has_wakeable() {
+            return false;
+        }
+        if guard.has_non_notice_wakeable() {
+            return true;
+        }
+        let mut budget = self.wake.lock().unwrap_or_else(|e| e.into_inner());
+        if budget.streak < WAKE_BUDGET {
+            budget.streak += 1;
+            return true;
+        }
+        guard.demote_notice_wakes();
+        if !std::mem::replace(&mut budget.marker_sent, true) {
+            let info = NoticeInfo {
+                kind: NoticeKind::Overflow,
+                run: UnitId::new(),
+                handle: String::new(),
+                name: String::new(),
+                generation: 0,
+                count: 1,
+                created: SystemTime::now(),
+            };
+            guard.push_marker(
+                info,
+                format!(
+                    "{WAKE_BUDGET} turns in a row were started by run notices, so further notices will not wake you; they are queued and listed by runs()."
+                ),
+                self.clock.now(),
+            );
+        }
+        false
+    }
+
+    /// The user spoke, or the model read run state itself: it is engaged, so
+    /// the wake budget starts over.
+    pub fn note_engaged(&self) {
+        let mut budget = self.wake.lock().unwrap_or_else(|e| e.into_inner());
+        budget.streak = 0;
+        budget.marker_sent = false;
     }
 
     pub fn list(&self, caller: UnitId, scope: Scope) -> Vec<UnitView> {
@@ -1578,6 +1781,7 @@ impl UnitHub {
                     self.guard_notice(&mut table, from, to);
                 }
                 self.release(table);
+                self.flush_notices();
                 return Ok(SendAck {
                     id,
                     state,
@@ -1619,17 +1823,23 @@ impl UnitHub {
             name(to),
             inbox::PAIR_BURST,
         );
-        let seq = table.notice_seq.entry(owner).or_default();
-        *seq += 1;
-        let notice = Notice {
-            seq: *seq,
-            run: from,
-            kind: NoticeKind::Guard,
-            wake: false,
+        let (handle, run_name) = table.units.get(&from).map_or_else(Default::default, |u| {
+            (u.handle.to_string(), u.name.to_string())
+        });
+        table.pending_notices.push(PendingNotice {
+            owner,
+            info: NoticeInfo {
+                kind: NoticeKind::Guard,
+                run: from,
+                handle,
+                name: run_name,
+                generation: 0,
+                count: 1,
+                created: SystemTime::now(),
+            },
             text,
-            created: SystemTime::now(),
-        };
-        table.notices.entry(owner).or_default().push(notice);
+            wake: false,
+        });
     }
 
     /// Resets the counter of every pair `which` selects and takes what the

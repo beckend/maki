@@ -151,6 +151,16 @@ impl AgentHandles {
         self.mailbox.claim_wake()
     }
 
+    /// True when a waking run notice is queued for `main` and the wake budget
+    /// allows a turn for it. The notice itself stays in the hub's inbox; the
+    /// run this starts drains it like any other.
+    pub(crate) fn claim_run_wake(&self) -> bool {
+        self.mailbox
+            .seed()
+            .and_then(|seed| seed.runs.clone())
+            .is_some_and(|runs| runs.hub.claim_main_wake())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn respawn(
         &mut self,
@@ -538,6 +548,65 @@ mod tests {
         let model_id = reported.recv_timeout(LONG_TIMEOUT).expect(NO_CALL);
         await_turn_end(handles);
         model_id
+    }
+
+    /// A finished shell run leaves a waking notice in `main`'s inbox and one
+    /// `RunNotice` event, so the event loop wakes; the claim says yes once, and
+    /// nothing is left to start a second turn once the run drained it.
+    #[test]
+    fn run_notice_wakes_idle_main() {
+        let model_slot = Arc::new(ArcSwap::from_pointee(ModelSlot {
+            model: crate::components::test_model(),
+            provider: Arc::new(StubProvider),
+        }));
+        let permissions = Arc::new(PermissionManager::new(
+            PermissionsConfig::default(),
+            PathBuf::from("/tmp"),
+            ProjectConfig::for_project(Path::new("/tmp")),
+            Arc::default(),
+        ));
+        let mut config = AgentConfig::default();
+        config.runs.enabled = true;
+        let handles = AgentHandles::spawn(
+            &model_slot,
+            Resumed::fresh(),
+            config,
+            ToolOutputLines::default(),
+            &permissions,
+            maki_providers::Timeouts::default(),
+            EventHandle::disconnected_for_test(),
+            None,
+            McpConfigErrors::new(PathBuf::new()),
+            Arc::new(ModelPolicy::default()),
+        );
+        let runs = handles.mailbox.seed().and_then(|seed| seed.runs.clone());
+        let runs = runs.expect("runs are enabled");
+        assert!(!handles.claim_run_wake(), "nothing queued yet");
+        let req: maki_agent::runs::SpawnRequest = serde_json::from_value(serde_json::json!({
+            "kind": "shell", "description": "quick", "command": "true"
+        }))
+        .unwrap();
+        runs.hub.spawn(runs.hub.main(), req).unwrap();
+        let end = std::time::Instant::now() + LONG_TIMEOUT;
+        while !handles.claim_run_wake() {
+            assert!(std::time::Instant::now() < end, "no wake for the notice");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let noticed = handles
+            .agent_rx
+            .try_iter()
+            .any(|e| matches!(e.event, maki_agent::AgentEvent::RunNotice { wake: true }));
+        assert!(noticed, "the event loop is told");
+        // The turn this starts drains the notice, so there is nothing to wake again.
+        assert_eq!(
+            runs.hub
+                .inbox_of(runs.hub.main())
+                .unwrap()
+                .drain_step()
+                .len(),
+            1
+        );
+        assert!(!handles.claim_run_wake());
     }
 
     /// The regression the per-runtime cell fixed. With one process-wide slot,
