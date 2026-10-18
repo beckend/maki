@@ -1611,7 +1611,7 @@ impl App {
             }
             return vec![];
         }
-        if envelope.run_id != self.run_id {
+        if envelope.run_id != self.run_id && envelope.run_id != maki_agent::BACKGROUND_RUN_ID {
             // A snapshot dropped here degrades the tool body to llm_output.
             if let AgentEvent::ToolSnapshot { id, .. }
             | AgentEvent::ToolHeaderSnapshot { id, .. }
@@ -1688,6 +1688,28 @@ impl App {
             self.chats[chat_idx].cancel_in_progress();
             self.chats[chat_idx].mark_finished(TaskOutcome::Done, DONE_TEXT);
             return vec![];
+        }
+
+        // A native run's tab follows its record: idle between answers, closed
+        // when the record is done. Shell runs are not stamped and stay on main.
+        if chat_idx != MAIN_CHAT {
+            match &envelope.event {
+                AgentEvent::RunStateChanged { state, .. } => {
+                    self.chats[chat_idx].idle = state == "idle";
+                    return vec![];
+                }
+                AgentEvent::RunFinished { reason, .. } => {
+                    self.chats[chat_idx].cancel_in_progress();
+                    let (outcome, text) = match reason.as_str() {
+                        "completed" => (TaskOutcome::Done, DONE_TEXT),
+                        "killed" => (TaskOutcome::Error, CANCELLED_TEXT),
+                        _ => (TaskOutcome::Error, ERROR_TEXT),
+                    };
+                    self.chats[chat_idx].mark_finished(outcome, text);
+                    return vec![];
+                }
+                _ => {}
+            }
         }
 
         if let AgentEvent::ToolDone(ref e) = envelope.event {

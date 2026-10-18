@@ -117,6 +117,18 @@ impl AgentHandles {
     }
 
     pub(crate) fn cancel_subagent(&self, tool_use_id: String) {
+        // A native run's tab is keyed by its handle, and it stops through the
+        // hub, which also stops what it started.
+        if let Some(runs) = self.mailbox.seed().and_then(|seed| seed.runs.clone())
+            && let Ok(id) = runs.hub.resolve(runs.hub.main(), &tool_use_id)
+        {
+            runs.hub.stop(
+                runs.hub.main(),
+                &[id],
+                maki_agent::runs::StopOpts::default(),
+            );
+            return;
+        }
         self.subagent_cancels.cancel(tool_use_id);
     }
 
@@ -124,6 +136,9 @@ impl AgentHandles {
     pub(crate) fn cancel_all(&self) {
         self.cancels.cancel_all();
         self.subagent_cancels.cancel_all();
+        if let Some(runs) = self.mailbox.seed().and_then(|seed| seed.runs.clone()) {
+            runs.hub.shutdown();
+        }
     }
 
     pub(crate) fn send_mcp(&self, cmd: McpCommand) {

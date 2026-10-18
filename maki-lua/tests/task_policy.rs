@@ -192,7 +192,13 @@ fn load_task_host() -> (Arc<ToolRegistry>, PluginHost) {
 fn load_task_host_with_opts(
     opts: serde_json::Map<String, serde_json::Value>,
 ) -> (Arc<ToolRegistry>, PluginHost) {
-    let reg = Arc::new(ToolRegistry::new());
+    load_task_host_in(Arc::new(ToolRegistry::new()), opts)
+}
+
+fn load_task_host_in(
+    reg: Arc<ToolRegistry>,
+    opts: serde_json::Map<String, serde_json::Value>,
+) -> (Arc<ToolRegistry>, PluginHost) {
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     let prelude = STUB_PRELUDE
         .replace("@PLAIN_TEXT@", PLAIN_TEXT)
@@ -518,4 +524,111 @@ fn raising_prompt_does_not_leak_semaphore_permit() {
     // Pool is full again (released == acquired), so this cannot block.
     let out = exec_tool(&reg, TASK_TOOL, task_input(SCENARIO_PLAIN, None)).unwrap();
     assert_eq!(out, PLAIN_TEXT);
+}
+
+/// Answers every request with one fixed sentence, standing in for the model
+/// behind a native run.
+struct FixedReply;
+
+impl maki_providers::provider::Provider for FixedReply {
+    fn stream_message<'a>(
+        &'a self,
+        _: &'a maki_providers::Model,
+        _: &'a [maki_providers::Message],
+        _: &'a str,
+        _: &'a Value,
+        _: &'a flume::Sender<maki_providers::ProviderEvent>,
+        _: maki_providers::RequestOptions,
+        _: Option<&'a maki_storage::id::SessionRef>,
+    ) -> maki_providers::provider::BoxFuture<
+        'a,
+        Result<maki_providers::StreamResponse, maki_providers::AgentError>,
+    > {
+        Box::pin(async {
+            Ok(maki_providers::StreamResponse {
+                message: maki_providers::Message {
+                    role: maki_providers::Role::Assistant,
+                    content: vec![maki_providers::ContentBlock::Text {
+                        text: "native says hi".into(),
+                    }],
+                    ..Default::default()
+                },
+                stop_reason: Some(maki_providers::StopReason::EndTurn),
+                ..Default::default()
+            })
+        })
+    }
+
+    fn list_models(
+        &self,
+    ) -> maki_providers::provider::BoxFuture<
+        '_,
+        Result<Vec<maki_providers::ModelInfo>, maki_providers::AgentError>,
+    > {
+        Box::pin(async { unimplemented!() })
+    }
+}
+
+/// `[agent.runs] enabled` with the Lua `task` plugin loaded: both tools are
+/// registered, both complete, and neither disturbs the other.
+#[test]
+fn native_and_legacy_task_enabled() {
+    use maki_agent::runs::{RunsCtx, SystemClock, UnitHub, UnitLimits};
+
+    let reg = Arc::new(ToolRegistry::new());
+    let config = maki_config::RunsConfig {
+        enabled: true,
+        ..Default::default()
+    };
+    maki_agent::runs::sync_registration(&reg, &config).unwrap();
+    let (reg, _host) = load_task_host_in(reg, serde_json::Map::new());
+    for name in [TASK_TOOL, "spawn", "wait", "runs", "stop", "send"] {
+        assert!(reg.get(name).is_some(), "{name} not registered");
+    }
+
+    let mut ctx = stub_ctx(&AgentMode::Build);
+    ctx.provider = Arc::new(FixedReply);
+    ctx.registry = Arc::clone(&reg);
+    let (tx, _rx) = flume::unbounded::<maki_agent::Envelope>();
+    let hub = UnitHub::new(
+        UnitLimits::default(),
+        maki_agent::EventSender::new(tx, 0),
+        Arc::new(SystemClock),
+    );
+    ctx.runs = Some(RunsCtx {
+        self_run: hub.main(),
+        hub: Arc::clone(&hub),
+    });
+    let run = |name: &str, input: Value| -> Result<String, String> {
+        let inv = reg.get(name).unwrap().tool.parse(&input).unwrap();
+        smol::block_on(inv.execute(&ctx))
+            .output
+            .map(|out| match out {
+                ToolOutput::Plain(s) | ToolOutput::Markdown(s) => s.text,
+                other => panic!("unexpected output: {other:?}"),
+            })
+    };
+
+    let legacy = run(TASK_TOOL, task_input(SCENARIO_PLAIN, None)).unwrap();
+    assert_eq!(legacy, PLAIN_TEXT);
+
+    let started = run(
+        "spawn",
+        json!({"kind": "agent", "description": "reader", "prompt": "say hi", "one_shot": true}),
+    )
+    .unwrap();
+    let handle = started.split_whitespace().nth(1).unwrap().to_owned();
+    assert!(
+        handle.starts_with("ag-") && !handle.starts_with("toolu_"),
+        "{handle}"
+    );
+    let waited = run("wait", json!({"ids": [handle]})).unwrap();
+    assert!(waited.contains("native says hi"), "{waited}");
+    assert!(waited.contains("completed"), "{waited}");
+
+    // And the legacy tool still works after a native run existed.
+    assert_eq!(
+        run(TASK_TOOL, task_input(SCENARIO_PLAIN, None)).unwrap(),
+        PLAIN_TEXT
+    );
 }
