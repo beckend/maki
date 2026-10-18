@@ -1127,7 +1127,8 @@ mod topology {
         assert_eq!(facts.me.2, 1);
         assert_eq!(rig.hub.topology_facts(c.id).unwrap().me.2, 2);
         let json = serde_json::to_string(&facts).unwrap();
-        assert!(!json.contains("aa"), "{json}");
+        // Quoted: a random handle such as `ag-cy0daa` may contain `aa`.
+        assert!(!json.contains("\"aa\""), "{json}");
     }
 
     #[test]
@@ -1574,6 +1575,40 @@ mod admit {
         // slot, which is the point.
         let view = settle(&rig, b.id);
         assert!(view.queue.is_none(), "{:?}", view.state);
+        assert_eq!(rig.hub.slots_in_use(), 0);
+    }
+
+    /// Stopping a parent whose children wait in the queue removes them; they
+    /// never send a request.
+    #[test]
+    fn stopping_a_parent_dequeues_its_children() {
+        let script = Script::new(vec![
+            ("HHH", vec![Step::Hang]),
+            ("PPP", vec![Step::Hang]),
+            ("CC1", vec![Step::Reply(reply("c1"))]),
+            ("CC2", vec![Step::Reply(reply("c2"))]),
+        ]);
+        let rig = rig_with(
+            &script,
+            UnitLimits {
+                max_agents: 2,
+                ..UnitLimits::default()
+            },
+        );
+        let h = spawn(&rig, "HHH", json!({}));
+        let p = spawn(&rig, "PPP", json!({}));
+        await_requests(&script, "HHH", 1);
+        await_requests(&script, "PPP", 1);
+        let c1 = spawn_as(&rig, p.id, agent_req("CC1", json!({})));
+        let c2 = spawn_as(&rig, p.id, agent_req("CC2", json!({})));
+        assert_eq!(c2.queue_position, Some((2, 2)));
+        rig.hub.stop(rig.hub.main(), &[p.id], StopOpts::default());
+        for id in [c1.id, c2.id, p.id] {
+            assert_eq!(done_reason(&settle(&rig, id)), DoneReason::Killed);
+        }
+        assert_eq!(script.requests("CC1") + script.requests("CC2"), 0);
+        rig.hub.stop(rig.hub.main(), &[h.id], StopOpts::default());
+        settle(&rig, h.id);
         assert_eq!(rig.hub.slots_in_use(), 0);
     }
 }
