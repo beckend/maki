@@ -585,7 +585,7 @@ impl Driver {
     fn judge(&self, launch: &AgentLaunch, end: TurnEnd) -> (Judged, UnitResult) {
         let mut result = UnitResult::default();
         let verdict = match end.result {
-            Err(AgentError::Cancelled) => {
+            Err(AgentError::Cancelled) | Ok(DoneReason::Cancelled) => {
                 result.summary = end.text;
                 if self.run.token.is_cancelled() {
                     Judged::Final(Verdict::Done(UnitDone::Killed, None))
@@ -615,26 +615,24 @@ impl Driver {
                 result.summary = end.text;
                 Judged::Final(Verdict::Done(UnitDone::MaxTokens, None))
             }
-            Ok(DoneReason::EndTurn | DoneReason::Compact | DoneReason::Cancelled) => {
-                match &launch.structured {
-                    Some(captured) => match lock(&captured.value).clone() {
-                        Some(value) => {
-                            result.summary = value.to_string();
-                            result.structured = Some(value);
-                            Judged::Final(Verdict::Idle { interrupted: false })
-                        }
-                        None => {
-                            result.summary = end.text;
-                            Judged::Nudge(NUDGE_MISSING.to_owned())
-                        }
-                    },
-                    None if end.text.trim().is_empty() => Judged::Nudge(NUDGE_SUMMARY.to_owned()),
-                    None => {
-                        result.summary = end.text;
+            Ok(DoneReason::EndTurn | DoneReason::Compact) => match &launch.structured {
+                Some(captured) => match lock(&captured.value).clone() {
+                    Some(value) => {
+                        result.summary = value.to_string();
+                        result.structured = Some(value);
                         Judged::Final(Verdict::Idle { interrupted: false })
                     }
+                    None => {
+                        result.summary = end.text;
+                        Judged::Nudge(NUDGE_MISSING.to_owned())
+                    }
+                },
+                None if end.text.trim().is_empty() => Judged::Nudge(NUDGE_SUMMARY.to_owned()),
+                None => {
+                    result.summary = end.text;
+                    Judged::Final(Verdict::Idle { interrupted: false })
                 }
-            }
+            },
         };
         (verdict, result)
     }

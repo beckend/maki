@@ -130,6 +130,7 @@ struct RunsArgs {
     include_finished: Option<bool>,
     tail: Option<usize>,
     from_offset: Option<u64>,
+    full: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -423,7 +424,9 @@ async fn wait(runs: &RunsCtx, args: WaitArgs, cancel: &CancelToken) -> Result<St
             out.push_str("\n\n");
         }
         out.push_str(&record(view));
-        if let UnitState::Done(t) = &view.state
+        if view.kind == RunKind::Agent {
+            out.push_str(&agent_result(view, false));
+        } else if let UnitState::Done(t) = &view.state
             && !t.result.summary.is_empty()
         {
             let _ = write!(out, "\nlast output:\n{}", t.result.summary);
@@ -506,6 +509,9 @@ fn list_or_show(runs: &RunsCtx, args: RunsArgs) -> Result<String, String> {
             .get(id)
             .ok_or_else(|| format!("UNKNOWN_RUN: {key}"))?;
         let mut out = record(&view);
+        if view.kind == RunKind::Agent {
+            out.push_str(&agent_result(&view, args.full.unwrap_or(false)));
+        }
         if view.kind == RunKind::Shell {
             let from = args.from_offset;
             let tail = args.tail.unwrap_or(DEFAULT_TAIL_LINES);
@@ -589,6 +595,37 @@ fn render_output(slice: &OutputSlice) -> String {
     }
     if let Some(log) = &slice.log {
         let _ = write!(out, "\nlog: {}", log.display());
+    }
+    out
+}
+
+/// The result of an agent run that has produced one: bounded text, the
+/// structured value, and with `full` the spilled body.
+fn agent_result(v: &UnitView, full: bool) -> String {
+    let Some(result) = &v.result else {
+        return String::new();
+    };
+    let mut out = String::new();
+    let mut text = result.summary.clone();
+    if full
+        && let Some(body) = &result.body_ref
+        && let Ok(whole) = std::fs::read_to_string(&body.0)
+    {
+        text = whole;
+    }
+    if !text.is_empty() {
+        let _ = write!(out, "\nresult:\n{text}");
+    }
+    if let Some(structured) = &result.structured
+        && text != structured.to_string()
+    {
+        let _ = write!(out, "\nstructured: {structured}");
+    }
+    if result.truncated
+        && !full
+        && let Some(body) = &result.body_ref
+    {
+        let _ = write!(out, "\nfull text: {}", body.0.display());
     }
     out
 }
