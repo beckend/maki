@@ -1495,6 +1495,8 @@ Tests: `topology::fact_changes_only_when_children_change`, `topology::retell_coa
 E2E: with `siblings = true`, `a` messages `b` by name and `b` reports both.
 Commit: `feat: run topology facts and sibling routing`.
 
+Notes from the build: no new frame constructor was needed. `fit_frame` already stores a frame for `RunContext::fixed`, so `History::told()` is `Some` for native agents and the plan fact was always tracked; the topology is simply a third `LiveFacts` field that starts `None` at every frame (`facts_at_start`), so a child's first request carries the update before its prompt and a compaction re-tells it. The fact is read live from the hub in `tell_changes` (`UnitHub::topology_facts`), not from the context builder, because it changes mid-run. `FactsUpdate.topology` carries the whole new topology (absent when unchanged, so stored updates stay byte-identical); the main agent with no unfinished runs is `None`, and one that loses its last run hears "no unfinished runs". Children are the unfinished ones sorted by name, so a finished child leaves the list and re-tells once; the e2e shows the main agent hearing it after `wait`. The sibling rule is one extra clause in `UnitHub::send`; the error stays `NOT_REACHABLE`. The ping-pong guard keys on the pair, so it covers siblings unchanged. The scripted test provider routes on the first non-update message, since the update now precedes the prompt.
+
 ### Phase 4e: acks
 
 Goal: delivery visible. Files: `runs/inbox.rs`, `types.rs` (`RunMessageDelivered`),
