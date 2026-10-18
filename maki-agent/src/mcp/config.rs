@@ -971,4 +971,18 @@ command = ["echo", "hello"]
         let cfg = read_config(&path).unwrap().unwrap();
         assert!(cfg.mcp.contains_key("valid"));
     }
+
+    #[test]
+    fn run_tool_names_are_free_for_servers_unless_runs_are_enabled() {
+        let reg = crate::tools::ToolRegistry::new();
+        crate::runs::sync_registration(&reg, &Default::default()).unwrap();
+        assert!(parse("spawn", stdio_raw(&["echo"])).is_ok());
+        let on = maki_config::RunsConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        crate::runs::sync_registration(&reg, &on).unwrap();
+        let err = parse("spawn", stdio_raw(&["echo"])).unwrap_err();
+        assert!(err.to_string().contains("conflicts with built-in"), "{err}");
+    }
 }

@@ -8,6 +8,7 @@ mod topology;
 use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Instant, SystemTime};
 
@@ -729,6 +730,14 @@ pub fn native_run_tools(audience: ToolAudience) -> Vec<Arc<dyn Tool>> {
         .collect()
 }
 
+static RUN_NAMES_RESERVED: AtomicBool = AtomicBool::new(false);
+
+/// True while the run tools are registered, so only then do their names count
+/// as built-in (an MCP server may use them when `[agent.runs]` is off).
+pub fn run_names_reserved() -> bool {
+    RUN_NAMES_RESERVED.load(Ordering::Relaxed)
+}
+
 /// Makes the global registry match `[agent.runs] enabled`. Called before the
 /// Lua tools load so a plugin cannot shadow a native tool, and again on every
 /// reload, so it starts by dropping what an earlier load put there.
@@ -737,6 +746,7 @@ pub fn sync_registration(
     config: &maki_config::RunsConfig,
 ) -> Result<(), crate::tools::RegistryError> {
     registry.clear_native();
+    RUN_NAMES_RESERVED.store(config.enabled, Ordering::Relaxed);
     if !config.enabled {
         return Ok(());
     }
