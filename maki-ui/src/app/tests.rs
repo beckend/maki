@@ -8083,3 +8083,25 @@ fn native_run_creates_tab_keyed_by_handle() {
     assert!(app.chats[idx].is_finished());
     assert!(!app.chats[app.chat_index["toolu_legacy"]].is_finished());
 }
+
+#[test]
+fn esc_leaves_native_run_tab_running() {
+    const HANDLE: &str = "ag-k3x9ab";
+    let mut app = streaming_app();
+    let native = |event| {
+        subagent_msg_with_run_id(event, HANDLE, Some("reader"), maki_agent::BACKGROUND_RUN_ID)
+    };
+    app.update(native(AgentEvent::RunStarted {
+        handle: HANDLE.into(),
+        name: "reader".into(),
+        kind: "agent".into(),
+    }));
+    let idx = app.chat_index[HANDLE];
+    app.update(Msg::Key(key(KeyCode::Esc)));
+    assert!(!app.chats[idx].is_finished());
+    assert_eq!(app.chat_index.get(HANDLE), Some(&idx));
+    app.update(native(AgentEvent::TextDelta {
+        text: "more".into(),
+    }));
+    assert_eq!(app.chats.len(), 2);
+}
