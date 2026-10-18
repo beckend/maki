@@ -2648,6 +2648,14 @@ impl App {
             .as_ref()
             .map(|s| s.parent_tool_use_id.clone());
 
+        if let (AgentEvent::PermissionWithdrawn { id }, Some(owner)) =
+            (&envelope.event, &subagent_id)
+        {
+            self.permission_prompt.withdraw(owner, id);
+            return vec![];
+        }
+        let asker_name = envelope.subagent.as_ref().map(|s| s.name.clone());
+
         let is_plugin_task = plugin.is_some();
         let chat_idx = match envelope.subagent {
             Some(ref subagent) => self.resolve_or_create_chat(subagent, &plugin),
@@ -2679,9 +2687,13 @@ impl App {
             match &envelope.event {
                 AgentEvent::RunStateChanged { state, .. } => {
                     self.chats[chat_idx].idle = state == "idle";
+                    if state == "idle" {
+                        self.drop_run_prompts(subagent_id.as_deref());
+                    }
                     return vec![];
                 }
                 AgentEvent::RunFinished { reason, .. } => {
+                    self.drop_run_prompts(subagent_id.as_deref());
                     self.chats[chat_idx].cancel_in_progress();
                     let (outcome, text) = match reason.as_str() {
                         "completed" => (TaskOutcome::Done, DONE_TEXT),
@@ -2791,6 +2803,13 @@ impl App {
         } = result
         {
             let project_trusted = self.permissions.project_is_trusted();
+            // A background run is named, so the user knows whose call it is.
+            let asker_label = match (&subagent_id, &asker_name) {
+                (Some(handle), Some(name)) if is_run_handle(handle) => {
+                    Some(format!("{name} ({handle})"))
+                }
+                _ => None,
+            };
             self.open_prompt(|app| {
                 app.permission_prompt.push(
                     id,
@@ -2800,6 +2819,9 @@ impl App {
                     project_trusted,
                     reason,
                 );
+                if let Some(label) = asker_label.clone() {
+                    app.permission_prompt.label_last(label);
+                }
             });
             return vec![];
         }
@@ -3334,6 +3356,13 @@ impl App {
         sync_search_highlight(&self.search_modal, chat);
     }
 
+    /// A run that ended or went idle has nothing left to answer.
+    fn drop_run_prompts(&mut self, handle: Option<&str>) {
+        if let Some(handle) = handle {
+            self.permission_prompt.drop_subagent(handle);
+        }
+    }
+
     pub fn close_all_overlays(&mut self) {
         self.overlays_mut().iter_mut().for_each(|o| o.close());
     }
@@ -3804,5 +3833,9 @@ fn sync_search_highlight(modal: &SearchModal, chat: &mut Chat) {
 /// turn, so cancelling or ending a turn leaves it alone; only its own
 /// `RunFinished` closes it.
 fn is_native_run(chat: &Chat) -> bool {
-    chat.task_id().is_some_and(|id| id.starts_with("ag-"))
+    chat.task_id().is_some_and(|id| is_run_handle(id))
+}
+
+fn is_run_handle(id: &str) -> bool {
+    id.starts_with("ag-")
 }

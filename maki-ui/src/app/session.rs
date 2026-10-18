@@ -312,6 +312,7 @@ impl App {
         self.queue.clear();
         self.recoverable_queue.clear();
         self.close_all_overlays();
+        self.permission_prompt.clear();
         self.status_bar.clear_flash();
         self.last_esc = None;
         self.last_quit = None;

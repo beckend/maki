@@ -1272,7 +1272,7 @@ async fn gate(
         }
         pending().await
     };
-    let allowed_by = ctx
+    let decided = ctx
         .deadline
         .paused_while(async {
             tokio::select! {
@@ -1280,8 +1280,19 @@ async fn gate(
                 never = withdrawn => never,
             }
         })
-        .await
-        .map_err(|e| e.to_string())?;
+        .await;
+    // A background run.s prompt gave its slot up while it waited.
+    if let Some(runs) = &ctx.runs {
+        runs.hub
+            .prompt_resolved(
+                runs.self_run,
+                id,
+                ctx.user_response_rx.as_ref(),
+                &ctx.cancel,
+            )
+            .await;
+    }
+    let allowed_by = decided.map_err(|e| e.to_string())?;
     if let Some(plugin) = allowed_by {
         mark_allowed_by(ctx, plugin);
     }

@@ -17,6 +17,8 @@ pub enum NoticeKind {
     Overflow,
     /// A message the run sent was dropped or is slow to arrive.
     Delivery,
+    /// A run's permission prompt has waited a while for the user.
+    Permission,
 }
 
 impl NoticeKind {
@@ -26,6 +28,7 @@ impl NoticeKind {
             Self::Guard => "guard",
             Self::Overflow => "overflow",
             Self::Delivery => "delivery",
+            Self::Permission => "permission",
         }
     }
 }

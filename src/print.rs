@@ -396,6 +396,7 @@ pub async fn run(params: PrintParams) -> Result<Interrupt> {
             | AgentEvent::AuthRequired
             | AgentEvent::AllowedByPlugin { .. }
             | AgentEvent::PermissionRequest { .. }
+            | AgentEvent::PermissionWithdrawn { .. }
             | AgentEvent::SubagentHistory { .. }
             | AgentEvent::ToolSnapshot { .. }
             | AgentEvent::ToolHeaderSnapshot { .. }

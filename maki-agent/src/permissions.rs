@@ -146,6 +146,20 @@ const USER_REJECTED_REASON: &str = "rejected by the user";
 const PROMPT_UNANSWERED_REASON: &str = "permission prompt cancelled, unanswered";
 const UNATTENDED_REASON: &str =
     "no one can answer a permission prompt in this session, so this call needs an allow rule";
+const UNAVAILABLE_PREFIX: &str = "unavailable:";
+
+/// What a background run's denied prompt says when no one is there to answer.
+/// The run is told to hand the problem to its parent instead of retrying.
+pub fn unattended_reason() -> String {
+    format!("{UNATTENDED_REASON}; report this to your parent with send")
+}
+
+/// The reason of a prompt that stayed unanswered for `secs` seconds.
+pub fn prompt_timeout_reason(scope: &str, secs: u64) -> String {
+    format!(
+        "permission prompt for {scope} timed out after {secs}s; ask your parent via send if you need it"
+    )
+}
 const PLUGIN_DENIED_REASON: &str = "denied by a plugin answering the prompt";
 
 fn deny_rule_reason(origin: &str, rule: &PermissionRule) -> String {
@@ -201,13 +215,16 @@ pub enum PermissionAnswer {
     /// Nobody can see the prompt, so nobody will ever answer it: the asker
     /// moved off its turn where no one watches.
     Unattended,
+    /// Nobody answered: the prompt timed out, or no one could. Carries the
+    /// whole reason for the model. Only the host makes this one, never a user.
+    Unavailable(String),
 }
 
 impl PermissionAnswer {
     pub fn decision_source(&self) -> &'static str {
         match self {
             Self::AllowOnce | Self::Deny | Self::DenyWithGuidance(_) => DECISION_SOURCE_USER_ONCE,
-            Self::Unattended => DECISION_SOURCE_USER_ABORT,
+            Self::Unattended | Self::Unavailable(_) => DECISION_SOURCE_USER_ABORT,
             Self::AllowSession => DECISION_SOURCE_USER_SESSION,
             Self::AllowAlwaysProject
             | Self::AllowAlwaysGlobal
@@ -237,6 +254,7 @@ impl PermissionAnswer {
             Self::DenyAlwaysProject => "deny_always_project".to_string(),
             Self::DenyAlwaysGlobal => "deny_always_global".to_string(),
             Self::Unattended => "unattended".to_string(),
+            Self::Unavailable(reason) => format!("{UNAVAILABLE_PREFIX}{reason}"),
         }
     }
 
@@ -250,6 +268,9 @@ impl PermissionAnswer {
             "deny_always_project" => Some(Self::DenyAlwaysProject),
             "deny_always_global" => Some(Self::DenyAlwaysGlobal),
             "unattended" => Some(Self::Unattended),
+            _ if s.starts_with(UNAVAILABLE_PREFIX) => {
+                Some(Self::Unavailable(s[UNAVAILABLE_PREFIX.len()..].to_owned()))
+            }
             _ if s.starts_with("deny:") => {
                 let guidance = s.strip_prefix("deny:").unwrap();
                 if guidance.is_empty() {
@@ -725,7 +746,8 @@ impl PermissionManager {
             PermissionAnswer::AllowOnce
             | PermissionAnswer::Deny
             | PermissionAnswer::DenyWithGuidance(_)
-            | PermissionAnswer::Unattended => {}
+            | PermissionAnswer::Unattended
+            | PermissionAnswer::Unavailable(_) => {}
             PermissionAnswer::AllowSession => {
                 for s in &resolved {
                     self.add_session_rule(PermissionRule {
@@ -964,6 +986,8 @@ impl PermissionManager {
         let source = answer.decision_source();
         if answer.is_allow() {
             allowed(source)
+        } else if let PermissionAnswer::Unavailable(reason) = &answer {
+            Err(deny(source, reason.clone(), None, None))
         } else {
             Err(deny(
                 source,

@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use maki_config::RunsConfig;
+use maki_config::{RunsConfig, UnattendedMode};
 
 /// Timeouts above this are lowered, so `Instant + timeout` cannot overflow.
 const MAX_TIMEOUT_SECS: u64 = 365 * 24 * 3600;
@@ -20,6 +20,8 @@ pub struct UnitLimits {
     pub default_timeout: Duration,
     pub max_timeout: Duration,
     pub siblings: bool,
+    pub permission_timeout: Duration,
+    pub unattended: UnattendedMode,
 }
 
 impl Default for UnitLimits {
@@ -44,6 +46,10 @@ impl From<&RunsConfig> for UnitLimits {
             default_timeout: Duration::from_secs(config.default_timeout_secs.min(MAX_TIMEOUT_SECS)),
             max_timeout: Duration::from_secs(config.max_timeout_secs.min(MAX_TIMEOUT_SECS)),
             siblings: config.siblings,
+            permission_timeout: Duration::from_secs(
+                config.permission_timeout_secs.min(MAX_TIMEOUT_SECS),
+            ),
+            unattended: config.unattended_permissions,
         }
     }
 }

@@ -1126,6 +1126,7 @@ impl EventPump {
             | AgentEvent::RunStateChanged { .. }
             | AgentEvent::RunNotice { .. }
             | AgentEvent::RunFinished { .. }
+            | AgentEvent::PermissionWithdrawn { .. }
             | AgentEvent::StreamClosed => {}
             // A later kept message overwrites this with its own answer, so the
             // reason is the result only when every message was dropped.
