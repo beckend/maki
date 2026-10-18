@@ -64,8 +64,8 @@ fn set_state(rig: &Rig, id: UnitId, state: UnitState) {
     rig.hub.table().units.get_mut(&id).unwrap().state = state;
 }
 
-#[test]
-fn settlement_queues_one_notice_in_the_owner_inbox() {
+#[tokio::test]
+async fn settlement_queues_one_notice_in_the_owner_inbox() {
     let rig = rig();
     let id = run(&rig, NoticePolicy::Wake);
     finish(&rig, id);
@@ -79,8 +79,8 @@ fn settlement_queues_one_notice_in_the_owner_inbox() {
     assert!(rig.hub.pending_notices(rig.hub.main()).is_empty());
 }
 
-#[test]
-fn wake_budget_three_then_overflow_marker() {
+#[tokio::test]
+async fn wake_budget_three_then_overflow_marker() {
     let rig = rig();
     let main = rig.hub.main();
     for _ in 0..3 {
@@ -118,8 +118,8 @@ fn wake_budget_three_then_overflow_marker() {
     assert_eq!(main_inbox(&rig).drain_step().len(), 3);
 }
 
-#[test]
-fn budget_resets_on_user_and_on_runs_read() {
+#[tokio::test]
+async fn budget_resets_on_user_and_on_runs_read() {
     let rig = rig();
     for _ in 0..3 {
         let id = run(&rig, NoticePolicy::Wake);
@@ -137,8 +137,8 @@ fn budget_resets_on_user_and_on_runs_read() {
     assert!(rig.hub.claim_main_wake());
 }
 
-#[test]
-fn message_wake_does_not_spend_the_budget() {
+#[tokio::test]
+async fn message_wake_does_not_spend_the_budget() {
     let rig = rig();
     for _ in 0..3 {
         let id = run(&rig, NoticePolicy::Wake);
@@ -153,8 +153,8 @@ fn message_wake_does_not_spend_the_budget() {
     assert!(rig.hub.claim_main_wake(), "a message to main always wakes");
 }
 
-#[test]
-fn notice_removed_when_wait_consumes_before_drain() {
+#[tokio::test]
+async fn notice_removed_when_wait_consumes_before_drain() {
     let rig = rig();
     let main = rig.hub.main();
     let id = run(&rig, NoticePolicy::Wake);
@@ -170,8 +170,8 @@ fn notice_removed_when_wait_consumes_before_drain() {
     assert!(!rig.hub.claim_main_wake(), "nothing left to wake for");
 }
 
-#[test]
-fn released_claim_keeps_the_notice() {
+#[tokio::test]
+async fn released_claim_keeps_the_notice() {
     let rig = rig();
     let main = rig.hub.main();
     let id = run(&rig, NoticePolicy::Wake);
@@ -182,8 +182,8 @@ fn released_claim_keeps_the_notice() {
     assert_eq!(rig.hub.pending_notices(main).len(), 1);
 }
 
-#[test]
-fn read_after_drain_cannot_cancel_notice() {
+#[tokio::test]
+async fn read_after_drain_cannot_cancel_notice() {
     let rig = rig();
     let main = rig.hub.main();
     let id = run(&rig, NoticePolicy::Wake);
@@ -195,8 +195,8 @@ fn read_after_drain_cannot_cancel_notice() {
     assert_eq!(drained.len(), 1);
 }
 
-#[test]
-fn consumed_before_the_notice_is_queued_suppresses_it() {
+#[tokio::test]
+async fn consumed_before_the_notice_is_queued_suppresses_it() {
     let rig = rig();
     let main = rig.hub.main();
     let id = run(&rig, NoticePolicy::Wake);
@@ -213,8 +213,8 @@ fn consumed_before_the_notice_is_queued_suppresses_it() {
     assert!(rig.hub.pending_notices(main).is_empty());
 }
 
-#[test]
-fn an_older_read_cannot_consume_a_later_idle_notice() {
+#[tokio::test]
+async fn an_older_read_cannot_consume_a_later_idle_notice() {
     let rig = rig();
     let main = rig.hub.main();
     let id = run(&rig, NoticePolicy::Wake);
@@ -228,8 +228,8 @@ fn an_older_read_cannot_consume_a_later_idle_notice() {
     assert_eq!(left.len(), 1, "the second idle is news: {left:?}");
 }
 
-#[test]
-fn stopped_run_produces_no_notice() {
+#[tokio::test]
+async fn stopped_run_produces_no_notice() {
     let rig = rig();
     let main = rig.hub.main();
     let id = run(&rig, NoticePolicy::Wake);
@@ -237,8 +237,8 @@ fn stopped_run_produces_no_notice() {
     assert!(rig.hub.pending_notices(main).is_empty());
 }
 
-#[test]
-fn idle_expiry_is_silent() {
+#[tokio::test]
+async fn idle_expiry_is_silent() {
     let rig = rig();
     let main = rig.hub.main();
     let id = run(&rig, NoticePolicy::Wake);
@@ -251,8 +251,8 @@ fn idle_expiry_is_silent() {
     assert!(!rig.hub.claim_main_wake());
 }
 
-#[test]
-fn identical_notices_collapse_with_a_count() {
+#[tokio::test]
+async fn identical_notices_collapse_with_a_count() {
     let rig = rig();
     let main = rig.hub.main();
     let id = run(&rig, NoticePolicy::Quiet);
@@ -275,8 +275,8 @@ fn identical_notices_collapse_with_a_count() {
     assert!(inbox::frame(&inbox.drain_step(), None).contains("same (x3)"));
 }
 
-#[test]
-fn a_storm_is_bounded_and_reported_once() {
+#[tokio::test]
+async fn a_storm_is_bounded_and_reported_once() {
     let rig = rig();
     for _ in 0..(MAX_PENDING + 10) {
         let id = run(&rig, NoticePolicy::Quiet);
@@ -295,8 +295,8 @@ fn a_storm_is_bounded_and_reported_once() {
     ));
 }
 
-#[test]
-fn a_waking_notice_to_main_sends_one_event() {
+#[tokio::test]
+async fn a_waking_notice_to_main_sends_one_event() {
     let rig = rig();
     let id = run(&rig, NoticePolicy::Wake);
     finish(&rig, id);
@@ -308,8 +308,8 @@ fn a_waking_notice_to_main_sends_one_event() {
     assert_eq!(seen, 1);
 }
 
-#[test]
-fn quiet_notice_never_wakes_and_never_sends_an_event() {
+#[tokio::test]
+async fn quiet_notice_never_wakes_and_never_sends_an_event() {
     let rig = rig();
     let id = run(&rig, NoticePolicy::Quiet);
     finish(&rig, id);
@@ -322,8 +322,8 @@ fn quiet_notice_never_wakes_and_never_sends_an_event() {
     assert_eq!(rig.hub.pending_notices(rig.hub.main()).len(), 1);
 }
 
-#[test]
-fn claim_then_drain_then_commit_delivers_exactly_once() {
+#[tokio::test]
+async fn claim_then_drain_then_commit_delivers_exactly_once() {
     let rig = rig();
     let main = rig.hub.main();
     let id = run(&rig, NoticePolicy::Wake);
@@ -336,8 +336,8 @@ fn claim_then_drain_then_commit_delivers_exactly_once() {
     assert!(rig.hub.pending_notices(main).is_empty());
 }
 
-#[test]
-fn abandoned_claim_still_delivers_once_and_later_settles_are_news() {
+#[tokio::test]
+async fn abandoned_claim_still_delivers_once_and_later_settles_are_news() {
     let rig = rig();
     let main = rig.hub.main();
     let id = run(&rig, NoticePolicy::Wake);
@@ -361,8 +361,8 @@ fn abandoned_claim_still_delivers_once_and_later_settles_are_news() {
     );
 }
 
-#[test]
-fn a_reused_call_id_does_not_inherit_a_stale_claim() {
+#[tokio::test]
+async fn a_reused_call_id_does_not_inherit_a_stale_claim() {
     let rig = rig();
     let main = rig.hub.main();
     let a = run(&rig, NoticePolicy::Wake);
@@ -378,8 +378,8 @@ fn a_reused_call_id_does_not_inherit_a_stale_claim() {
     assert_eq!(left[0].run, a);
 }
 
-#[test]
-fn parallel_reads_of_one_run_both_commit() {
+#[tokio::test]
+async fn parallel_reads_of_one_run_both_commit() {
     let rig = rig();
     let main = rig.hub.main();
     let id = run(&rig, NoticePolicy::Wake);
@@ -392,8 +392,8 @@ fn parallel_reads_of_one_run_both_commit() {
     assert!(!rig.hub.claim_main_wake());
 }
 
-#[test]
-fn another_owners_read_does_not_consume_the_notice() {
+#[tokio::test]
+async fn another_owners_read_does_not_consume_the_notice() {
     let rig = rig();
     let main = rig.hub.main();
     let id = run(&rig, NoticePolicy::Wake);
@@ -403,8 +403,8 @@ fn another_owners_read_does_not_consume_the_notice() {
     assert_eq!(rig.hub.pending_notices(main).len(), 1);
 }
 
-#[test]
-fn collapse_window_boundary_is_thirty_seconds() {
+#[tokio::test]
+async fn collapse_window_boundary_is_thirty_seconds() {
     let rig = rig();
     let main = rig.hub.main();
     let id = run(&rig, NoticePolicy::Quiet);
@@ -439,8 +439,8 @@ fn collapse_window_boundary_is_thirty_seconds() {
     );
 }
 
-#[test]
-fn exhausted_budget_marker_is_sent_once_and_stays_bounded() {
+#[tokio::test]
+async fn exhausted_budget_marker_is_sent_once_and_stays_bounded() {
     let rig = rig();
     let main = rig.hub.main();
     for _ in 0..inbox::MAX_PENDING + 5 {

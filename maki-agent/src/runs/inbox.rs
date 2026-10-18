@@ -223,9 +223,11 @@ impl Inbox {
     }
 
     /// The run is over: later sends fail with `RECIPIENT_TERMINAL`.
-    pub(crate) fn close(&self) {
-        self.lock().set_phase(Phase::Closed);
+    /// Returns what was still queued: it will never be delivered.
+    pub(crate) fn close(&self) -> Vec<InboxItem> {
+        let left = self.lock().close();
         self.signal();
+        left
     }
 
     /// Items queued and not yet drained.
@@ -289,6 +291,13 @@ pub enum TurnEnd {
 impl Guard<'_> {
     pub(crate) fn phase(&self) -> Phase {
         self.state.phase
+    }
+
+    /// Closes and empties the inbox; the caller reports the drops after it
+    /// has released the lock.
+    pub(crate) fn close(&mut self) -> Vec<InboxItem> {
+        self.state.phase = Phase::Closed;
+        self.state.items.drain(..).collect()
     }
 
     pub(crate) fn set_phase(&mut self, phase: Phase) {
