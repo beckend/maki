@@ -525,7 +525,7 @@ pub fn is_builtin_tool(name: &str) -> bool {
         && !maki_config::PROVIDER_BUILTINS.contains(&name);
     bundled_tool
         || maki_config::EDIT_SUB_TOOLS.contains(&name)
-        || runs::RUN_TOOL_NAMES.contains(&name)
+        || (crate::runs::run_names_reserved() && runs::RUN_TOOL_NAMES.contains(&name))
 }
 
 pub fn all_builtin_tool_names() -> Vec<&'static str> {
@@ -533,7 +533,12 @@ pub fn all_builtin_tool_names() -> Vec<&'static str> {
         .iter()
         .filter(|name| !maki_config::PROVIDER_BUILTINS.contains(name))
         .chain(maki_config::EDIT_SUB_TOOLS.iter())
-        .chain(runs::RUN_TOOL_NAMES.iter())
+        .chain(
+            crate::runs::run_names_reserved()
+                .then_some(runs::RUN_TOOL_NAMES.iter())
+                .into_iter()
+                .flatten(),
+        )
         .copied()
         .collect()
 }
@@ -1250,5 +1255,22 @@ mod tests {
             assert!(!is_builtin_tool(name), "{name}");
             assert!(!all_builtin_tool_names().contains(&name), "{name}");
         }
+    }
+
+    #[test]
+    fn run_names_are_reserved_only_while_enabled() {
+        let reg = ToolRegistry::new();
+        let on = maki_config::RunsConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        crate::runs::sync_registration(&reg, &Default::default()).unwrap();
+        assert!(!is_builtin_tool("spawn"));
+        assert!(!all_builtin_tool_names().contains(&"wait"));
+        crate::runs::sync_registration(&reg, &on).unwrap();
+        assert!(is_builtin_tool("spawn"));
+        assert!(all_builtin_tool_names().contains(&"wait"));
+        crate::runs::sync_registration(&reg, &Default::default()).unwrap();
+        assert!(!is_builtin_tool("stop"));
     }
 }
