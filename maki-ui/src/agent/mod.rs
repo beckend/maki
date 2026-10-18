@@ -883,4 +883,31 @@ mod tests {
         );
         assert!(start.elapsed() >= SHORT_TIMEOUT);
     }
+
+    fn test_hub() -> maki_agent::runs::RunsCtx {
+        use maki_agent::runs::{ManualClock, UnitHub, UnitLimits};
+        let (tx, _rx) = flume::unbounded();
+        let hub = UnitHub::new(
+            UnitLimits::default(),
+            maki_agent::EventSender::new(tx, 0),
+            Arc::new(ManualClock::default()),
+        );
+        let self_run = hub.main();
+        maki_agent::runs::RunsCtx { hub, self_run }
+    }
+
+    #[test]
+    fn deliver_to_run_refuses_an_unknown_run() {
+        let runs = test_hub();
+        let err = smol::block_on(deliver_to_run(&runs, None, "ag-nope", "hi".into()));
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn deliver_to_run_does_not_route_the_user_to_main() {
+        let runs = test_hub();
+        let inbox = runs.hub.inbox_of(runs.hub.main()).unwrap();
+        assert!(smol::block_on(deliver_to_run(&runs, None, "main", "hi".into())).is_err());
+        assert!(inbox.is_empty());
+    }
 }
