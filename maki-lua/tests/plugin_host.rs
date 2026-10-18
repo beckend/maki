@@ -8216,3 +8216,82 @@ fn a_ctx_session_pays_for_reach_whoever_could_answer(answerable: bool) {
     };
     assert!(text.text.contains("fs_write"), "got: {}", text.text);
 }
+
+const PROMOTE_PLUGIN: &str = r#"
+maki.api.register_tool({
+    name = "promote_test",
+    description = "promotes its job when the deadline hits",
+    schema = { type = "object", properties = {}, additionalProperties = false },
+    audiences = { "main" },
+    handler = function(input, ctx)
+        ctx:set_deadline(1)
+        local parts = {}
+        local job = maki.fn.jobstart("echo started; sleep 2; echo done", {
+            on_stdout = function(_, line) parts[#parts + 1] = line end,
+        })
+        maki.async.on_cancel(function(reason)
+            local handle, err = ctx:promote(job, { command = "sleep-ish", output = table.concat(parts, "\n") })
+            ctx:finish({ llm_output = (handle or ("refused: " .. tostring(err))) .. " reason=" .. reason })
+        end)
+        return nil
+    end,
+})
+"#;
+
+#[test]
+fn ctx_promote_hands_a_timed_out_job_to_the_run_hub() {
+    use maki_agent::runs::{RunsCtx, Scope, UnitLimits, UnitState, WaitMode};
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source("promote_test", PROMOTE_PLUGIN).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let (tx, _rx) = flume::unbounded();
+    let hub = maki_agent::runs::UnitHub::with_shell_options(
+        UnitLimits::default(),
+        maki_agent::EventSender::new(tx, 0),
+        Arc::new(maki_agent::runs::SystemClock),
+        maki_agent::runs::ShellOptions {
+            dir: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        },
+    );
+    let mut ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
+    ctx.runs = Some(RunsCtx {
+        hub: Arc::clone(&hub),
+        self_run: hub.main(),
+    });
+    let out = exec_with_ctx(&reg, "promote_test", json!({}), &ctx).unwrap();
+    let handle = out.split_whitespace().next().unwrap().to_owned();
+    assert!(handle.starts_with("sh-"), "got: {out}");
+    assert!(out.ends_with("reason=timeout"), "got: {out}");
+
+    let runs = hub.list(hub.main(), Scope::All);
+    assert_eq!(runs.len(), 1);
+    let id = runs[0].id;
+    let views = smol::block_on(hub.wait(
+        hub.main(),
+        &[id],
+        WaitMode::All,
+        Duration::from_secs(30),
+        &maki_agent::cancel::CancelToken::none(),
+    ));
+    assert!(
+        matches!(views[0].state, UnitState::Done(_)),
+        "{:?}",
+        views[0].state
+    );
+    let log = std::fs::read_to_string(dir.path().join(format!("{handle}.log"))).unwrap();
+    assert_eq!(
+        log, "started\ndone\n",
+        "output before and after the hand-over"
+    );
+}
+
+#[test]
+fn ctx_promote_refuses_when_runs_are_off() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source("promote_test", PROMOTE_PLUGIN).unwrap();
+    let out = exec_tool(&reg, "promote_test", json!({})).unwrap();
+    assert_eq!(out, "refused: runs are not enabled reason=timeout");
+}

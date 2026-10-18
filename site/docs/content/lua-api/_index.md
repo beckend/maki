@@ -7537,6 +7537,10 @@ function M.tail(text, n)
 --- placeholder to drop. {reason} is a cancel-hook reason ("cancelled" |
 --- "timeout").
 function M.cut(view, out, reason, timeout_secs)
+
+--- Like `cut` for a timed-out command that was handed to the run hub instead
+--- of being killed. Not an error: the process is alive and owns {handle}.
+function M.promoted(view, out, handle, timeout_secs)
 ```
 
 ### `require("maki.provider_parse")`

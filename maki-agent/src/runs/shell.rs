@@ -405,6 +405,263 @@ async fn supervise(
     finish(terminal);
 }
 
+/// What a foreground tool hands over with its still running process.
+pub struct Adopted {
+    /// Leader of the process group (the tool made it a session leader).
+    pub pid: u32,
+    /// Everything the process printed before the hand-over, already merged.
+    pub initial: Vec<u8>,
+    /// Output after the hand-over, then the exit. The tool's reader and wait
+    /// threads feed it; the process is reaped there, never here.
+    pub events: flume::Receiver<AdoptEvent>,
+}
+
+pub enum AdoptEvent {
+    Output(Vec<u8>),
+    /// `None` when a signal ended the process.
+    Exit(Option<i32>),
+}
+
+pub(super) fn start_adopted(
+    hub: Weak<UnitHub>,
+    id: UnitId,
+    run: Arc<ShellRun>,
+    spec: ShellSpec,
+    clock: Arc<dyn Clock>,
+    opts: ShellOptions,
+    adopted: Adopted,
+) {
+    smol::spawn(supervise_adopted(hub, id, run, spec, clock, opts, adopted)).detach();
+}
+
+/// The log and ring side of the pump, for output that arrives as chunks.
+struct Sink {
+    log: Option<File>,
+    cap: u64,
+    logged: u64,
+    discarding: bool,
+}
+
+impl Sink {
+    fn accept(&mut self, run: &ShellRun, chunk: &[u8]) {
+        if self.discarding || chunk.is_empty() {
+            return;
+        }
+        let keep = chunk.len().min((self.cap - self.logged) as usize);
+        let mut data = chunk[..keep].to_vec();
+        if keep < chunk.len() {
+            data.extend_from_slice(
+                format!(
+                    "\n[log limit of {} bytes reached; further output discarded]\n",
+                    self.cap
+                )
+                .as_bytes(),
+            );
+            self.discarding = true;
+        }
+        self.logged += data.len() as u64;
+        if let Some(file) = &mut self.log
+            && let Err(e) = file.write_all(&data)
+        {
+            tracing::warn!(%e, "shell log write failed");
+            self.log = None;
+        }
+        run.out().push(&data);
+    }
+}
+
+enum AdoptStep {
+    Event(Option<AdoptEvent>),
+    Stop(Cause),
+}
+
+/// Waits for the exit event, feeding output on the way. `None` means a
+/// signal ended the process or the sender went away without an exit.
+async fn until_exit(
+    events: &flume::Receiver<AdoptEvent>,
+    run: &ShellRun,
+    sink: &mut Sink,
+) -> Option<i32> {
+    loop {
+        match events.recv_async().await {
+            Ok(AdoptEvent::Output(data)) => sink.accept(run, &data),
+            Ok(AdoptEvent::Exit(code)) => return code,
+            Err(_) => return None,
+        }
+    }
+}
+
+async fn supervise_adopted(
+    hub: Weak<UnitHub>,
+    id: UnitId,
+    run: Arc<ShellRun>,
+    spec: ShellSpec,
+    clock: Arc<dyn Clock>,
+    opts: ShellOptions,
+    adopted: Adopted,
+) {
+    let started = clock.now();
+    let deadline = started + Duration::from_secs(spec.timeout_secs);
+    let Adopted {
+        pid,
+        initial,
+        events,
+    } = adopted;
+    let finish = |terminal: Terminal| {
+        if let Some(hub) = hub.upgrade() {
+            hub.settle(id, terminal, run.total_bytes());
+        }
+    };
+    let elapsed_ms = || clock.now().saturating_duration_since(started).as_millis() as u64;
+    let result = |reason, exit_code, detail| Terminal {
+        reason,
+        exit_code,
+        detail,
+        result: UnitResult {
+            summary: run.summary(),
+            body_ref: run.log_path.clone().map(BodyRef),
+            elapsed_ms: elapsed_ms(),
+            ..UnitResult::default()
+        },
+    };
+    let handle = hub
+        .upgrade()
+        .and_then(|h| h.handle_of(id))
+        .map(|h| h.to_string());
+    {
+        // Same gate as a launch: teardown either sees the pid or stops us.
+        let gate = run.killed.lock().unwrap_or_else(|e| e.into_inner());
+        if *gate || SHUTTING_DOWN.load(Ordering::SeqCst) {
+            drop(gate);
+            #[cfg(unix)]
+            crate::child_guard::sigkill_process_group(pid);
+            return;
+        }
+        run.pid.store(pid, Ordering::SeqCst);
+        live_groups().insert(pid);
+    }
+    if let (Some(hub), Some(handle)) = (hub.upgrade(), &handle) {
+        hub.record_proc(handle, pid);
+    }
+    let log = run.log_path.as_ref().and_then(|path| {
+        private_log(path)
+            .inspect_err(
+                |e| tracing::warn!(?path, %e, "shell log unavailable, keeping output in memory"),
+            )
+            .ok()
+    });
+    let mut sink = Sink {
+        log,
+        cap: opts.log_cap,
+        logged: 0,
+        discarding: false,
+    };
+    sink.accept(&run, &initial);
+
+    let step = loop {
+        let step = or(
+            async { AdoptStep::Event(events.recv_async().await.ok()) },
+            async {
+                AdoptStep::Stop(
+                    or(
+                        async {
+                            run.stop_requested().await;
+                            Cause::Stopped
+                        },
+                        async {
+                            clock.sleep_until(deadline).await;
+                            Cause::TimedOut
+                        },
+                    )
+                    .await,
+                )
+            },
+        )
+        .await;
+        match step {
+            AdoptStep::Event(Some(AdoptEvent::Output(data))) => sink.accept(&run, &data),
+            other => break other,
+        }
+    };
+
+    let terminal = match step {
+        AdoptStep::Event(Some(AdoptEvent::Exit(Some(0)))) => {
+            result(DoneReason::Completed, Some(0), None)
+        }
+        AdoptStep::Event(Some(AdoptEvent::Exit(Some(code)))) => {
+            result(DoneReason::Failed, Some(code), None)
+        }
+        AdoptStep::Event(Some(AdoptEvent::Exit(None))) => {
+            result(DoneReason::Failed, None, Some("killed by a signal".into()))
+        }
+        AdoptStep::Event(_) => result(
+            DoneReason::Failed,
+            None,
+            Some("lost track of the process".into()),
+        ),
+        AdoptStep::Stop(cause) => {
+            let reason = match cause {
+                Cause::Stopped => DoneReason::Killed,
+                Cause::TimedOut => {
+                    if let Some(hub) = hub.upgrade() {
+                        hub.mark_stopping(id);
+                    }
+                    DoneReason::TimedOut
+                }
+            };
+            let grace_ends = clock.now() + opts.grace;
+            term_group(pid);
+            let exited = or(
+                async { Some(until_exit(&events, &run, &mut sink).await) },
+                async {
+                    clock.sleep_until(grace_ends).await;
+                    None
+                },
+            )
+            .await;
+            let (code, signal) = match exited {
+                Some(code) => (code, signal_name(15)),
+                None => {
+                    #[cfg(unix)]
+                    crate::child_guard::sigkill_process_group(pid);
+                    let drain = clock.now() + DRAIN_GRACE;
+                    or(
+                        async {
+                            until_exit(&events, &run, &mut sink).await;
+                        },
+                        async { clock.sleep_until(drain).await },
+                    )
+                    .await;
+                    (None, signal_name(9))
+                }
+            };
+            let signalled = code.is_none();
+            let detail = match reason {
+                DoneReason::TimedOut => Some(format!(
+                    "timed out after {}s{}",
+                    spec.timeout_secs,
+                    if signalled {
+                        format!(" ({signal})")
+                    } else {
+                        String::new()
+                    }
+                )),
+                _ => signalled.then_some(signal),
+            };
+            result(reason, code, detail)
+        }
+    };
+
+    #[cfg(unix)]
+    crate::child_guard::sigkill_process_group(pid);
+    run.pid.store(0, Ordering::Release);
+    live_groups().remove(&pid);
+    let mut terminal = terminal;
+    terminal.result.summary = run.summary();
+    terminal.result.elapsed_ms = elapsed_ms();
+    finish(terminal);
+}
+
 /// Process groups of shells that were launched and not yet reaped, so a
 /// signal handler or panic hook can tear them down without a hub in hand.
 static LIVE: Mutex<BTreeSet<u32>> = Mutex::new(BTreeSet::new());
@@ -965,6 +1222,190 @@ mod tests {
         let t = finished(&rig, id);
         assert_eq!(t.reason, DoneReason::Killed);
         assert_eq!(t.detail.as_deref(), Some("SIGKILL"));
+    }
+
+    /// A stand-in for the bash plugin's job: its own session, reader thread
+    /// for the merged output, wait thread for the exit.
+    fn foreground_child(command: &str) -> (u32, flume::Receiver<AdoptEvent>) {
+        use std::io::BufRead;
+        use std::os::unix::process::CommandExt;
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("exec 2>&1; {command}"))
+            .stdout(Stdio::piped())
+            .stdin(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let (tx, rx) = flume::unbounded();
+        let stdout = child.stdout.take().unwrap();
+        let reader_tx = tx.clone();
+        let reader = std::thread::spawn(move || {
+            for line in std::io::BufReader::new(stdout)
+                .lines()
+                .map_while(Result::ok)
+            {
+                let _ = reader_tx.send(AdoptEvent::Output(format!("{line}\n").into_bytes()));
+            }
+        });
+        std::thread::spawn(move || {
+            let _ = reader.join();
+            let status = child.wait().unwrap();
+            let _ = tx.send(AdoptEvent::Exit(status.code()));
+        });
+        (pid, rx)
+    }
+
+    fn shell_request(command: &str) -> crate::runs::SpawnRequest {
+        let mut req = crate::runs::tests::request(RunKind::Shell, "bash: adopted");
+        req.command = Some(command.into());
+        req
+    }
+
+    #[test]
+    fn adopted_process_gets_handle_and_log() {
+        let rig = rig();
+        let (pid, events) = foreground_child("echo live; sleep 1; echo after");
+        let ack = rig
+            .hub
+            .adopt_shell(
+                rig.hub.main(),
+                shell_request("echo live; sleep 1; echo after"),
+                Adopted {
+                    pid,
+                    initial: b"before\n".to_vec(),
+                    events,
+                },
+            )
+            .unwrap();
+        assert!(ack.handle.as_str().starts_with("sh-"), "{}", ack.handle);
+        let id = ack.id;
+        let t = finished(&rig, id);
+        assert_eq!(t.reason, DoneReason::Completed);
+        assert_eq!(t.exit_code, Some(0));
+        let log =
+            std::fs::read_to_string(rig.dir.path().join(format!("{}.log", ack.handle))).unwrap();
+        assert_eq!(log, "before\nlive\nafter\n", "output so far comes first");
+        assert_eq!(read_all(&rig, id), log);
+        until("group gone", || !group_alive(pid));
+    }
+
+    #[test]
+    fn adopted_failure_keeps_exit_code() {
+        let rig = rig();
+        let (pid, events) = foreground_child("echo bad; exit 3");
+        let ack = rig
+            .hub
+            .adopt_shell(
+                rig.hub.main(),
+                shell_request("echo bad; exit 3"),
+                Adopted {
+                    pid,
+                    initial: Vec::new(),
+                    events,
+                },
+            )
+            .unwrap();
+        let t = finished(&rig, ack.id);
+        assert_eq!((t.reason, t.exit_code), (DoneReason::Failed, Some(3)));
+    }
+
+    #[test]
+    fn adopted_process_is_stopped_once_with_term_then_kill() {
+        let rig = rig();
+        let command = "trap 'echo got-term' TERM; echo ready; while :; do sleep 0.05; done";
+        let (pid, events) = foreground_child(command);
+        let ack = rig
+            .hub
+            .adopt_shell(
+                rig.hub.main(),
+                shell_request(command),
+                Adopted {
+                    pid,
+                    initial: Vec::new(),
+                    events,
+                },
+            )
+            .unwrap();
+        until("ready", || output_has(&rig, ack.id, "ready"));
+        rig.hub.stop(rig.hub.main(), &[ack.id], Default::default());
+        until("TERM delivered", || output_has(&rig, ack.id, "got-term"));
+        rig.clock.advance(DEFAULT_GRACE);
+        let t = finished(&rig, ack.id);
+        assert_eq!(t.reason, DoneReason::Killed);
+        assert_eq!(t.detail.as_deref(), Some("SIGKILL"));
+        until("group gone", || !group_alive(pid));
+    }
+
+    #[test]
+    fn adopted_process_times_out_on_its_own_deadline() {
+        let rig = rig();
+        let (pid, events) = foreground_child("echo ready; sleep 600");
+        let mut req = shell_request("echo ready; sleep 600");
+        req.timeout_secs = Some(30);
+        let ack = rig
+            .hub
+            .adopt_shell(
+                rig.hub.main(),
+                req,
+                Adopted {
+                    pid,
+                    initial: Vec::new(),
+                    events,
+                },
+            )
+            .unwrap();
+        until("ready", || output_has(&rig, ack.id, "ready"));
+        rig.clock.advance(Duration::from_secs(30));
+        rig.clock.advance(DEFAULT_GRACE);
+        let t = finished(&rig, ack.id);
+        assert_eq!(t.reason, DoneReason::TimedOut);
+        until("group gone", || !group_alive(pid));
+    }
+
+    #[test]
+    fn refused_adoption_leaves_the_process_with_its_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, _rx) = flume::unbounded::<Envelope>();
+        let limits = UnitLimits {
+            max_shells: 0,
+            ..UnitLimits::default()
+        };
+        let hub = UnitHub::with_shell_options(
+            limits,
+            EventSender::new(tx, 0),
+            Arc::new(ManualClock::default()),
+            ShellOptions {
+                dir: Some(dir.path().to_path_buf()),
+                log_cap: DEFAULT_LOG_CAP,
+                grace: DEFAULT_GRACE,
+            },
+        );
+        let (pid, events) = foreground_child("sleep 600");
+        let err = hub
+            .adopt_shell(
+                hub.main(),
+                shell_request("sleep 600"),
+                Adopted {
+                    pid,
+                    initial: Vec::new(),
+                    events,
+                },
+            )
+            .err()
+            .unwrap();
+        assert!(
+            matches!(err, crate::runs::UnitError::ShellLimit { .. }),
+            "{err}"
+        );
+        assert!(group_alive(pid), "the hub must not touch a refused process");
+        assert!(
+            hub.list(hub.main(), crate::runs::Scope::All).is_empty(),
+            "no run was created"
+        );
+        crate::child_guard::sigkill_process_group(pid);
+        until("group gone", || !group_alive(pid));
     }
 
     #[test]

@@ -274,7 +274,7 @@ local opts = maki.api.register_options(output_limits.extend({
   timeout_secs = {
     default = 120,
     min = 5,
-    desc = "Kill the command after this many seconds. A call's `timeout` param overrides it.",
+    desc = "Stop waiting for the command after this many seconds and kill it; with native runs enabled it keeps running as a background shell run instead. A call's `timeout` param overrides it.",
   },
 }))
 
@@ -465,6 +465,17 @@ maki.api.register_tool({
     maki.async.on_cancel(function(reason)
       if finished then
         return
+      end
+      -- With native runs on, a command that hit its timeout keeps running
+      -- as a shell run instead of being killed. Any refusal (runs off, a
+      -- limit, already exited) leaves the job untouched and falls through.
+      if reason == "timeout" then
+        local handle = ctx:promote(job, { command = command, output = table.concat(output_parts) })
+        if handle then
+          finished = true
+          ctx:finish(partial.promoted(view, final_output(), handle, timeout_secs))
+          return
+        end
       end
       finished = true
       ctx:finish(partial.cut(view, final_output(), reason, timeout_secs))

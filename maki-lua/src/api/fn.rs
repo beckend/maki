@@ -438,6 +438,26 @@ impl JobStore {
             .then(|| job.event_rx.take())?
     }
 
+    /// Hands a live task-owned job's pid and event stream to a caller that
+    /// takes the process over. Nothing is removed yet: on a refusal the
+    /// caller gives the stream back with [`Self::restore_receiver`], and on
+    /// success it calls [`Self::finish`], which drops the entry without a kill.
+    pub fn take_for_adoption(
+        &mut self,
+        job_id: u32,
+        task_id: Option<u64>,
+    ) -> Option<(u32, flume::Receiver<JobEvent>)> {
+        let job = self.jobs.get_mut(&job_id)?;
+        if job.owner != JobOwner::Task(task_id?)
+            || job.exit_code.is_some()
+            || job.reaped.load(Ordering::Relaxed)
+        {
+            return None;
+        }
+        let rx = job.event_rx.take()?;
+        Some((job.pid, rx))
+    }
+
     pub fn restore_receiver(&mut self, job_id: u32, receiver: flume::Receiver<JobEvent>) {
         if let Some(job) = self.jobs.get_mut(&job_id)
             && job.event_rx.is_none()
