@@ -2467,7 +2467,11 @@ impl App {
         self.finish_subagents(TaskOutcome::Cancelled, CANCELLED_TEXT);
         self.chats[MAIN_CHAT].auth_parked = false;
         self.shell.cancel_all();
-        for chat in self.chats.iter_mut().filter(|c| c.plugin.is_none()) {
+        for chat in self
+            .chats
+            .iter_mut()
+            .filter(|c| c.plugin.is_none() && !is_native_run(c))
+        {
             chat.flush();
             chat.cancel_in_progress();
         }
@@ -3576,7 +3580,12 @@ impl App {
     fn terminalize_turn(&mut self, message: &str) {
         self.retain_resolved_subagents(TaskOutcome::Error, ERROR_TEXT);
         self.chats[MAIN_CHAT].fail_in_progress_except(message.into(), self.shell.active_ids());
-        for chat in self.chats.iter_mut().skip(1).filter(|c| c.plugin.is_none()) {
+        for chat in self
+            .chats
+            .iter_mut()
+            .skip(1)
+            .filter(|c| c.plugin.is_none() && !is_native_run(c))
+        {
             chat.fail_in_progress_with_message(message.into());
         }
     }
@@ -3585,7 +3594,7 @@ impl App {
     /// `chat_index`.
     fn retain_resolved_subagents(&mut self, outcome: TaskOutcome, text: &str) {
         self.chat_index.retain(|_, &mut sub_idx| {
-            if self.chats[sub_idx].is_finished() {
+            if self.chats[sub_idx].is_finished() || is_native_run(&self.chats[sub_idx]) {
                 true
             } else {
                 self.chats[sub_idx].mark_finished(outcome, text);
@@ -3789,4 +3798,11 @@ fn sync_search_highlight(modal: &SearchModal, chat: &mut Chat) {
         chat.scroll_to_segment(i);
     }
     chat.set_highlight_segment(idx);
+}
+
+/// A native background run's tab, keyed by its `ag-` handle. It outlives the
+/// turn, so cancelling or ending a turn leaves it alone; only its own
+/// `RunFinished` closes it.
+fn is_native_run(chat: &Chat) -> bool {
+    chat.task_id().is_some_and(|id| id.starts_with("ag-"))
 }
