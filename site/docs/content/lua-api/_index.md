@@ -1591,6 +1591,11 @@ session, so opening one fails with "session not live". The
 
 **Returns:** ([`Session?`](#maki-agent-Session), `string?`) Session handle, or `(nil, err)` on failure.
 
+The handle carries its own id, so you can deliver a message to the subagent
+from the outside with `maki.session.notify(..., { session = sess:session_id() })`.
+The message waits for the subagent's next `:prompt()`; see
+[maki.agent.Session](#maki-agent-session).
+
 **Example:**
 
 ```lua
@@ -1656,6 +1661,44 @@ a multi-step conversation.
 Always call `:close()` when you are done, on error paths too. The
 garbage collector is a fallback that may never run while the VM sits
 idle, so a session you only drop can stay open for the rest of the run.
+
+`:session_id()` is how anything else reaches this one: hand it to
+`maki.session.notify` to deliver an observation from the outside. The
+observation waits for the next `:prompt()` — a subagent has no turn of
+its own to be woken into, and `maki.session.prompt` is a UI roundtrip
+that does not apply to it.
+
+---
+
+### `Session:session_id()` {#Session-session_id}
+
+```lua
+Session:session_id()
+```
+
+The id that addresses this session, for `maki.session.notify`.
+
+Use it to report something to the subagent from outside its own conversation:
+
+```lua
+local id = sess:session_id()
+maki.session.notify("the build failed", { session = id })
+```
+
+What reaches the subagent, and when:
+
+- The message becomes an observation in its history at the subagent's NEXT
+  `:prompt()`. Nothing starts a subagent's turn on its own, so a message
+  delivered while it is idle just waits for you to prompt it.
+- `wake` is read only by an interactive frontend loop. There is none here,
+  so passing it changes nothing.
+- `maki.session.prompt()` does NOT work on a subagent: it is a roundtrip to
+  the UI, and a subagent has no tab to answer it. Use `:prompt()`.
+
+The id stops resolving once you close the session and drop the handle; a
+later notify answers `session not live`.
+
+**Returns:** (`string`) The id, which parses as a maki session id.
 
 ---
 
