@@ -109,6 +109,10 @@ pub(super) struct ShellRun {
     /// under this lock, so teardown either stops the launch or sees the pid.
     killed: Mutex<bool>,
     stop_event: Event,
+    /// Set when the supervisor gives up waiting for the output pipe to close
+    /// (an orphan kept it open): the pump flushes what it holds and ends.
+    drain_over: AtomicBool,
+    drain_event: Event,
 }
 
 impl ShellRun {
@@ -120,7 +124,24 @@ impl ShellRun {
             stop: AtomicBool::new(false),
             killed: Mutex::new(false),
             stop_event: Event::new(),
+            drain_over: AtomicBool::new(false),
+            drain_event: Event::new(),
         })
+    }
+
+    fn abandon_drain(&self) {
+        self.drain_over.store(true, Ordering::Release);
+        self.drain_event.notify(usize::MAX);
+    }
+
+    async fn drain_abandoned(&self) {
+        loop {
+            let listener = self.drain_event.listen();
+            if self.drain_over.load(Ordering::Acquire) {
+                return;
+            }
+            listener.await;
+        }
     }
 
     fn out(&self) -> MutexGuard<'_, Output> {
@@ -313,7 +334,7 @@ async fn supervise(
     let Some(launched) = launch_unless_killed(&spec, &run, &opts, watch, &record) else {
         return;
     };
-    let (mut guard, pump) = match launched {
+    let (mut guard, mut pump) = match launched {
         Ok(launched) => launched,
         Err(e) => {
             finish(result(
@@ -392,13 +413,23 @@ async fn supervise(
     crate::child_guard::sigkill_process_group(pid);
     run.pid.store(0, Ordering::Release);
     live_groups().remove(&pid);
-    or(
+    let drained = or(
         async {
-            let _ = pump.await;
+            let _ = (&mut pump).await;
+            true
         },
-        async { clock.sleep_until(clock.now() + DRAIN_GRACE).await },
+        async {
+            clock.sleep_until(clock.now() + DRAIN_GRACE).await;
+            false
+        },
     )
     .await;
+    if !drained {
+        // An orphan outside the group still holds the pipe. Let the pump flush
+        // the watch lines it holds (they would die with the dropped task).
+        run.abandon_drain();
+        let _ = pump.await;
+    }
     let mut terminal = terminal;
     terminal.result.summary = run.summary();
     terminal.result.elapsed_ms = elapsed_ms();
@@ -843,6 +874,7 @@ async fn pump(
     enum Step {
         Read(io::Result<usize>),
         Tick,
+        Abandon,
     }
     let mut chunk = [0u8; READ_CHUNK];
     let mut logged = 0u64;
@@ -851,16 +883,21 @@ async fn pump(
         let due = watch
             .as_ref()
             .and_then(|w| Some((w.deadline()?, Arc::clone(&w.clock))));
-        let step = match due {
-            Some((at, clock)) => {
-                or(async { Step::Read(reader.read(&mut chunk).await) }, async {
+        let tick = async {
+            match due {
+                Some((at, clock)) => {
                     clock.sleep_until(at).await;
                     Step::Tick
-                })
-                .await
+                }
+                None => std::future::pending().await,
             }
-            None => Step::Read(reader.read(&mut chunk).await),
         };
+        let read = async { Step::Read(reader.read(&mut chunk).await) };
+        let abandon = async {
+            run.drain_abandoned().await;
+            Step::Abandon
+        };
+        let step = or(abandon, or(tick, read)).await;
         let n = match step {
             Step::Tick => {
                 if let Some(w) = &mut watch {
@@ -868,7 +905,7 @@ async fn pump(
                 }
                 continue;
             }
-            Step::Read(Ok(0) | Err(_)) => {
+            Step::Read(Ok(0) | Err(_)) | Step::Abandon => {
                 if let Some(w) = &mut watch {
                     w.finish();
                 }
@@ -1589,6 +1626,43 @@ mod tests {
         assert!(notices[0].text.contains("ERROR b"), "{}", notices[0].text);
         assert!(!notices[0].text.contains("\na\n"), "{}", notices[0].text);
         assert!(notices[0].text.contains("/ERROR/"), "{}", notices[0].text);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn orphan_holding_the_pipe_does_not_lose_held_watch_lines() {
+        let rig = rig();
+        let pidfile = rig.dir.path().join("orphan.pid");
+        // A partial line is held by the line splitter until a newline or the
+        // end of the stream. The orphan leaves the process group and keeps the
+        // pipe open, so the stream does not end within the drain grace.
+        let flag = rig.dir.path().join("orphan.ready");
+        // The leader waits until the orphan has left the group, or the group
+        // kill at the leader's exit would take it too.
+        let command = format!(
+            "printf 'ERROR tail'; setsid sh -c 'echo $$ > {pid}; : > {flag}; exec sleep 20' & \
+             while [ ! -e {flag} ]; do sleep 0.02; done",
+            pid = pidfile.display(),
+            flag = flag.display()
+        );
+        let started = Instant::now();
+        let id = watch_start(&rig, &command, "^ERROR");
+        until("run done", || {
+            rig.clock.advance(DRAIN_GRACE + Duration::from_secs(1));
+            view(&rig, id).state.is_done()
+        });
+        until("flushed match notice", || !match_notices(&rig).is_empty());
+        let text = match_notices(&rig)[0].text.clone();
+        assert!(text.contains("ERROR tail"), "{text}");
+        // The orphan sleeps 20 s; the flush must not wait for it.
+        assert!(started.elapsed() < Duration::from_secs(10));
+        if let Some(pid) = std::fs::read_to_string(&pidfile)
+            .ok()
+            .and_then(|p| p.trim().parse::<i32>().ok())
+        {
+            // SAFETY: signals the orphan this test started.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
     }
 
     #[test]
