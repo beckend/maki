@@ -86,6 +86,7 @@ impl AgentLoop {
             &config.runs,
             EventSender::new(agent_tx.clone(), 0),
             resumed.id.id(),
+            true,
         );
         let seed = mailbox.publish_seed(
             AgentSeed::new(

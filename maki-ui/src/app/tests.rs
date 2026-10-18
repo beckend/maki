@@ -8105,3 +8105,114 @@ fn esc_leaves_native_run_tab_running() {
     }));
     assert_eq!(app.chats.len(), 2);
 }
+
+mod run_prompts {
+    use super::*;
+
+    const HANDLE_A: &str = "ag-aaaaaa";
+    const HANDLE_B: &str = "ag-bbbbbb";
+
+    fn ask(handle: &str, name: &str, id: &str, tx: flume::Sender<String>) -> Msg {
+        Msg::Agent(Box::new(Envelope {
+            event: AgentEvent::PermissionRequest {
+                id: id.into(),
+                tool: ToolKey::native("bash"),
+                scopes: vec!["echo routed".into()],
+                reason: None,
+            },
+            subagent: Some(subagent_info_with_tx(handle, name, Some(tx))),
+            run_id: maki_agent::BACKGROUND_RUN_ID,
+        }))
+    }
+
+    fn event_of(handle: &str, name: &str, event: AgentEvent) -> Msg {
+        subagent_msg_with_run_id(event, handle, Some(name), maki_agent::BACKGROUND_RUN_ID)
+    }
+
+    #[test]
+    fn background_prompt_reaches_ui_with_run_name_and_queues() {
+        let (tx_a, rx_a) = flume::unbounded();
+        let (tx_b, rx_b) = flume::unbounded();
+        let mut app = streaming_app();
+        app.update(ask(HANDLE_A, "auditor", "same", tx_a));
+        app.update(ask(HANDLE_B, "builder", "same", tx_b));
+        assert_eq!(
+            app.permission_prompt.front_label(),
+            Some("auditor (ag-aaaaaa)")
+        );
+        app.update(Msg::Key(key(KeyCode::Char('y'))));
+        assert_eq!(rx_a.try_recv().unwrap(), allow_once("same"));
+        assert!(rx_b.is_empty(), "the answer applies to that run only");
+        assert_eq!(
+            app.permission_prompt.front_label(),
+            Some("builder (ag-bbbbbb)")
+        );
+        app.update(Msg::Key(key(KeyCode::Esc)));
+        assert_eq!(
+            rx_b.try_recv().unwrap(),
+            TaggedAnswer::new("same", PermissionAnswer::Deny).encode(),
+            "Esc dismisses a run's ask as a denial"
+        );
+        assert!(rx_a.is_empty());
+    }
+
+    #[test]
+    fn a_cancelled_turn_leaves_a_runs_prompt_and_its_answer_route() {
+        let (tx, rx) = flume::unbounded();
+        let mut app = streaming_app();
+        app.update(ask(HANDLE_A, "auditor", "t1", tx));
+        app.handle_cancel();
+        assert!(app.permission_prompt.is_open(), "the run is still waiting");
+        app.update(Msg::Key(key(KeyCode::Char('y'))));
+        assert_eq!(rx.try_recv().unwrap(), allow_once("t1"));
+    }
+
+    #[test]
+    fn withdrawn_prompt_leaves_the_screen() {
+        let (tx, _rx) = flume::unbounded();
+        let mut app = streaming_app();
+        app.update(ask(HANDLE_A, "auditor", "t1", tx));
+        app.update(event_of(
+            HANDLE_B,
+            "builder",
+            AgentEvent::PermissionWithdrawn { id: "t1".into() },
+        ));
+        assert!(
+            app.permission_prompt.is_open(),
+            "another run's withdraw is not ours"
+        );
+        app.update(event_of(
+            HANDLE_A,
+            "auditor",
+            AgentEvent::PermissionWithdrawn { id: "t1".into() },
+        ));
+        assert!(!app.permission_prompt.is_open());
+    }
+
+    #[test]
+    fn finished_run_takes_its_prompt_with_it() {
+        let (tx, _rx) = flume::unbounded();
+        let mut app = streaming_app();
+        app.update(event_of(
+            HANDLE_A,
+            "auditor",
+            AgentEvent::RunStarted {
+                handle: HANDLE_A.into(),
+                name: "auditor".into(),
+                kind: "agent".into(),
+            },
+        ));
+        app.update(ask(HANDLE_A, "auditor", "t1", tx));
+        assert!(app.permission_prompt.is_open());
+        app.update(event_of(
+            HANDLE_A,
+            "auditor",
+            AgentEvent::RunFinished {
+                handle: HANDLE_A.into(),
+                reason: "killed".into(),
+                detail: None,
+            },
+        ));
+        assert!(!app.permission_prompt.is_open());
+    }
+}

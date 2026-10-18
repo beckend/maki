@@ -288,7 +288,8 @@ impl Chat {
             | AgentEvent::RunStarted { .. }
             | AgentEvent::RunStateChanged { .. }
             | AgentEvent::RunFinished { .. }
-            | AgentEvent::RunNotice { .. } => {}
+            | AgentEvent::RunNotice { .. }
+            | AgentEvent::PermissionWithdrawn { .. } => {}
             AgentEvent::LiveToolBuf { id, body } => {
                 self.messages_panel.register_live_buf(id, body);
             }

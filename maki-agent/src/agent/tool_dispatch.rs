@@ -931,11 +931,19 @@ async fn gate(
         ask,
         layers.as_ref().map(|layers| layers as &dyn PromptLayers),
     );
-    let allowed_by = ctx
-        .deadline
-        .paused_while(decision)
-        .await
-        .map_err(|e| e.to_string())?;
+    let decided = ctx.deadline.paused_while(decision).await;
+    // A background run's prompt gave its slot up while it waited.
+    if let Some(runs) = &ctx.runs {
+        runs.hub
+            .prompt_resolved(
+                runs.self_run,
+                id,
+                ctx.user_response_rx.as_ref(),
+                &ctx.cancel,
+            )
+            .await;
+    }
+    let allowed_by = decided.map_err(|e| e.to_string())?;
     if let Some(plugin) = allowed_by {
         mark_allowed_by(ctx, plugin);
     }

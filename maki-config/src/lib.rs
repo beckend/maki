@@ -101,6 +101,7 @@ pub const DEFAULT_RUNS_MAX_TIMEOUT_SECS: u64 = 86_400;
 pub const MIN_RUNS_MAX_DEPTH: u32 = 1;
 pub const MIN_RUNS_LIMIT: u32 = 1;
 pub const MIN_RUNS_TIMEOUT_SECS: u64 = 1;
+pub const DEFAULT_RUNS_PERMISSION_TIMEOUT_SECS: u64 = 120;
 
 pub const MIN_RETRY_BASE_MS: u64 = 1;
 pub const MIN_RETRY_MAX_MS: u64 = 1;
@@ -848,6 +849,20 @@ pub struct RunsFileConfig {
     pub spawn_per_minute: Option<u32>,
     pub default_timeout_secs: Option<u64>,
     pub max_timeout_secs: Option<u64>,
+    pub permission_timeout_secs: Option<u64>,
+    pub unattended_permissions: Option<UnattendedMode>,
+}
+
+/// What a background run's permission prompt gets when nobody can answer it
+/// (`maki -p`, an SDK client with no handler).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnattendedMode {
+    /// Deny the call.
+    #[default]
+    Deny,
+    /// Allow it when the session runs with `--yolo`, deny it otherwise.
+    InheritYolo,
 }
 
 impl RunsFileConfig {
@@ -866,7 +881,9 @@ impl RunsFileConfig {
             max_queue,
             spawn_per_minute,
             default_timeout_secs,
-            max_timeout_secs
+            max_timeout_secs,
+            permission_timeout_secs,
+            unattended_permissions
         );
     }
 }
@@ -1626,6 +1643,17 @@ pub struct RunsConfig {
 
     #[config(default = DEFAULT_RUNS_MAX_TIMEOUT_SECS, min = MIN_RUNS_TIMEOUT_SECS, desc = "Largest `timeout_secs` a `spawn` may ask for (seconds); larger values are lowered to it")]
     pub max_timeout_secs: u64,
+
+    #[config(default = DEFAULT_RUNS_PERMISSION_TIMEOUT_SECS, min = MIN_RUNS_TIMEOUT_SECS, desc = "How long a run's permission prompt waits for the user (seconds) before it is denied; the run gives up its slot meanwhile")]
+    pub permission_timeout_secs: u64,
+
+    #[config(
+        default = UnattendedMode::Deny,
+        ty = "string",
+        default_doc = "deny",
+        desc = "A run's permission prompt when nobody can answer (`maki -p`): `deny`, or `inherit_yolo` to allow it under `--yolo`"
+    )]
+    pub unattended_permissions: UnattendedMode,
 }
 
 impl RunsConfig {
@@ -1653,6 +1681,10 @@ impl RunsConfig {
             max_timeout_secs: file
                 .max_timeout_secs
                 .unwrap_or(DEFAULT_RUNS_MAX_TIMEOUT_SECS),
+            permission_timeout_secs: file
+                .permission_timeout_secs
+                .unwrap_or(DEFAULT_RUNS_PERMISSION_TIMEOUT_SECS),
+            unattended_permissions: file.unattended_permissions.unwrap_or_default(),
         }
     }
 }
@@ -3070,6 +3102,7 @@ mod tests {
     #[test_case("spawn_per_minute" ; "spawn_per_minute")]
     #[test_case("default_timeout_secs" ; "default_timeout_secs")]
     #[test_case("max_timeout_secs" ; "max_timeout_secs")]
+    #[test_case("permission_timeout_secs" ; "permission_timeout_secs")]
     fn zero_rejected(key: &str) {
         let raw: RawConfig = toml::from_str(&format!("[agent.runs]\n{key} = 0\n")).unwrap();
         assert!(raw.into_config(&[]).unwrap().validate().is_err());

@@ -7,6 +7,7 @@ mod admit;
 pub mod agent;
 #[cfg(test)]
 mod agent_run;
+mod broker;
 pub mod clock;
 mod drive;
 pub mod inbox;
@@ -815,6 +816,10 @@ pub struct UnitHub {
     message_seq: AtomicU64,
     /// Delivery acks per sender. A leaf lock: nothing is taken under it.
     acks: Mutex<Acks>,
+    /// Whether a user is there to answer a run's permission prompt.
+    attended: AtomicBool,
+    /// Prompts waiting for an answer, over all runs.
+    prompts: Arc<AtomicUsize>,
 }
 
 /// Messages the ping-pong guard keeps per pair before it refuses more.
@@ -857,7 +862,15 @@ impl UnitHub {
             user: UnitId::new(),
             message_seq: AtomicU64::new(0),
             acks: Mutex::default(),
+            attended: AtomicBool::new(true),
+            prompts: Arc::default(),
         })
+    }
+
+    /// Frontends with no one to answer (`maki -p`) say so, and a run's prompt
+    /// then gets the `unattended_permissions` policy at once.
+    pub fn set_attended(&self, attended: bool) {
+        self.attended.store(attended, Ordering::Relaxed);
     }
 
     /// The root agent's identity; it owns the top-level runs.
@@ -1082,16 +1095,17 @@ impl UnitHub {
         });
         let agent_started = match (agent_spec, launch) {
             (Some(spec), Some(launch)) => {
+                let broker = broker::PermissionBroker::new(Arc::clone(&self.prompts));
                 let info = SubagentInfo {
                     parent_tool_use_id: handle.to_string(),
                     name: name.to_string(),
                     prompt: Some(spec.prompt.clone()),
                     model: Some(launch.model_spec.clone()),
                     opts: Some(launch.request_options()),
-                    answer_tx: None,
+                    answer_tx: Some(broker.sender()),
                     inbox: None,
                 };
-                let run = AgentRun::new(&self.cancel, info);
+                let run = AgentRun::new(&self.cancel, info, broker);
                 table.agents.insert(id, Arc::clone(&run));
                 Some((spec, launch, run))
             }
@@ -2457,6 +2471,7 @@ pub fn start_session(
     config: &maki_config::RunsConfig,
     events: EventSender,
     session: MakiId,
+    attended: bool,
 ) -> Option<RunsCtx> {
     config.enabled.then(|| {
         let dir = maki_storage::paths::runs_dir(&session.to_string())
@@ -2472,6 +2487,7 @@ pub fn start_session(
             Arc::new(SystemClock),
             shell,
         );
+        hub.set_attended(attended);
         let self_run = hub.main();
         RunsCtx { hub, self_run }
     })

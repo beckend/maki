@@ -710,6 +710,11 @@ pub enum AgentEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
     },
+    /// The prompt `id` no longer needs an answer (it timed out, or its run was
+    /// stopped), so a frontend takes it off the screen.
+    PermissionWithdrawn {
+        id: String,
+    },
     /// A `permission.prompt` layer allowed a call that would have prompted.
     /// The prompt is where the user learns what the agent is about to do, so
     /// a frontend marks the row instead. `id` is the closest row the user can

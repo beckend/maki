@@ -333,6 +333,7 @@ pub fn run(params: PrintParams) -> Result<()> {
             | AgentEvent::AuthRequired
             | AgentEvent::AllowedByPlugin { .. }
             | AgentEvent::PermissionRequest { .. }
+            | AgentEvent::PermissionWithdrawn { .. }
             | AgentEvent::SubagentHistory { .. }
             | AgentEvent::ToolSnapshot { .. }
             | AgentEvent::ToolHeaderSnapshot { .. }
