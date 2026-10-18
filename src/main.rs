@@ -19,9 +19,11 @@ const TELEMETRY_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
 fn main() {
     color_eyre::install().ok();
+    maki_agent::runs::install_signal_teardown();
     let result = cmd::dispatch(Cli::parse());
     // Detached export tasks die with the process; drain them here, before
     // the `exit` below skips every destructor.
+    maki_agent::runs::shutdown_all();
     maki_otel::shutdown(TELEMETRY_SHUTDOWN_TIMEOUT);
     if let Err(e) = result {
         print_error(&e);

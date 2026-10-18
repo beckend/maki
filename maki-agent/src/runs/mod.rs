@@ -6,6 +6,8 @@ pub mod clock;
 pub mod limits;
 pub mod notice;
 pub mod shell;
+#[cfg(unix)]
+mod signals;
 mod topology;
 
 use std::collections::HashMap;
@@ -1045,6 +1047,41 @@ impl UnitHub {
         }
     }
 }
+
+impl UnitHub {
+    /// Best-effort teardown for process exit: no new shell launches, SIGTERM to
+    /// every running shell group, then SIGKILL after a short bounded grace.
+    /// Idempotent, synchronous, needs no runtime; safe from a signal-handling
+    /// thread. Returns once the groups are signalled, not once they are reaped.
+    pub fn shutdown(&self) {
+        let pids = {
+            let table = self.units.lock().unwrap_or_else(|e| e.into_inner());
+            table
+                .shells
+                .values()
+                .filter_map(|run| run.mark_killed())
+                .collect::<Vec<_>>()
+        };
+        shell::shutdown_groups(&pids);
+    }
+}
+
+/// Tears down the shells of every hub in this process. Called on SIGTERM,
+/// SIGHUP, SIGINT, a panic on the main thread and normal exit.
+pub fn shutdown_all() {
+    shell::shutdown_all();
+}
+
+/// Makes SIGTERM, SIGHUP and SIGINT run [`shutdown_all`] and then die of that
+/// signal as before. The handler only writes a byte to a pipe; a thread does
+/// the work.
+#[cfg(unix)]
+pub fn install_signal_teardown() {
+    signals::install();
+}
+
+#[cfg(not(unix))]
+pub fn install_signal_teardown() {}
 
 impl Drop for UnitHub {
     /// No grace: nobody is left to wait for it.
