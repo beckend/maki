@@ -1613,7 +1613,17 @@ impl UnitHub {
             )
             .await;
             if cancelled {
-                self.table().pool.drop_run(id);
+                // The grant may have landed just before the cancel was seen:
+                // pass a slot dropped here on to the head of the line.
+                let mut table = self.table();
+                let held = table.pool.drop_run(id);
+                if held {
+                    table.promote(usize::from(self.limits.max_agents));
+                }
+                self.release(table);
+                if held {
+                    self.settled.notify(usize::MAX);
+                }
                 return false;
             }
         }
@@ -1628,7 +1638,15 @@ impl UnitHub {
             state,
             Some(UnitState::Queued | UnitState::Running | UnitState::Idle)
         ) {
-            table.pool.drop_run(id);
+            // A stopping run may still hold a slot: pass it on now.
+            let held = table.pool.drop_run(id);
+            if held {
+                table.promote(usize::from(self.limits.max_agents));
+            }
+            self.release(table);
+            if held {
+                self.settled.notify(usize::MAX);
+            }
             return Some(false);
         }
         if table.pool.holds(id) {
