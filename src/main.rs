@@ -37,9 +37,11 @@ impl Drop for ExitOnPanic {
 async fn main() {
     color_eyre::install().ok();
     let _exit = ExitOnPanic;
+    maki_agent::runs::install_signal_teardown();
     let result = cmd::dispatch(Cli::parse()).await;
     // Detached export tasks die with the process; drain them here, before
     // the `exit` below skips every destructor.
+    maki_agent::runs::shutdown_all();
     maki_otel::shutdown(TELEMETRY_SHUTDOWN_TIMEOUT);
     let code = match result {
         Ok(()) => 0,

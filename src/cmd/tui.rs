@@ -546,6 +546,7 @@ pub async fn run(mut cli: Cli) -> Result<()> {
                     "plugin host and teardown joined"
                 );
                 if code != 0 {
+                    maki_agent::runs::shutdown_all();
                     maki_otel::shutdown(crate::TELEMETRY_SHUTDOWN_TIMEOUT);
                     std::process::exit(code);
                 }
