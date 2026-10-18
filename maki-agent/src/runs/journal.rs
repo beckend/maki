@@ -10,7 +10,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use maki_storage::id::MakiId;
 use maki_storage::runs::{
     AckRec, MarkRec, MsgRec, NoticeRec, ProcRec, RunJournal, RunState, SpawnRec, StateRec, TermRec,
-    proc_info,
+    boot_stamp, proc_info, same_boot,
 };
 use maki_storage::runs::{JournalRecord, Replay};
 use serde_json::{Value, json};
@@ -117,6 +117,28 @@ fn ms_now() -> u64 {
     maki_storage::runs::system_now_ms()
 }
 
+/// Hubs with a journal, so process-wide teardown can settle and flush them.
+static HUBS: Mutex<Vec<std::sync::Weak<UnitHub>>> = Mutex::new(Vec::new());
+
+pub(super) fn register(hub: &Arc<UnitHub>) {
+    let mut hubs = HUBS.lock().unwrap_or_else(|e| e.into_inner());
+    hubs.retain(|w| w.strong_count() > 0);
+    hubs.push(Arc::downgrade(hub));
+}
+
+/// Settles and flushes the journal of every live hub (process exit, signals).
+pub(super) fn shutdown_hubs() {
+    let hubs: Vec<_> = HUBS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter_map(std::sync::Weak::upgrade)
+        .collect();
+    for hub in hubs {
+        hub.shutdown();
+    }
+}
+
 impl UnitHub {
     /// Starts journaling to `journal`. Done once, before the first spawn;
     /// without it the hub is memory-only.
@@ -137,18 +159,25 @@ impl UnitHub {
         }));
     }
 
-    /// A shell's group is running: enough to recognise and kill it after a
-    /// crash. Written as soon as the process exists.
-    pub(super) fn record_proc(&self, id: UnitId, pgid: u32) {
-        let Some(info) = proc_info(pgid) else { return };
-        let Some(handle) = self.table().units.get(&id).map(|u| u.handle.to_string()) else {
+    /// A shell's group exists: enough to recognise and kill it after a
+    /// crash. Written and fsynced before this returns, and the shell has not
+    /// started running its command yet (see `shell::start_gate`).
+    pub(super) fn record_proc(&self, handle: &str, pgid: u32) {
+        let Some(journal) = self.journal.get() else {
             return;
         };
-        self.jot(JournalRecord::Proc(ProcRec {
-            handle,
+        let Some(info) = proc_info(pgid) else { return };
+        journal.append(JournalRecord::Proc(ProcRec {
+            handle: handle.to_owned(),
             pgid,
             start_ticks: info.start_ticks,
+            boot: boot_stamp(),
         }));
+        journal.flush();
+    }
+
+    pub(super) fn handle_of(&self, id: UnitId) -> Option<UnitHandle> {
+        self.table().units.get(&id).map(|u| u.handle.clone())
     }
 
     pub(super) fn jot_ack(
@@ -169,6 +198,19 @@ impl UnitHub {
     /// Whether the journal gave up after a write error.
     pub fn journal_degraded(&self) -> bool {
         self.journal.get().is_some_and(|j| j.degraded())
+    }
+
+    /// Shells that were running when this process ended them: final, so the
+    /// next start does not call them lost.
+    pub(super) fn journal_shells_killed(&self, handles: &[String]) {
+        for handle in handles {
+            self.jot(JournalRecord::Term(TermRec {
+                handle: handle.clone(),
+                reason: DoneReason::Killed.as_str().to_owned(),
+                detail: Some("session ended".to_owned()),
+                ..TermRec::default()
+            }));
+        }
     }
 
     /// Writes the clean-shutdown mark and waits for the file to catch up.
@@ -257,12 +299,16 @@ impl UnitHub {
                 ("session ended", None)
             };
         };
-        match proc_info(proc.pgid) {
-            Some(info) if info.start_ticks == proc.start_ticks && info.pgrp == proc.pgid => {
-                kill_orphan(proc.pgid, proc.start_ticks, self.shell.grace);
-                ("orphan killed", Some(proc.pgid))
-            }
-            _ => ("process gone", None),
+        // Start ticks count from boot, so a record from another boot or pid
+        // namespace says nothing about the process at that pid: never signal.
+        if proc.pgid == 0 || !same_boot(&proc.boot) {
+            return ("process gone", None);
+        }
+        if still_the_leader(proc) {
+            kill_orphan(proc.pgid, proc.start_ticks, self.shell.grace);
+            ("orphan killed", Some(proc.pgid))
+        } else {
+            ("process gone", None)
         }
     }
 
@@ -462,10 +508,28 @@ fn restore_lost(run: &RunState, detail: &str) -> Option<Unit> {
     })
 }
 
+/// The pid still belongs to the recorded process and that process leads its
+/// own group. A group whose leader is gone is not touched, even if members
+/// remain: without the leader nothing proves the group is still the one that
+/// was recorded.
+fn still_the_leader(proc: &ProcRec) -> bool {
+    proc_info(proc.pgid).is_some_and(|i| i.start_ticks == proc.start_ticks && i.pgrp == proc.pgid)
+}
+
 /// SIGTERM the group, then SIGKILL after `grace` if the same process is still
 /// there. Runs on its own thread so starting a session never waits on it.
 #[cfg(unix)]
 fn kill_orphan(pgid: u32, start_ticks: u64, grace: Duration) {
+    // Re-read right before the signal, so the window in which the pid could
+    // change hands is the few microseconds between this read and the syscall.
+    let again = ProcRec {
+        pgid,
+        start_ticks,
+        ..ProcRec::default()
+    };
+    if !still_the_leader(&again) {
+        return;
+    }
     shell::term_group(pgid);
     let _ = std::thread::Builder::new()
         .name("maki-orphan".into())
@@ -475,7 +539,11 @@ fn kill_orphan(pgid: u32, start_ticks: u64, grace: Duration) {
                 std::thread::sleep(Duration::from_millis(50));
             }
             // The pid may have been reused in the meantime: check again.
-            if proc_info(pgid).is_some_and(|i| i.start_ticks == start_ticks) {
+            // After our TERM: the leader may be gone with members left. While
+            // any member lives the pid cannot be handed out again, so a dead
+            // leader and a live group is still the recorded group.
+            let leader_gone = proc_info(pgid).is_none() && shell::group_exists(pgid);
+            if leader_gone || still_the_leader(&again) {
                 crate::child_guard::sigkill_process_group(pgid);
             }
         });
@@ -663,6 +731,7 @@ mod tests {
                 handle: handle.into(),
                 pgid: c.id(),
                 start_ticks: ticks(c) + skew,
+                boot: boot_stamp(),
             })
         };
         crashed_journal(
@@ -708,6 +777,7 @@ mod tests {
                     handle: "sh-aaaaaa".into(),
                     pgid: child.id(),
                     start_ticks: proc_info(child.id()).unwrap().start_ticks,
+                    boot: boot_stamp(),
                 }),
             ],
         );
@@ -716,6 +786,102 @@ mod tests {
         assert!(child.try_wait().unwrap().is_none());
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    #[test]
+    fn a_record_from_another_boot_never_kills() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = sleeper();
+        let (pid, ticks) = (child.id(), proc_info(child.id()).unwrap().start_ticks);
+        let proc = |boot: &str| {
+            JournalRecord::Proc(ProcRec {
+                handle: "sh-aaaaaa".into(),
+                pgid: pid,
+                start_ticks: ticks,
+                boot: boot.into(),
+            })
+        };
+        // Same pid, same start ticks, but another boot, another pid
+        // namespace, or no stamp at all.
+        let stamp = boot_stamp();
+        let (boot_id, ns) = stamp.split_once('/').unwrap();
+        for (n, boot) in [
+            format!("{}/{ns}", "00000000-0000-0000-0000-000000000000"),
+            format!("{boot_id}/pid:[1]"),
+            String::new(),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let d = dir.path().join(n.to_string());
+            crashed_journal(
+                &d,
+                vec![spawn_rec("sh-aaaaaa", "shell", "wake"), proc(&boot)],
+            );
+            let hub = hub_with(&d);
+            let report = hub.reconcile();
+            assert!(report.orphans_killed.is_empty(), "{boot}");
+            assert!(child.try_wait().unwrap().is_none(), "{boot}");
+            assert_eq!(report.lost.len(), 1);
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn a_shell_is_recorded_before_it_runs_its_command() {
+        // The command writes a marker; the journal must already know the
+        // process when the marker appears.
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("marker");
+        let hub = hub_with(&dir.path().join("j"));
+        let req: SpawnRequest = serde_json::from_value(json!({
+            "kind": "shell", "description": "gate",
+            "command": format!("touch {}; sleep 1", marker.display())
+        }))
+        .unwrap();
+        let journal = Arc::clone(hub.journal.get().unwrap());
+        hub.spawn(hub.main(), req).unwrap();
+        until("marker", || marker.exists());
+        // Read the file directly: no flush may be what makes it durable.
+        let on_disk = Replay::read(journal.dir());
+        assert!(
+            on_disk.runs[0].proc.is_some(),
+            "proc record came after exec"
+        );
+        hub.shutdown();
+    }
+
+    #[test]
+    fn clean_shutdown_with_a_running_shell_reports_nothing_lost() {
+        let dir = tempfile::tempdir().unwrap();
+        let hub = hub_with(dir.path());
+        let req: SpawnRequest = serde_json::from_value(json!({
+            "kind": "shell", "description": "sleeper", "command": "sleep 300"
+        }))
+        .unwrap();
+        hub.spawn(hub.main(), req).unwrap();
+        let journal = Arc::clone(hub.journal.get().unwrap());
+        until("proc record", || {
+            journal.replay().runs.iter().any(|r| r.proc.is_some())
+        });
+        let pgid = journal.replay().runs[0].proc.as_ref().unwrap().pgid;
+        hub.shutdown();
+        let replay = Replay::read(journal.dir());
+        assert!(replay.clean_mark);
+        assert!(replay.runs[0].term.is_some(), "{:?}", replay.runs[0]);
+        until("group gone", || !shell::group_exists(pgid));
+        drop(journal);
+        drop(hub);
+        let again = hub_with(dir.path());
+        let report = again.reconcile();
+        assert!(report.lost.is_empty(), "{report:?}");
+        assert!(
+            again
+                .pending_notices(again.main())
+                .iter()
+                .all(|n| n.kind != NoticeKind::Lost)
+        );
     }
 
     #[test]

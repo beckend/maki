@@ -18,7 +18,7 @@
 
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufWriter, Write};
+use std::io::{self, BufRead, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
@@ -40,8 +40,12 @@ pub const MESSAGES_FILE: &str = "messages.ndjson";
 const LOCK_FILE: &str = "journal.lock";
 pub const COMPACT_THRESHOLD: u64 = 4 * 1024 * 1024;
 pub const FLUSH_INTERVAL: Duration = Duration::from_millis(250);
+/// How long a critical record waits for queue room before it is dropped.
+const CRITICAL_WAIT: Duration = Duration::from_secs(5);
 pub const QUEUE_CAP: usize = 4096;
 pub const MAX_BODY: usize = 16 * 1024;
+/// A journal line longer than this is corrupt: records are a few hundred bytes.
+pub const MAX_LINE: usize = 1024 * 1024;
 /// Terminal runs older than this are dropped at compaction.
 pub const RETAIN_TERMINAL_MS: u64 = 24 * 3600 * 1000;
 /// Past this multiple of the threshold even after compaction, only critical
@@ -162,6 +166,10 @@ pub struct ProcRec {
     pub handle: String,
     pub pgid: u32,
     pub start_ticks: u64,
+    /// [`boot_stamp`] of the machine and pid namespace that ran it. Start
+    /// ticks only mean something within one boot and one pid namespace, so a
+    /// record with another or no stamp never matches a process.
+    pub boot: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -234,8 +242,10 @@ pub struct Replay {
 
 impl Replay {
     pub fn read(dir: &Path) -> Self {
-        let bytes = fs::read(dir.join(JOURNAL_FILE)).unwrap_or_default();
-        let mut replay = Self::parse(&bytes);
+        let mut replay = match File::open(dir.join(JOURNAL_FILE)) {
+            Ok(file) => Self::parse_reader(io::BufReader::new(file)),
+            Err(_) => Self::default(),
+        };
         let bodies = read_bodies(dir);
         for m in &mut replay.messages {
             m.rec.body = bodies.get(&m.rec.id).cloned();
@@ -244,24 +254,34 @@ impl Replay {
     }
 
     pub fn parse(bytes: &[u8]) -> Self {
+        Self::parse_reader(bytes)
+    }
+
+    /// Streams the journal line by line. A line longer than [`MAX_LINE`] is
+    /// skipped without being held, so a corrupt file cannot exhaust memory.
+    pub fn parse_reader(reader: impl BufRead) -> Self {
         let mut replay = Self::default();
-        let text = String::from_utf8_lossy(bytes);
-        let ends_clean = text.ends_with('\n');
-        let lines: Vec<&str> = text.lines().collect();
-        for (n, line) in lines.iter().enumerate() {
+        let mut n = 0;
+        for_each_line(reader, |line, torn_tail| {
+            n += 1;
+            let Some(line) = line else {
+                warn!(line = n, "skipping oversized journal line");
+                replay.corrupt += 1;
+                return;
+            };
+            let line = String::from_utf8_lossy(line);
             if line.trim().is_empty() {
-                continue;
+                return;
             }
-            let torn_tail = n + 1 == lines.len() && !ends_clean;
-            match serde_json::from_str::<Value>(line) {
+            match serde_json::from_str::<Value>(&line) {
                 Err(_) if torn_tail => {}
                 Err(e) => {
-                    warn!(line = n + 1, %e, "skipping corrupt journal line");
+                    warn!(line = n, %e, "skipping corrupt journal line");
                     replay.corrupt += 1;
                 }
                 Ok(value) => replay.apply_value(value),
             }
-        }
+        });
         replay
     }
 
@@ -413,18 +433,71 @@ impl Replay {
     }
 }
 
-/// Message bodies by id; a torn or corrupt line is skipped.
+/// Calls `f(line, torn_tail)` for every line without its newline; `line` is
+/// `None` for one longer than [`MAX_LINE`], which is consumed but not kept.
+/// `torn_tail` marks a last line with no newline.
+fn for_each_line(mut reader: impl BufRead, mut f: impl FnMut(Option<&[u8]>, bool)) {
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        let got = match reader
+            .by_ref()
+            .take(MAX_LINE as u64 + 1)
+            .read_until(b'\n', &mut buf)
+        {
+            Ok(0) | Err(_) => return,
+            Ok(n) => n,
+        };
+        let newline = buf.last() == Some(&b'\n');
+        if newline {
+            buf.pop();
+        } else if got > MAX_LINE {
+            // Skip the rest of the oversized line.
+            let mut ended = false;
+            loop {
+                let (used, hit) = match reader.fill_buf() {
+                    Ok([]) | Err(_) => break,
+                    Ok(chunk) => match chunk.iter().position(|&b| b == b'\n') {
+                        Some(i) => (i + 1, true),
+                        None => (chunk.len(), false),
+                    },
+                };
+                reader.consume(used);
+                if hit {
+                    ended = true;
+                    break;
+                }
+            }
+            f(None, !ended);
+            if !ended {
+                return;
+            }
+            continue;
+        }
+        f(Some(&buf), !newline);
+        if !newline {
+            return;
+        }
+    }
+}
+
+/// Message bodies by id; a torn, corrupt or oversized line is skipped.
 pub fn read_bodies(dir: &Path) -> HashMap<String, String> {
     #[derive(Deserialize)]
     struct Line {
         id: String,
         body: String,
     }
-    let text = fs::read_to_string(dir.join(MESSAGES_FILE)).unwrap_or_default();
-    text.lines()
-        .filter_map(|l| serde_json::from_str::<Line>(l).ok())
-        .map(|l| (l.id, l.body))
-        .collect()
+    let mut out = HashMap::new();
+    let Ok(file) = File::open(dir.join(MESSAGES_FILE)) else {
+        return out;
+    };
+    for_each_line(io::BufReader::new(file), |line, _| {
+        if let Some(l) = line.and_then(|l| serde_json::from_slice::<Line>(l).ok()) {
+            out.insert(l.id, l.body);
+        }
+    });
+    out
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -479,6 +552,9 @@ impl RunJournal {
     /// starts the writer. `Locked` when another process has it.
     pub fn open_in(dir: PathBuf, opts: JournalOptions) -> Result<Self, JournalError> {
         crate::paths::create_private_dir(&dir)?;
+        if fs::symlink_metadata(&dir)?.file_type().is_symlink() {
+            return Err(io::Error::other("run directory is a symlink").into());
+        }
         let lock = Lock::acquire(&dir.join(LOCK_FILE)).map_err(|e| match e {
             LockError::Held { .. } => JournalError::Locked,
             LockError::Io { source, .. } => JournalError::Io(source),
@@ -551,9 +627,32 @@ impl RunJournal {
             ts: (self.now)(),
             rec,
         };
-        if tx.try_send(Cmd::Rec(Box::new(entry))).is_err() {
-            self.dropped.fetch_add(1, Ordering::Relaxed);
+        if !entry.rec.critical() {
+            if tx.try_send(Cmd::Rec(Box::new(entry))).is_err() {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+            }
+            return;
         }
+        // A lost `spawn`, `term`, `proc` or `mark` would make a finished run
+        // look unfinished or hide a shell, so these wait for room (the writer
+        // drains in milliseconds) and give up only after a long stall.
+        let mut cmd = Cmd::Rec(Box::new(entry));
+        let deadline = std::time::Instant::now() + CRITICAL_WAIT;
+        loop {
+            match tx.try_send(cmd) {
+                Ok(()) => return,
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => break,
+                Err(std::sync::mpsc::TrySendError::Full(back)) => {
+                    if std::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    cmd = back;
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            }
+        }
+        self.dropped.fetch_add(1, Ordering::Relaxed);
+        warn!("run journal queue stalled, a critical record was dropped");
     }
 
     /// Blocks until everything appended so far is on disk (shutdown and tests).
@@ -600,8 +699,33 @@ fn private_options() -> OpenOptions {
     let mut o = OpenOptions::new();
     o.create(true).append(true);
     #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
     o
+}
+
+/// Where a torn last line starts, `None` when the file ends with a newline.
+/// Reads the tail backwards, never the whole file.
+fn torn_tail_start(path: &Path) -> io::Result<Option<u64>> {
+    use std::io::{Seek, SeekFrom};
+    let mut file = File::open(path)?;
+    let len = file.metadata()?.len();
+    let mut end = len;
+    let mut chunk = vec![0u8; 64 * 1024];
+    while end > 0 {
+        let start = end.saturating_sub(chunk.len() as u64);
+        let part = &mut chunk[..(end - start) as usize];
+        file.seek(SeekFrom::Start(start))?;
+        file.read_exact(part)?;
+        if let Some(i) = part.iter().rposition(|&b| b == b'\n') {
+            let keep = start + i as u64 + 1;
+            return Ok((keep < len).then_some(keep));
+        }
+        end = start;
+    }
+    Ok((len > 0).then_some(0))
 }
 
 fn encode(entry: &Entry) -> Vec<u8> {
@@ -632,15 +756,9 @@ impl Writer {
         } else {
             // A torn last line goes: left in place it would turn into a corrupt
             // line once the next record follows it.
-            let bytes = fs::read(&path)?;
-            if let Some(last) = bytes.iter().rposition(|&b| b == b'\n')
-                && last + 1 < bytes.len()
-            {
-                OpenOptions::new()
-                    .write(true)
-                    .open(&path)?
-                    .set_len(last as u64 + 1)?;
-                self.size = last as u64 + 1;
+            if let Some(keep) = torn_tail_start(&path)? {
+                OpenOptions::new().write(true).open(&path)?.set_len(keep)?;
+                self.size = keep;
             }
         }
         self.file = Some(file);
@@ -806,6 +924,24 @@ pub struct ProcInfo {
     pub start_ticks: u64,
     /// Process group id, field 5.
     pub pgrp: u32,
+}
+
+/// Identifies the boot and the pid namespace this process sees: the kernel's
+/// boot id plus the `pid` namespace link. Empty when `/proc` cannot say, and
+/// an empty stamp never matches anything.
+pub fn boot_stamp() -> String {
+    let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap_or_default();
+    let ns = fs::read_link("/proc/self/ns/pid").unwrap_or_default();
+    let boot = boot.trim();
+    if boot.is_empty() {
+        return String::new();
+    }
+    format!("{boot}/{}", ns.display())
+}
+
+/// Whether `stamp` is this boot and namespace.
+pub fn same_boot(stamp: &str) -> bool {
+    !stamp.is_empty() && stamp == boot_stamp()
 }
 
 /// `None` when the process is gone or the platform has no `/proc`.
@@ -1049,6 +1185,7 @@ mod tests {
             handle: "sh-1".into(),
             pgid: 7,
             start_ticks: 99,
+            boot: "b".into(),
         }));
         j.append(term("ag-1", "completed"));
         j.append(JournalRecord::Notice(NoticeRec {
@@ -1100,5 +1237,180 @@ mod tests {
         let stat = "123 (we ird) name) S 1 456 456 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 987654 0 0";
         let info = parse_stat(stat).unwrap();
         assert_eq!((info.pgrp, info.start_ticks), (456, 987654));
+    }
+
+    fn sample_journal() -> Vec<u8> {
+        let dir = tempfile::tempdir().unwrap();
+        let j = open(dir.path());
+        for i in 0..6 {
+            j.append(spawn(&format!("ag-{i}")));
+            j.append(JournalRecord::State(StateRec {
+                handle: format!("ag-{i}"),
+                state: "idle".into(),
+            }));
+            j.append(JournalRecord::Proc(ProcRec {
+                handle: format!("ag-{i}"),
+                pgid: 7,
+                start_ticks: 9,
+                boot: "b".into(),
+            }));
+        }
+        j.append(term("ag-1", "completed"));
+        j.flush();
+        drop(j);
+        fs::read(dir.path().join(JOURNAL_FILE)).unwrap()
+    }
+
+    #[test]
+    fn random_corruption_never_panics() {
+        let base = sample_journal();
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..2000 {
+            let mut bytes = base.clone();
+            for _ in 0..1 + next() % 8 {
+                if bytes.len() < 2 {
+                    break;
+                }
+                let at = (next() % bytes.len() as u64) as usize;
+                match next() % 4 {
+                    0 => bytes[at] ^= 1 << (next() % 8),
+                    1 => bytes[at] = next() as u8,
+                    2 => {
+                        bytes.remove(at);
+                    }
+                    _ => bytes.truncate(at.max(1)),
+                }
+            }
+            let r = Replay::parse(&bytes);
+            // Whatever survived still compacts and round-trips.
+            let _ = r.compacted(1);
+        }
+    }
+
+    #[test]
+    fn a_huge_line_is_skipped_without_being_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(JOURNAL_FILE);
+        let mut f = File::create(&path).unwrap();
+        f.write_all(b"{\"v\":1,\"t\":\"hdr\"}\n").unwrap();
+        let chunk = vec![b'a'; 1 << 20];
+        for _ in 0..100 {
+            f.write_all(&chunk).unwrap();
+        }
+        f.write_all(b"\n{\"v\":1,\"t\":\"spawn\",\"handle\":\"ag-1\"}\n")
+            .unwrap();
+        // A second one with no newline at all: torn tail of 100 MB.
+        for _ in 0..100 {
+            f.write_all(&chunk).unwrap();
+        }
+        drop(f);
+        let r = Replay::read(dir.path());
+        assert_eq!(r.runs.len(), 1);
+        assert!(r.corrupt >= 1);
+        // The writer cuts the torn 100 MB tail instead of reading it in.
+        let j = open(dir.path());
+        j.append(spawn("ag-2"));
+        let r = j.replay();
+        assert_eq!(r.runs.len(), 2);
+        assert!(fs::metadata(&path).unwrap().len() < 4096 + (101 << 20));
+    }
+
+    #[test]
+    fn terminal_is_final_and_unknown_handles_are_ignored() {
+        let text = [
+            r#"{"v":1,"t":"state","handle":"ghost","state":"running"}"#,
+            r#"{"v":1,"t":"term","handle":"ghost","reason":"completed"}"#,
+            r#"{"v":1,"t":"proc","handle":"ghost","pgid":5}"#,
+            r#"{"v":1,"t":"spawn","handle":"ag-1"}"#,
+            r#"{"v":1,"t":"spawn","handle":"ag-1","name":"dup"}"#,
+            r#"{"v":1,"t":"term","handle":"ag-1","reason":"failed"}"#,
+            r#"{"v":1,"t":"state","handle":"ag-1","state":"running"}"#,
+            r#"{"v":1,"t":"term","handle":"ag-1","reason":"completed"}"#,
+        ]
+        .join("\n")
+            + "\n";
+        let r = Replay::parse(text.as_bytes());
+        assert_eq!(r.runs.len(), 1);
+        assert_eq!(r.runs[0].state, "failed");
+        assert!(r.runs[0].term.is_some());
+        assert_eq!(r.runs[0].spawn.name, "");
+    }
+
+    #[test]
+    fn newer_journal_is_read_only_and_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(JOURNAL_FILE);
+        let text = "{\"v\":2,\"t\":\"hdr\"}\n{\"v\":2,\"t\":\"spawn\",\"handle\":\"ag-1\"}\n";
+        fs::write(&path, text).unwrap();
+        let j = open(dir.path());
+        assert!(j.read_only());
+        j.append(spawn("ag-2"));
+        j.append(term("ag-2", "completed"));
+        j.flush();
+        drop(j);
+        assert_eq!(fs::read_to_string(&path).unwrap(), text);
+    }
+
+    #[test]
+    fn critical_records_survive_a_flood() {
+        let dir = tempfile::tempdir().unwrap();
+        let j = Arc::new(open(dir.path()));
+        let flood = {
+            let j = Arc::clone(&j);
+            std::thread::spawn(move || {
+                for i in 0..30_000 {
+                    j.append(JournalRecord::State(StateRec {
+                        handle: format!("x-{i}"),
+                        state: "idle".into(),
+                    }));
+                }
+            })
+        };
+        for i in 0..50 {
+            j.append(spawn(&format!("ag-{i}")));
+            j.append(term(&format!("ag-{i}"), "completed"));
+        }
+        flood.join().unwrap();
+        let r = j.replay();
+        assert_eq!(r.runs.len(), 50);
+        assert!(r.runs.iter().all(|r| r.term.is_some()));
+    }
+
+    #[test]
+    fn a_symlinked_run_dir_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        fs::create_dir(&real).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(RunJournal::open_in(link, JournalOptions::default()).is_err());
+        assert!(!real.join(JOURNAL_FILE).exists());
+    }
+
+    #[test]
+    fn a_symlinked_journal_file_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        fs::write(&target, "").unwrap();
+        let run = dir.path().join("run");
+        fs::create_dir(&run).unwrap();
+        std::os::unix::fs::symlink(&target, run.join(JOURNAL_FILE)).unwrap();
+        assert!(RunJournal::open_in(run, JournalOptions::default()).is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"");
+    }
+
+    #[test]
+    fn boot_stamp_is_stable_and_checked() {
+        let a = boot_stamp();
+        assert!(!a.is_empty());
+        assert!(same_boot(&a));
+        assert!(!same_boot(""));
+        assert!(!same_boot("other/pid:[4026531836]"));
     }
 }
