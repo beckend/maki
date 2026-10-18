@@ -452,6 +452,14 @@ impl Driver {
         self.hub.upgrade()
     }
 
+    /// Holds an agent slot for the turn about to start.
+    async fn slot(&self) -> bool {
+        match self.hub() {
+            Some(hub) => hub.acquire(self.id, &self.run.token, false).await,
+            None => false,
+        }
+    }
+
     async fn drive(self, spec: AgentSpec, launch: AgentLaunch) {
         let mut history = History::new(
             launch
@@ -469,6 +477,12 @@ impl Driver {
     }
 
     async fn drive_loop(&self, spec: AgentSpec, launch: AgentLaunch, history: &mut History) {
+        // The clock starts when the run gets to work, not while it queues.
+        if !self.slot().await {
+            self.finish(UnitDone::Killed, None, UnitResult::default())
+                .await;
+            return;
+        }
         let deadline = self.clock.now() + Duration::from_secs(spec.timeout_secs);
         let mut gauge = ContextGauge::default();
         let (tx, rx) = flume::unbounded::<Envelope>();
@@ -485,6 +499,12 @@ impl Driver {
             message.push_str(&inbox::frame(&first, None));
         }
         loop {
+            // A no-op while the slot is held; after an idle wake it queues.
+            if !self.slot().await {
+                self.finish(UnitDone::Killed, None, UnitResult::default())
+                    .await;
+                return;
+            }
             let mut nudges = 0;
             let (verdict, mut result) = loop {
                 let end = self

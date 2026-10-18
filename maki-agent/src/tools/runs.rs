@@ -54,7 +54,10 @@ subagent: a separate agent with its own context that works on a self-contained t
 reports back. kind \"shell\" starts a command that keeps running while you continue. You
 are notified when a run finishes; do not poll or sleep. Start independent runs together
 in one message. Use `wait` only when you are blocked on a result, `send` to talk to a
-run, `stop` to end it, `runs` to look. Not available to agents at the maximum depth: you
+run, `stop` to end it, `runs` to look. Only a limited number of agents work at once;
+the rest show as queued with a position and start in order. A full queue returns
+QUEUE_FULL: wait for runs to finish. A timeout_secs above the session maximum is
+lowered to it, and an agent's clock starts when it starts working. Not available to agents at the maximum depth: you
 get DEPTH_LIMIT and must do the work yourself.
 
 Agent runs do not see this conversation, so the prompt must contain everything they
@@ -673,11 +676,13 @@ fn list_or_show(
             v.handle,
             v.name,
             v.kind.as_str(),
-            v.state.label(),
+            v.state_label(),
             compact_duration(v.age_secs),
             v.cost,
         );
     }
+    let (used, max) = runs.hub.session_usage();
+    let _ = write!(out, "\nsession: {used} of {max} runs started");
     out.truncate(out.trim_end().len());
     Ok(out)
 }
@@ -743,7 +748,7 @@ fn record(v: &UnitView) -> String {
         v.handle,
         v.name,
         v.kind.as_str(),
-        v.state.label(),
+        v.state_label(),
         v.description,
         compact_duration(v.age_secs),
     );
