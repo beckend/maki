@@ -94,6 +94,11 @@ impl UnitHub {
         self.clock.now() + timeout
     }
 
+    /// Whether `deadline` (from [`Self::deadline_after`]) has passed.
+    pub fn deadline_passed(&self, deadline: Instant) -> bool {
+        self.clock.now() >= deadline
+    }
+
     /// [`Self::join_until`] with the bound counted from now.
     pub async fn join(self: &Arc<Self>, timeout: Duration) -> Joined {
         self.join_until(self.clock.now() + timeout).await
@@ -399,5 +404,90 @@ mod headless {
             }
             assert_eq!(hub.join_until(deadline).await, Joined::Quiet);
         });
+    }
+
+    /// A notice that settles while a turn is in flight must not start a
+    /// second one; it wakes `main` once that turn is over, and `join` stays
+    /// open across the whole window.
+    #[test]
+    fn notice_at_turn_end_is_not_lost_or_doubled() {
+        smol::block_on(async {
+            let rig = rig(true);
+            let id = agent(&rig);
+            rig.hub.main_turn_begins();
+            let deadline = rig.hub.deadline_after(BOUND);
+            let hub = Arc::clone(&rig.hub);
+            let mut join = pin!(hub.join_until(deadline));
+            finish(&rig, id);
+            // Let `drive_main` run: it must see the open turn and stay quiet.
+            for _ in 0..8 {
+                smol::future::yield_now().await;
+            }
+            assert!(rig.wakes.try_recv().is_err(), "no wake during a turn");
+            assert!(poll_once(&mut join).await.is_none());
+            rig.hub.main_turn_ends();
+            wake(&rig).await;
+            assert!(poll_once(&mut join).await.is_none(), "claimed wake is work");
+            for _ in 0..8 {
+                smol::future::yield_now().await;
+            }
+            assert!(rig.wakes.try_recv().is_err(), "one wake, not two");
+            let text = run_turn(&rig);
+            assert!(text.contains("<run-notice"), "{text}");
+            assert_eq!(join.await, Joined::Quiet);
+        });
+    }
+
+    /// A notice that lands while a closing turn runs (turn opened by the
+    /// caller, not by `drive_main`) is delivered by a wake after it.
+    #[test]
+    fn notice_during_closing_turn_wakes_after_it() {
+        smol::block_on(async {
+            let rig = rig(true);
+            let id = agent(&rig);
+            rig.hub.main_turn_begins();
+            finish(&rig, id);
+            for _ in 0..8 {
+                smol::future::yield_now().await;
+            }
+            assert!(rig.wakes.try_recv().is_err());
+            let text = rig.hub.main_inbox.drain_step();
+            assert_eq!(text.len(), 1, "the turn reads the notice");
+            let late = agent(&rig);
+            finish(&rig, late);
+            rig.hub.main_turn_ends();
+            wake(&rig).await;
+            let text = run_turn(&rig);
+            assert!(text.contains("<run-notice"), "{text}");
+            let deadline = rig.hub.deadline_after(BOUND);
+            assert_eq!(rig.hub.join_until(deadline).await, Joined::Quiet);
+        });
+    }
+
+    /// A notice counted as in flight (taken out of the pending list, not yet
+    /// in an inbox) keeps `join` from calling the hub quiet.
+    #[test]
+    fn join_waits_for_notice_in_flight() {
+        smol::block_on(async {
+            let rig = rig(false);
+            let hub = Arc::clone(&rig.hub);
+            hub.notices_in_flight.fetch_add(1, Ordering::SeqCst);
+            let deadline = hub.deadline_after(BOUND);
+            let mut join = pin!(hub.join_until(deadline));
+            assert!(poll_once(&mut join).await.is_none());
+            hub.notices_in_flight.fetch_sub(1, Ordering::SeqCst);
+            hub.settled.notify(usize::MAX);
+            assert_eq!(join.await, Joined::Quiet);
+        });
+    }
+
+    /// `headless` uses it to stop preferring wakes once the bound passed.
+    #[test]
+    fn deadline_passed_follows_the_clock() {
+        let rig = rig(false);
+        let deadline = rig.hub.deadline_after(Duration::from_secs(5));
+        assert!(!rig.hub.deadline_passed(deadline));
+        rig.clock.advance(Duration::from_secs(5));
+        assert!(rig.hub.deadline_passed(deadline));
     }
 }
