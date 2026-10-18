@@ -107,6 +107,10 @@ pub(super) struct ShellRun {
     /// under this lock, so teardown either stops the launch or sees the pid.
     killed: Mutex<bool>,
     stop_event: Event,
+    /// Set when the supervisor gives up waiting for the output pipe to close
+    /// (an orphan kept it open): the pump flushes what it holds and ends.
+    drain_over: AtomicBool,
+    drain_event: Event,
 }
 
 impl ShellRun {
@@ -118,7 +122,24 @@ impl ShellRun {
             stop: AtomicBool::new(false),
             killed: Mutex::new(false),
             stop_event: Event::new(),
+            drain_over: AtomicBool::new(false),
+            drain_event: Event::new(),
         })
+    }
+
+    fn abandon_drain(&self) {
+        self.drain_over.store(true, Ordering::Release);
+        self.drain_event.notify(usize::MAX);
+    }
+
+    async fn drain_abandoned(&self) {
+        loop {
+            let listener = self.drain_event.listen();
+            if self.drain_over.load(Ordering::Acquire) {
+                return;
+            }
+            listener.await;
+        }
     }
 
     fn out(&self) -> MutexGuard<'_, Output> {
@@ -385,11 +406,18 @@ async fn supervise(
     crate::child_guard::sigkill_process_group(pid);
     run.pid.store(0, Ordering::Release);
     live_groups().remove(&pid);
-    tokio::select! {
+    let drained = tokio::select! {
         biased;
-        _ = &mut pump => {}
-        _ = clock.sleep_until(clock.now() + DRAIN_GRACE) => {}
+        _ = &mut pump => true,
+        _ = clock.sleep_until(clock.now() + DRAIN_GRACE) => false,
+    };
+    if !drained {
+        // An orphan outside the group still holds the pipe. Let the pump flush
+        // the watch lines it holds (they would die with the dropped task).
+        run.abandon_drain();
+        let _ = pump.await;
     }
+
     let mut terminal = terminal;
     terminal.result.summary = run.summary();
     terminal.result.elapsed_ms = elapsed_ms();
@@ -817,6 +845,7 @@ async fn pump(
     enum Step {
         Read(io::Result<(usize, Vec<u8>)>),
         Tick,
+        Abandon,
     }
     // The pipe is a blocking one, so a thread reads it and hands the chunks
     // over; the watch's deadline is waited on here, beside the read.
@@ -847,22 +876,33 @@ async fn pump(
         let due = watch
             .as_ref()
             .and_then(|w| Some((w.deadline()?, Arc::clone(&w.clock))));
-        let step = match due {
-            Some((at, clock)) => {
-                tokio::select! {
-                    biased;
-                    got = rx.recv_async() => Step::Read(
-                        got.unwrap_or(Err(io::Error::other("the reader stopped"))),
-                    ),
-                    _ = clock.sleep_until(at) => Step::Tick,
+        let tick = async {
+            match due {
+                Some((at, clock)) => {
+                    clock.sleep_until(at).await;
+                    Step::Tick
                 }
+                None => std::future::pending().await,
             }
-            None => Step::Read(
+        };
+        let read = async {
+            Step::Read(
                 rx.recv_async()
                     .await
                     .unwrap_or(Err(io::Error::other("the reader stopped"))),
-            ),
+            )
         };
+        let abandon = async {
+            run.drain_abandoned().await;
+            Step::Abandon
+        };
+        let step = tokio::select! {
+            biased;
+            s = abandon => s,
+            s = tick => s,
+            s = read => s,
+        };
+
         let (n, data) = match step {
             Step::Tick => {
                 if let Some(w) = &mut watch {
@@ -877,7 +917,7 @@ async fn pump(
                 reader_task.abort();
                 return;
             }
-            Step::Read(Err(_)) => {
+            Step::Read(Err(_)) | Step::Abandon => {
                 if let Some(w) = &mut watch {
                     w.finish();
                 }
