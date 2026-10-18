@@ -348,8 +348,7 @@ impl ToolInvocation for LuaToolInvocation {
                 if sent.is_err() {
                     return HeaderResult::plain(fallback);
                 }
-                reply_rx
-                    .recv_async()
+                crate::runtime::recv_reply_async(&reply_rx, &tx)
                     .await
                     .unwrap_or_else(|_| HeaderResult::plain(fallback))
             }),
@@ -397,7 +396,7 @@ impl ToolInvocation for LuaToolInvocation {
         let tx = self.tx.clone();
         Box::pin(async move {
             if tx.send_async(req).await.is_ok() {
-                let _ = reply_rx.recv_async().await;
+                let _ = crate::runtime::recv_reply_async(&reply_rx, &tx).await;
             }
         })
     }
@@ -425,7 +424,7 @@ impl ToolInvocation for LuaToolInvocation {
                     {
                         return Some(PermissionScopes::force_prompt(fallback));
                     }
-                    match reply_rx.recv_async().await {
+                    match crate::runtime::recv_reply_async(&reply_rx, &tx).await {
                         Ok(Some(scopes)) => Some(scopes),
                         _ => Some(PermissionScopes::force_prompt(fallback)),
                     }
@@ -487,7 +486,7 @@ impl ToolInvocation for LuaToolInvocation {
                 return Err("lua thread disconnected".to_string()).into();
             }
 
-            let recv = async { Some(reply_rx.recv_async().await) };
+            let recv = async { Some(crate::runtime::recv_reply_async(&reply_rx, &tx).await) };
             let result = match effective_secs {
                 Some(secs) => {
                     futures_lite::future::race(recv, async move {

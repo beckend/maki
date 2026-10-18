@@ -567,7 +567,7 @@ impl PluginHost {
                 reply: reply_tx,
             })
             .map_err(|_| PluginError::HostDead)?;
-        reply_rx.recv().map_err(|_| PluginError::HostDead)?
+        crate::runtime::recv_reply(&reply_rx, &self.inner.tx).map_err(|_| PluginError::HostDead)?
     }
 
     /// Option specs declared by loaded plugins via `maki.api.register_options`,
@@ -578,7 +578,7 @@ impl PluginHost {
             .tx
             .send(Request::CollectPluginOptions { reply: reply_tx })
             .map_err(|_| PluginError::HostDead)?;
-        reply_rx.recv().map_err(|_| PluginError::HostDead)
+        crate::runtime::recv_reply(&reply_rx, &self.inner.tx).map_err(|_| PluginError::HostDead)
     }
 
     /// Runs a source as the global `init.lua`.
@@ -621,7 +621,7 @@ impl PluginHost {
                 reply: reply_tx,
             })
             .map_err(|_| PluginError::HostDead)?;
-        reply_rx.recv().map_err(|_| PluginError::HostDead)?
+        crate::runtime::recv_reply(&reply_rx, &self.inner.tx).map_err(|_| PluginError::HostDead)?
     }
 
     pub fn unload(&self, plugin: &str) -> Result<(), PluginError> {
@@ -633,7 +633,7 @@ impl PluginHost {
                 reply: reply_tx,
             })
             .map_err(|_| PluginError::HostDead)?;
-        reply_rx.recv().map_err(|_| PluginError::HostDead)?;
+        crate::runtime::recv_reply(&reply_rx, &self.inner.tx).map_err(|_| PluginError::HostDead)?;
         Ok(())
     }
 
@@ -703,7 +703,7 @@ impl PluginHost {
             .tx
             .send(Request::CollectPackages { reply: reply_tx })
             .map_err(|_| PluginError::HostDead)?;
-        reply_rx.recv().map_err(|_| PluginError::HostDead)
+        crate::runtime::recv_reply(&reply_rx, &self.inner.tx).map_err(|_| PluginError::HostDead)
     }
 
     fn run_pack_loader(
@@ -730,7 +730,7 @@ impl PluginHost {
                 reply: reply_tx,
             })
             .map_err(|_| PluginError::HostDead)?;
-        reply_rx.recv().map_err(|_| PluginError::HostDead)?
+        crate::runtime::recv_reply(&reply_rx, &self.inner.tx).map_err(|_| PluginError::HostDead)?
     }
 
     /// Loads one external package directory as a single owner.
@@ -818,7 +818,7 @@ impl PluginHost {
             .tx
             .send(Request::SealPackOps { reply: reply_tx })
             .map_err(|_| PluginError::HostDead)?;
-        reply_rx.recv().map_err(|_| PluginError::HostDead)
+        crate::runtime::recv_reply(&reply_rx, &self.inner.tx).map_err(|_| PluginError::HostDead)
     }
 
     /// Takes the package operations Lua recorded, leaving the queue empty.
@@ -831,7 +831,7 @@ impl PluginHost {
             .tx
             .send(Request::TakePackOps { reply: reply_tx })
             .map_err(|_| PluginError::HostDead)?;
-        reply_rx.recv().map_err(|_| PluginError::HostDead)
+        crate::runtime::recv_reply(&reply_rx, &self.inner.tx).map_err(|_| PluginError::HostDead)
     }
 
     /// Loads every package that should be loaded now: the `start/` ones, and
@@ -1165,7 +1165,7 @@ impl EventHandle {
     pub fn collect_prompt_slots(&self) -> ResolvedPrompts {
         let (tx, rx) = flume::bounded(1);
         let _ = self.tx.send(Request::CollectPromptSlots { reply: tx });
-        rx.recv().unwrap_or_default()
+        crate::runtime::recv_reply(&rx, &self.tx).unwrap_or_default()
     }
 
     pub fn package_context(&self) -> Result<crate::pack::PackContext, String> {
@@ -1173,8 +1173,7 @@ impl EventHandle {
         self.tx
             .send(Request::CollectPackageContext { reply: reply_tx })
             .map_err(|_| PACK_STATE_UNAVAILABLE.to_owned())?;
-        let (declared, active) = reply_rx
-            .recv()
+        let (declared, active) = crate::runtime::recv_reply(&reply_rx, &self.tx)
             .map_err(|_| PACK_STATE_UNAVAILABLE.to_owned())?;
         let installed = crate::pack::installed_names()
             .ok_or_else(|| "could not read the package lockfile".to_owned())?;
@@ -1185,7 +1184,9 @@ impl EventHandle {
     pub async fn collect_prompt_slots_async(&self) -> ResolvedPrompts {
         let (tx, rx) = flume::bounded(1);
         let _ = self.tx.send(Request::CollectPromptSlots { reply: tx });
-        rx.recv_async().await.unwrap_or_default()
+        crate::runtime::recv_reply_async(&rx, &self.tx)
+            .await
+            .unwrap_or_default()
     }
 
     pub fn request_restore(&self, item: RestoreItem, event_tx: maki_agent::EventSender) {
