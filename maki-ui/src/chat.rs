@@ -599,6 +599,7 @@ impl Chat {
     /// brings back the senders the ending dropped.
     pub(crate) fn reopen(&mut self) {
         self.finish = None;
+        self.idle = false;
         if let Some(clock) = &mut self.clock {
             clock.resume();
         }

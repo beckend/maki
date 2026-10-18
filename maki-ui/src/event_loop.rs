@@ -2011,6 +2011,12 @@ impl<'t> EventLoop<'t> {
                     .cancel_subagent(tool_use_id.clone());
                 self.emit_task_stopped(idx, &tool_use_id, None);
             }
+            Action::StopRuns { target } => {
+                self.sessions[idx].handles.stop_runs(&target);
+            }
+            Action::SendToRun { handle, text } => {
+                self.sessions[idx].handles.send_to_run(handle, text);
+            }
             Action::CancelPluginTask { id, plugin } => {
                 self.ctx.lua_event_handle.cancel_plugin_session(&id);
                 self.emit_task_stopped(idx, &id, Some(&plugin));
