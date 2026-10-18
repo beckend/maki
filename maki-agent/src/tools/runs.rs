@@ -22,8 +22,8 @@ use crate::ToolOutput;
 use crate::cancel::CancelToken;
 use crate::runs::shell::command_scopes;
 use crate::runs::{
-    OutputSlice, RunKind, RunsCtx, Scope, SpawnRequest, StopOpts, StopStatus, UnitId, UnitState,
-    UnitView, WaitMode,
+    AgentLaunch, OutputSlice, RunKind, RunsCtx, Scope, SpawnRequest, StopOpts, StopStatus,
+    UnitError, UnitId, UnitKind, UnitState, UnitView, WaitMode,
 };
 use maki_config::Permission;
 
@@ -41,6 +41,7 @@ pub const RUN_TOOL_NAMES: [&str; 5] = [
 ];
 
 const NOT_IMPLEMENTED: &str = "NOT_IMPLEMENTED";
+const PLAN_BLOCK: &str = "PLAN_MODE: only research agents may be spawned in plan mode";
 const NO_RUNS: &str = "no runs";
 const DEFAULT_WAIT_SECS: u64 = 60;
 const DEFAULT_STOP_WAIT_SECS: u64 = 10;
@@ -338,7 +339,7 @@ impl ToolInvocation for RunInvocation {
                 (_, None) => Err(NO_RUNTIME.to_owned()),
                 (Call::Spawn(mut req), Some(runs)) => {
                     req.origin_tool_use_id = ctx.tool_use_id.as_deref().map(Arc::from);
-                    spawn(runs, *req)
+                    spawn(runs, ctx, *req).await
                 }
                 (Call::Runs(args), Some(runs)) => list_or_show(runs, args),
                 (Call::Wait(args), Some(runs)) => wait(runs, args, &ctx.cancel).await,
@@ -350,11 +351,31 @@ impl ToolInvocation for RunInvocation {
     }
 }
 
-fn spawn(runs: &RunsCtx, req: SpawnRequest) -> Result<String, String> {
-    let ack = runs
-        .hub
-        .spawn(runs.self_run, req)
-        .map_err(|e| e.to_string())?;
+async fn spawn(runs: &RunsCtx, ctx: &ToolContext, req: SpawnRequest) -> Result<String, String> {
+    let agent_spec = if req.kind == RunKind::Agent {
+        match req.clone().into_kind().map_err(|e| e.to_string())? {
+            UnitKind::Agent(spec) => Some(spec),
+            UnitKind::Shell(_) => None,
+        }
+    } else {
+        None
+    };
+    let ack = match agent_spec {
+        Some(spec) => {
+            if ctx.mode.plan_path().is_some() && spec.subagent_type != "research" {
+                return Err(PLAN_BLOCK.to_owned());
+            }
+            let launch = AgentLaunch::prepare(ctx, &spec).await?;
+            runs.hub.spawn_agent(runs.self_run, req, launch)
+        }
+        None => {
+            if ctx.mode.plan_path().is_some() {
+                return Err(PLAN_BLOCK.to_owned());
+            }
+            runs.hub.spawn(runs.self_run, req)
+        }
+    }
+    .map_err(|e| e.to_string())?;
     let mut state = ack.state.label().to_owned();
     if let Some((at, of)) = ack.queue_position {
         let _ = write!(state, ", position {at} of {of}");
@@ -453,7 +474,7 @@ async fn stop(runs: &RunsCtx, args: StopArgs, cancel: &CancelToken) -> Result<St
                 any_ok = true;
                 format!("already_finished({reason})")
             }
-            Ok(StopStatus::Requested) => {
+            Ok(StopStatus::Requested | StopStatus::Interrupted) => {
                 any_ok = true;
                 match settled
                     .iter()
@@ -477,6 +498,9 @@ fn list_or_show(runs: &RunsCtx, args: RunsArgs) -> Result<String, String> {
             .hub
             .resolve(runs.self_run, &key)
             .map_err(|e| format!("{e}: {key}"))?;
+        if !runs.hub.can_reach(runs.self_run, id) {
+            return Err(format!("{}: {key}", UnitError::NotReachable));
+        }
         let view = runs
             .hub
             .get(id)
@@ -506,6 +530,7 @@ fn list_or_show(runs: &RunsCtx, args: RunsArgs) -> Result<String, String> {
         .list(runs.self_run, scope)
         .into_iter()
         .filter(|v| include_finished || !v.state.is_done())
+        .filter(|v| scope != Scope::All || runs.hub.can_reach(runs.self_run, v.id))
         .collect();
     let notices = runs.hub.take_notices(runs.self_run);
     if views.is_empty() && notices.is_empty() {
@@ -617,6 +642,7 @@ mod tests {
 
     fn ctx_with_clock() -> (ToolContext, Arc<ManualClock>) {
         let mut ctx = stub_ctx(&AgentMode::Build);
+        ctx.provider = Arc::new(crate::test_support::StubStreamProvider::default());
         let clock = Arc::new(ManualClock::default());
         let hub = UnitHub::new(UnitLimits::default(), ctx.event_tx.clone(), clock.clone());
         let self_run = hub.main();
@@ -655,7 +681,7 @@ mod tests {
     }
 
     #[test]
-    fn spawn_returns_queued_record() {
+    fn spawn_starts_an_agent_record() {
         let ctx = ctx();
         let started = call(
             Which::Spawn,
@@ -665,7 +691,7 @@ mod tests {
         .unwrap();
         assert!(
             started.starts_with("started ag-")
-                && started.ends_with("\"audit-auth\" (agent, queued, position 1 of 1)"),
+                && started.ends_with("\"audit-auth\" (agent, running)"),
             "{started}"
         );
         let shell = call(
@@ -678,7 +704,7 @@ mod tests {
 
         let listing = call(Which::Runs, &ctx, json!({})).unwrap();
         assert!(listing.starts_with("main (you)\n"), "{listing}");
-        assert!(listing.contains("audit-auth  agent  queued"), "{listing}");
+        assert!(listing.contains("audit-auth  agent  running"), "{listing}");
         assert!(listing.contains("build  shell  running"), "{listing}");
 
         let record = call(Which::Runs, &ctx, json!({"id": "audit-auth"})).unwrap();
