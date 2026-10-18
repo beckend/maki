@@ -19,7 +19,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 use maki_providers::{Message, Model};
-use maki_storage::frame::{FactsUpdate, LiveFacts, PlanChange, PromptFacts, StoredFrame};
+use maki_storage::frame::{
+    FactsUpdate, LiveFacts, PlanChange, PromptFacts, StoredFrame, TopologyFacts,
+};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use strum::IntoEnumIterator;
@@ -286,6 +288,60 @@ pub fn plan_mode_update(plan_path: &Path, prompts: &ResolvedPrompts) -> String {
     wrap_update(&[plan_text(plan_path, prompts)])
 }
 
+const MAIN_NAME: &str = "main";
+
+fn child_list(children: &[(String, String, u8)]) -> String {
+    children
+        .iter()
+        .map(|(handle, name, kind)| {
+            let kind = if *kind == 0 { "agent" } else { "shell" };
+            format!("\"{name}\" ({handle}, {kind})")
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// What the model reads about the runs around it. Plain sentences: it is
+/// told again only when the parent or the children change.
+pub(crate) fn topology_text(topology: &TopologyFacts) -> String {
+    let (handle, name, depth) = &topology.me;
+    let (max_depth, siblings) = topology.limits;
+    let at_cap = *depth >= max_depth;
+    let Some((parent_handle, parent_name)) = &topology.parent else {
+        let runs = if topology.children.is_empty() {
+            "You have no unfinished runs.".to_owned()
+        } else {
+            format!("Runs you started: {}.", child_list(&topology.children))
+        };
+        return format!(
+            "Run topology changed. You are \"{MAIN_NAME}\". {runs} Runs finish with a notice; do not poll. Maximum depth {max_depth}."
+        );
+    };
+    let parent = if parent_handle == MAIN_NAME {
+        format!("\"{MAIN_NAME}\"")
+    } else {
+        format!("\"{parent_name}\" ({parent_handle})")
+    };
+    let children = if topology.children.is_empty() {
+        "You have no children.".to_owned()
+    } else {
+        format!("Your children: {}.", child_list(&topology.children))
+    };
+    let cap = if at_cap {
+        " You are at the maximum depth: spawn(kind=\"agent\") will fail with DEPTH_LIMIT; do the work directly."
+    } else {
+        ""
+    };
+    let siblings = if siblings {
+        "You may message siblings by name or handle with send; runs(scope=\"all\") lists them."
+    } else {
+        "Messages to siblings are not enabled."
+    };
+    format!(
+        "Run topology changed. You are agent \"{name}\" ({handle}), depth {depth} of {max_depth}. Your parent is {parent}. {children} Use send(to=\"parent\") for a question or progress while you work; your result is delivered to your parent automatically when you finish, so do not send it. Sending does not end your turn. {siblings}{cap}"
+    )
+}
+
 /// The update that brings the model from `told` to `now`, if anything
 /// changed. It says only what changed, and stores only that.
 pub(crate) fn context_update(
@@ -318,6 +374,9 @@ pub(crate) fn context_update(
         Some(PlanChange::Entered(path)) => parts.push(plan_text(path, prompts)),
         Some(PlanChange::Ended) => parts.push(PLAN_ENDED.to_owned()),
         None => {}
+    }
+    if let Some(topology) = &update.topology {
+        parts.push(topology_text(topology));
     }
     for (key, content) in &update.hints {
         parts.push(match content {
@@ -354,6 +413,7 @@ mod tests {
                 instructions: "\n\nProject instructions:\nbe nice".into(),
                 hints: BTreeMap::from([(HINT_KEY.into(), "tags: a, b".into())]),
             }),
+            topology: None,
         }
     }
 
@@ -414,5 +474,117 @@ mod tests {
             fingerprint(&context("a", ""), Some(&mcp), &model(CLIENT_MODEL)),
             "a model without tool search shapes the MCP entries another way"
         );
+    }
+
+    fn main_topology() -> TopologyFacts {
+        TopologyFacts {
+            me: ("main".into(), "main".into(), 0),
+            parent: None,
+            children: vec![
+                ("ag-k3x9ab".into(), "auditor".into(), 0),
+                ("sh-4m2q7z".into(), "build".into(), 1),
+            ],
+            limits: (2, false),
+        }
+    }
+
+    fn sub_topology() -> TopologyFacts {
+        TopologyFacts {
+            me: ("ag-k3x9ab".into(), "auditor".into(), 1),
+            parent: Some(("main".into(), "main".into())),
+            children: Vec::new(),
+            limits: (2, false),
+        }
+    }
+
+    #[test]
+    fn rendering_snapshot_main_and_sub() {
+        assert_eq!(
+            topology_text(&main_topology()),
+            "Run topology changed. You are \"main\". Runs you started: \"auditor\" (ag-k3x9ab, agent), \"build\" (sh-4m2q7z, shell). Runs finish with a notice; do not poll. Maximum depth 2."
+        );
+        assert_eq!(
+            topology_text(&sub_topology()),
+            "Run topology changed. You are agent \"auditor\" (ag-k3x9ab), depth 1 of 2. Your parent is \"main\". You have no children. Use send(to=\"parent\") for a question or progress while you work; your result is delivered to your parent automatically when you finish, so do not send it. Sending does not end your turn. Messages to siblings are not enabled."
+        );
+        let mut capped = sub_topology();
+        capped.me.2 = 2;
+        capped.parent = Some(("ag-aaaaaa".into(), "lead".into()));
+        capped.limits.1 = true;
+        let text = topology_text(&capped);
+        assert!(text.contains("Your parent is \"lead\" (ag-aaaaaa)."));
+        assert!(text.contains("You may message siblings by name or handle"));
+        assert!(text.ends_with("do the work directly."), "{text}");
+    }
+
+    #[test]
+    fn fact_changes_only_when_children_change() {
+        let at = |topology: Option<TopologyFacts>| LiveFacts {
+            topology,
+            ..facts()
+        };
+        let told = at(Some(main_topology()));
+        assert!(context_update(&told, &told.clone(), &ResolvedPrompts::default()).is_none());
+        let mut grown = main_topology();
+        grown.children.push(("ag-zzzzzz".into(), "zed".into(), 0));
+        let update =
+            context_update(&told, &at(Some(grown.clone())), &ResolvedPrompts::default()).unwrap();
+        assert!(update.first_text_content().unwrap().contains("\"zed\""));
+        let mut heard = told;
+        heard.apply(update.facts_update().unwrap());
+        assert_eq!(heard.topology, Some(grown));
+    }
+
+    #[test]
+    fn retell_coalesced_per_drain() {
+        let mut now = facts();
+        let mut topology = main_topology();
+        topology.children.clear();
+        let mut told = facts();
+        for n in 0..5 {
+            topology
+                .children
+                .push((format!("ag-{n}"), format!("kid{n}"), 0));
+        }
+        now.topology = Some(topology);
+        // Five children appeared since the last drain: one update names all.
+        let update = context_update(&told, &now, &ResolvedPrompts::default()).unwrap();
+        let text = update.first_text_content().unwrap();
+        assert_eq!(text.matches("Run topology changed.").count(), 1);
+        assert!((0..5).all(|n| text.contains(&format!("kid{n}"))));
+        told.apply(update.facts_update().unwrap());
+        assert!(context_update(&told, &now, &ResolvedPrompts::default()).is_none());
+    }
+
+    /// The cache key of a session is its system prompt and its tools. Telling
+    /// the topology appends a message and touches neither.
+    #[test]
+    fn topology_update_leaves_the_prefix_and_fingerprint_alone() {
+        let native = model(NATIVE_MODEL);
+        let mut history = History::new(Vec::new());
+        assert_eq!(
+            fit_frame(&mut history, context("a", "sys"), None, &native),
+            FrameFit::Built
+        );
+        let (system, tools) = history.request_prefix().unwrap();
+        let (system, tools) = (system.to_owned(), tools.to_string());
+        let fingerprint_before = history.frame().unwrap().fingerprint.clone();
+
+        let told = history.told().unwrap();
+        let now = LiveFacts {
+            topology: Some(sub_topology()),
+            ..told.clone()
+        };
+        history.push(context_update(&told, &now, &ResolvedPrompts::default()).unwrap());
+        assert_eq!(history.told().unwrap(), now);
+
+        assert_eq!(
+            fit_frame(&mut history, context("a", "sys"), None, &native),
+            FrameFit::Kept
+        );
+        let (system_after, tools_after) = history.request_prefix().unwrap();
+        assert_eq!(system_after, system);
+        assert_eq!(tools_after.to_string(), tools);
+        assert_eq!(history.frame().unwrap().fingerprint, fingerprint_before);
     }
 }

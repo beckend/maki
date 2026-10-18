@@ -140,6 +140,7 @@ How many lines of output to show per tool in the UI. All values are `usize` with
 | `max_depth` | u32 | `2` | 1 | Deepest agent nesting (the main agent is 0); an agent at this depth cannot spawn agents |
 | `max_children_per_run` | u32 | `8` | 1 | Most unfinished runs one run may have started |
 | `session_max_runs` | u32 | `64` | 1 | Most runs one session may start in total |
+| `siblings` | bool | `false` | - | Let runs with the same parent message each other with `send`. Off: a run reaches only its parent, its children and `main` |
 
 ### `provider`
 

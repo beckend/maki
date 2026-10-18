@@ -1767,6 +1767,40 @@ mod tests {
         }
     }
 
+    /// A topology update adds one field; an update without it stays byte for
+    /// byte what it was, and one stored with it loads back whole.
+    #[test]
+    fn context_update_topology_keeps_stored_format() {
+        use maki_storage::frame::TopologyFacts;
+        let old = json!({ "date": UPDATE_DATE });
+        let loaded: FactsUpdate = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(loaded.topology, None);
+        assert_eq!(serde_json::to_value(&loaded).unwrap(), old);
+
+        let topology = TopologyFacts {
+            me: ("ag-k3x9ab".into(), "auditor".into(), 1),
+            parent: Some(("main".into(), "main".into())),
+            children: vec![("sh-4m2q7z".into(), "build".into(), 1)],
+            limits: (2, true),
+        };
+        let stored = json!({ "topology": {
+            "me": ["ag-k3x9ab", "auditor", 1],
+            "parent": ["main", "main"],
+            "children": [["sh-4m2q7z", "build", 1]],
+            "limits": [2, true]
+        } });
+        let update = FactsUpdate {
+            topology: Some(topology),
+            ..FactsUpdate::default()
+        };
+        assert_eq!(serde_json::to_value(&update).unwrap(), stored);
+        let back: FactsUpdate = serde_json::from_value(stored).unwrap();
+        assert_eq!(back, update);
+        // A newer writer's unknown field is ignored, not an error.
+        let unknown = json!({ "date": UPDATE_DATE, "from_the_future": 1 });
+        assert!(serde_json::from_value::<FactsUpdate>(unknown).is_ok());
+    }
+
     /// A first run in plan mode tells the model before the user's prompt, and
     /// the session must still be named after what the user typed.
     #[test_case(Message::context_update(UPDATE_TEXT.into(), plan_mode_facts()) ; "context_update")]

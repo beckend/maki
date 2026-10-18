@@ -28,6 +28,7 @@ use event_listener::Event;
 use futures_lite::future::or;
 
 use maki_providers::{Message, TokenUsage};
+use maki_storage::frame::TopologyFacts;
 use maki_storage::id::MakiId;
 use serde::Deserialize;
 use serde_json::Value;
@@ -1667,6 +1668,11 @@ impl UnitHub {
         ids.into_iter().map(|id| table.view(id)).collect()
     }
 
+    /// What `who` should know of the tree around it, for `tell_changes`.
+    pub fn topology_facts(&self, who: UnitId) -> Option<TopologyFacts> {
+        topology::facts(&self.table(), self.main, who, &self.limits)
+    }
+
     pub fn get(&self, id: UnitId) -> Option<UnitView> {
         let table = self.table();
         table.units.contains_key(&id).then(|| table.view(id))
@@ -1722,7 +1728,8 @@ impl UnitHub {
 impl UnitHub {
     /// Queues a message from `from` for `to`. Reachability is the tree: a run
     /// talks to its parent, its direct children and `main`; `main` and `user`
-    /// reach every agent. Siblings are not reachable (phase 4d adds the opt-in).
+    /// reach every agent. Siblings are reachable only with `[agent.runs]
+    /// siblings = true`; the ping-pong guard below covers them like any pair.
     ///
     /// The checks run under the hub lock; the enqueue runs under the
     /// recipient's inbox lock after the hub lock is gone, and wakes an `Idle`
@@ -1771,7 +1778,12 @@ impl UnitHub {
             let reachable = from == self.main
                 || from == self.user
                 || unit.parent == from
-                || table.units.get(&from).is_some_and(|f| f.parent == to);
+                || table.units.get(&from).is_some_and(|f| f.parent == to)
+                || (self.limits.siblings
+                    && table
+                        .units
+                        .get(&from)
+                        .is_some_and(|f| f.parent == unit.parent));
             if !reachable {
                 return Err(UnitError::NotReachable);
             }

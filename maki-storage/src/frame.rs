@@ -33,6 +33,33 @@ pub struct LiveFacts {
     /// `None` under a prompt the host wrote. Which facts it states is
     /// unknown, so none of them are tracked.
     pub prompt: Option<PromptFacts>,
+    /// Where the run sits among other runs. `None` for a main agent with no
+    /// runs, so a session that never starts one tells nothing.
+    pub topology: Option<TopologyFacts>,
+}
+
+/// Plain strings and numbers: maki-storage cannot name the run types. Kept
+/// small and free of states, costs and times, so it only changes when the
+/// shape of the tree around the run does.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TopologyFacts {
+    /// Handle, name and depth.
+    pub me: (String, String, u8),
+    /// Handle and name; `None` for the main agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<(String, String)>,
+    /// Handle, name and kind tag (0 agent, 1 shell), sorted by name.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub children: Vec<(String, String, u8)>,
+    /// Deepest agent nesting, and whether siblings may message each other.
+    pub limits: (u8, bool),
+}
+
+impl TopologyFacts {
+    /// The main agent with nothing to tell is the same as no topology.
+    pub fn normalized(self) -> Option<Self> {
+        (!(self.parent.is_none() && self.children.is_empty())).then_some(self)
+    }
 }
 
 /// A new variant is not skew-safe: an older build drops the whole message
@@ -61,6 +88,10 @@ pub struct FactsUpdate {
     /// `None` for a hint that no longer applies.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub hints: BTreeMap<String, Option<String>>,
+    /// The whole topology as it now stands. A main agent that lost its last
+    /// run hears it with no children.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topology: Option<TopologyFacts>,
 }
 
 impl FactsUpdate {
@@ -75,6 +106,9 @@ impl LiveFacts {
             Some(PlanChange::Entered(path)) => self.plan = Some(path.clone()),
             Some(PlanChange::Ended) => self.plan = None,
             None => {}
+        }
+        if let Some(topology) = &update.topology {
+            self.topology = topology.clone().normalized();
         }
         let Some(prompt) = &mut self.prompt else {
             return;
@@ -104,6 +138,12 @@ impl LiveFacts {
             plan: (self.plan != now.plan).then(|| match &now.plan {
                 Some(path) => PlanChange::Entered(path.clone()),
                 None => PlanChange::Ended,
+            }),
+            topology: (self.topology != now.topology).then(|| {
+                now.topology.clone().unwrap_or_else(|| TopologyFacts {
+                    children: Vec::new(),
+                    ..self.topology.clone().unwrap_or_default()
+                })
             }),
             ..FactsUpdate::default()
         };
@@ -197,6 +237,7 @@ impl StoredFrame {
         let mut facts = LiveFacts {
             plan: None,
             prompt: self.facts.clone(),
+            topology: None,
         };
         facts.apply(&self.inherited);
         facts
@@ -227,6 +268,7 @@ mod tests {
         LiveFacts {
             plan: None,
             prompt: Some(prompt()),
+            topology: None,
         }
     }
 
@@ -286,6 +328,7 @@ mod tests {
         let now = LiveFacts {
             plan: Some(PLAN_PATH.into()),
             prompt: None,
+            topology: None,
         };
         assert_eq!(
             rendered().changes_to(&now),
@@ -294,5 +337,67 @@ mod tests {
                 ..FactsUpdate::default()
             }
         );
+    }
+
+    fn sub_topology() -> TopologyFacts {
+        TopologyFacts {
+            me: ("ag-k3x9ab".into(), "auditor".into(), 1),
+            parent: Some(("main".into(), "main".into())),
+            children: Vec::new(),
+            limits: (2, false),
+        }
+    }
+
+    #[test]
+    fn facts_at_start_plan_none() {
+        let frame = StoredFrame {
+            system: "s".into(),
+            fingerprint: "f".into(),
+            facts: Some(prompt()),
+            mcp_tools: Vec::new(),
+        };
+        let start = frame.facts_at_start();
+        assert_eq!(start.plan, None);
+        assert_eq!(start.topology, None);
+        assert_eq!(start, rendered());
+    }
+
+    #[test]
+    fn topology_is_tracked_under_any_prompt_and_main_without_runs_tells_nothing() {
+        let now = LiveFacts {
+            topology: Some(sub_topology()),
+            ..host_written()
+        };
+        let update = host_written().changes_to(&now);
+        assert_eq!(update.topology, Some(sub_topology()));
+        let mut heard = host_written();
+        heard.apply(&update);
+        assert_eq!(heard, now);
+        assert!(heard.changes_to(&now).is_empty());
+
+        let mut main = sub_topology();
+        main.parent = None;
+        assert_eq!(main.clone().normalized(), None);
+        main.children.push(("sh-1".into(), "build".into(), 1));
+        assert!(main.normalized().is_some());
+    }
+
+    #[test]
+    fn main_losing_its_last_run_hears_no_children() {
+        let mut main = TopologyFacts {
+            me: ("main".into(), "main".into(), 0),
+            children: vec![("sh-1".into(), "build".into(), 1)],
+            ..TopologyFacts::default()
+        };
+        let told = LiveFacts {
+            topology: Some(main.clone()),
+            ..host_written()
+        };
+        let update = told.changes_to(&host_written());
+        main.children.clear();
+        assert_eq!(update.topology, Some(main));
+        let mut heard = told;
+        heard.apply(&update);
+        assert_eq!(heard, host_written());
     }
 }
