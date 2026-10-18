@@ -140,7 +140,7 @@
         "type": "integer"
       },
       "watch": {
-        "description": "shell only. Regex; each matching output line becomes a notice (max 1 per second, then batched).",
+        "description": "shell only. Regex (Rust syntax) matched against each stdout/stderr line; matches become notices, at most 1 per second (lines in between are batched) and 20 per minute, then one overflow notice. Wakes you only with notify=wake. A bad regex is rejected.",
         "type": "string"
       }
     },

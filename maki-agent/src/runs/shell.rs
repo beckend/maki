@@ -13,6 +13,7 @@ use std::time::Duration;
 use event_listener::Event;
 
 use super::clock::Clock;
+use super::watch::Watch;
 use super::{BodyRef, DoneReason, ShellSpec, Terminal, UnitHub, UnitId, UnitResult};
 use crate::child_guard::ChildGuard;
 
@@ -303,7 +304,11 @@ async fn supervise(
             hub.record_proc(handle, pid);
         }
     };
-    let Some(launched) = launch_unless_killed(&spec, &run, &opts, &record) else {
+    let watch = spec
+        .watch
+        .as_deref()
+        .and_then(|re| Watch::new(re, hub.clone(), id, Arc::clone(&clock)));
+    let Some(launched) = launch_unless_killed(&spec, &run, &opts, watch, &record) else {
         return;
     };
     let (mut guard, mut pump) = match launched {
@@ -443,13 +448,14 @@ fn launch_unless_killed(
     spec: &ShellSpec,
     run: &Arc<ShellRun>,
     opts: &ShellOptions,
+    watch: Option<Watch>,
     record: &dyn Fn(u32),
 ) -> Option<io::Result<(ChildGuard, tokio::task::JoinHandle<()>)>> {
     let gate = run.killed.lock().unwrap_or_else(|e| e.into_inner());
     if *gate || SHUTTING_DOWN.load(Ordering::SeqCst) {
         return None;
     }
-    let launched = launch(spec, run, opts, record);
+    let launched = launch(spec, run, opts, watch, record);
     if let Ok((guard, _)) = &launched {
         run.pid.store(guard.id(), Ordering::SeqCst);
         live_groups().insert(guard.id());
@@ -461,6 +467,7 @@ fn launch(
     spec: &ShellSpec,
     run: &Arc<ShellRun>,
     opts: &ShellOptions,
+    watch: Option<Watch>,
     record: &dyn Fn(u32),
 ) -> io::Result<(ChildGuard, tokio::task::JoinHandle<()>)> {
     let log = run.log_path.as_ref().and_then(|path| {
@@ -510,7 +517,7 @@ fn launch(
     // The pipe is a blocking one, so the reader runs on a blocking thread.
     let run = Arc::clone(run);
     let log_cap = opts.log_cap;
-    let pump = tokio::task::spawn_blocking(move || pump(reader, run, log, log_cap));
+    let pump = tokio::spawn(pump(reader, run, log, log_cap, watch));
     Ok((ChildGuard::new(child), pump))
 }
 
@@ -561,20 +568,93 @@ fn private_log(path: &std::path::Path) -> io::Result<File> {
     opts.open(path)
 }
 
-fn pump(mut reader: io::PipeReader, run: Arc<ShellRun>, mut log: Option<File>, cap: u64) {
-    let mut chunk = [0u8; READ_CHUNK];
+async fn pump(
+    mut reader: io::PipeReader,
+    run: Arc<ShellRun>,
+    mut log: Option<File>,
+    cap: u64,
+    mut watch: Option<Watch>,
+) {
+    enum Step {
+        Read(io::Result<(usize, Vec<u8>)>),
+        Tick,
+    }
+    // The pipe is a blocking one, so a thread reads it and hands the chunks
+    // over; the watch's deadline is waited on here, beside the read.
+    let (tx, rx) = flume::unbounded::<io::Result<(usize, Vec<u8>)>>();
+    let reader_task = tokio::task::spawn_blocking(move || {
+        let mut chunk = [0u8; READ_CHUNK];
+        loop {
+            match reader.read(&mut chunk) {
+                Ok(0) => {
+                    let _ = tx.send(Ok((0, Vec::new())));
+                    return;
+                }
+                Ok(n) => {
+                    if tx.send(Ok((n, chunk[..n].to_vec()))).is_err() {
+                        return;
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(e));
+                    return;
+                }
+            }
+        }
+    });
     let mut logged = 0u64;
     let mut discarding = false;
     loop {
-        let n = match reader.read(&mut chunk) {
-            Ok(0) | Err(_) => return,
-            Ok(n) => n,
+        let due = watch
+            .as_ref()
+            .and_then(|w| Some((w.deadline()?, Arc::clone(&w.clock))));
+        let step = match due {
+            Some((at, clock)) => {
+                tokio::select! {
+                    biased;
+                    got = rx.recv_async() => Step::Read(
+                        got.unwrap_or(Err(io::Error::other("the reader stopped"))),
+                    ),
+                    _ = clock.sleep_until(at) => Step::Tick,
+                }
+            }
+            None => Step::Read(
+                rx.recv_async()
+                    .await
+                    .unwrap_or(Err(io::Error::other("the reader stopped"))),
+            ),
         };
+        let (n, data) = match step {
+            Step::Tick => {
+                if let Some(w) = &mut watch {
+                    w.tick();
+                }
+                continue;
+            }
+            Step::Read(Ok(v)) if v.0 == 0 => {
+                if let Some(w) = &mut watch {
+                    w.finish();
+                }
+                reader_task.abort();
+                return;
+            }
+            Step::Read(Err(_)) => {
+                if let Some(w) = &mut watch {
+                    w.finish();
+                }
+                reader_task.abort();
+                return;
+            }
+            Step::Read(Ok(v)) => v,
+        };
+        if let Some(w) = &mut watch {
+            w.feed(&data);
+        }
         if discarding {
             continue;
         }
         let keep = n.min((cap - logged) as usize);
-        let mut data = chunk[..keep].to_vec();
+        let mut data = data;
         if keep < n {
             data.extend_from_slice(
                 format!("\n[log limit of {cap} bytes reached; further output discarded]\n")

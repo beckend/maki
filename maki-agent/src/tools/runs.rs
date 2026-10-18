@@ -188,7 +188,7 @@ impl Which {
                     "command": {"type": "string", "description": "shell only. Command line run with the user's shell."},
                     "cwd": {"type": "string"},
                     "timeout_secs": {"type": "integer", "minimum": 1, "description": "Wall clock limit. Default: 1800 for agents, 3600 for shell. Expiry ends the run as timed_out."},
-                    "watch": {"type": "string", "description": "shell only. Regex; each matching output line becomes a notice (max 1 per second, then batched)."},
+                    "watch": {"type": "string", "description": "shell only. Regex (Rust syntax) matched against each stdout/stderr line; matches become notices, at most 1 per second (lines in between are batched) and 20 per minute, then one overflow notice. Wakes you only with notify=wake. A bad regex is rejected."},
                     "notify": {"type": "string", "enum": ["wake", "quiet", "never"], "description": "On finish: wake starts a turn if you are idle (default), quiet waits for your next turn, never sends nothing (read with runs)."}
                 }
             }),

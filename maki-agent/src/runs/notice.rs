@@ -11,6 +11,8 @@ use crate::tools::compact_duration;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NoticeKind {
     Settled,
+    /// Output of a shell run matched its `watch` regex.
+    Match,
     /// The ping-pong guard held messages between two runs.
     Guard,
     /// Notices were dropped or demoted to protect the owner's context.
@@ -27,6 +29,7 @@ impl NoticeKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Settled => "settled",
+            Self::Match => "match",
             Self::Guard => "guard",
             Self::Overflow => "overflow",
             Self::Delivery => "delivery",
@@ -38,6 +41,7 @@ impl NoticeKind {
     pub fn parse(kind: &str) -> Option<Self> {
         [
             Self::Settled,
+            Self::Match,
             Self::Guard,
             Self::Overflow,
             Self::Delivery,
@@ -190,4 +194,39 @@ pub(super) fn agent_settled(
     }
     result_tail(&mut text, handle, &terminal.result);
     text
+}
+
+const MATCH_LINE_CHARS: usize = 300;
+
+/// A batch of output lines that matched a shell's `watch`.
+pub(super) fn shell_match(
+    handle: &str,
+    name: &str,
+    pattern: &str,
+    lines: &[String],
+    extra: usize,
+) -> String {
+    let mut text = format!("Run {handle} \"{name}\" (shell) output matched /{pattern}/:");
+    for line in lines {
+        let cut = line
+            .char_indices()
+            .nth(MATCH_LINE_CHARS)
+            .map_or(line.len(), |(i, _)| i);
+        let _ = write!(text, "\n{}", &line[..cut]);
+        if cut < line.len() {
+            text.push('…');
+        }
+    }
+    if extra > 0 {
+        let _ = write!(text, "\n(+{extra} more matching lines)");
+    }
+    let _ = write!(text, "\nread more with runs(id=\"{handle}\")");
+    text
+}
+
+pub(super) fn shell_match_overflow(handle: &str, name: &str, pattern: &str) -> String {
+    format!(
+        "Run {handle} \"{name}\" (shell) matched /{pattern}/ more than {} times in a minute; further matches are dropped until the minute ends. Read the output with runs(id=\"{handle}\")",
+        super::watch::MAX_PER_WINDOW
+    )
 }
