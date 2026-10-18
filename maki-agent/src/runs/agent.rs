@@ -19,7 +19,7 @@ use maki_providers::{
 use maki_storage::sessions::StoredThinking;
 use serde_json::{Value, json};
 
-use super::inbox::{self, Inbox, Phase};
+use super::inbox::{self, Inbox, InboxItem, Phase};
 use super::notice::BODY_FILE_SUFFIX;
 use super::{
     AgentSpec, BodyRef, Clock, DoneReason as UnitDone, Terminal, UnitHub, UnitId, UnitResult,
@@ -338,12 +338,13 @@ impl AgentRun {
     }
 
     /// Hard stop: the run's token, which every turn token descends from.
-    pub(super) fn cancel_run(&self) {
-        self.inbox.close();
+    pub(super) fn cancel_run(&self) -> Vec<InboxItem> {
+        let left = self.inbox.close();
         let trigger = lock(&self.cancel).take();
         if let Some(trigger) = trigger {
             trigger.cancel();
         }
+        left
     }
 
     /// Soft stop: abandon the current turn and stay available.
@@ -465,6 +466,7 @@ impl Driver {
             message.push_str(STRUCTURED_OUTPUT_PROMPT_SUFFIX);
         }
         let first = self.run.inbox.take_start();
+        self.delivered(&first);
         if !first.is_empty() {
             message.push_str("\n\n");
             message.push_str(&inbox::frame(&first, None));
@@ -555,7 +557,10 @@ impl Driver {
             return Settled::Stopped;
         }
         if guard.has_wakeable() {
-            return Settled::Restart(inbox::frame(&guard.take_start(), None));
+            let items = guard.take_start();
+            drop(guard);
+            self.delivered(&items);
+            return Settled::Restart(inbox::frame(&items, None));
         }
         guard.set_phase(Phase::Idle);
         let idle = self
@@ -564,8 +569,20 @@ impl Driver {
         if idle {
             Settled::Idle
         } else {
-            guard.set_phase(Phase::Closed);
+            let left = guard.close();
+            drop(guard);
+            if let Some(hub) = self.hub() {
+                hub.messages_dropped(&left, "recipient_stopped");
+            }
             Settled::Stopped
+        }
+    }
+
+    /// Items that become the next turn's user message. The turn sends it at
+    /// once, so they count as delivered here; the step is unknown.
+    fn delivered(&self, items: &[InboxItem]) {
+        if let Some(hub) = self.hub() {
+            hub.message_delivered(items, None);
         }
     }
 
@@ -601,7 +618,10 @@ impl Driver {
             match guard.phase() {
                 Phase::Closed => return None,
                 Phase::Running => {
-                    return Some(inbox::frame(&guard.take_start(), None));
+                    let items = guard.take_start();
+                    drop(guard);
+                    self.delivered(&items);
+                    return Some(inbox::frame(&items, None));
                 }
                 Phase::Idle => {}
             }
@@ -611,8 +631,9 @@ impl Driver {
     /// Children go first, then the parent settles: a notice never reports a
     /// finished parent with live children.
     async fn finish(&self, reason: UnitDone, detail: Option<String>, result: UnitResult) {
-        self.run.inbox.close();
+        let left = self.run.inbox.close();
         let Some(hub) = self.hub() else { return };
+        hub.messages_dropped(&left, "recipient_stopped");
         hub.stop_children(self.id);
         hub.children_settled(self.id).await;
         let terminal = Terminal {
