@@ -356,6 +356,9 @@ impl<'h> Agent<'h> {
             if kept.is_some() && prompt.is_none() {
                 self.refresh_frame()?;
             }
+            if let Some(text) = &kept {
+                self.note_user_spoke(text, images.len());
+            }
             let kept = kept.map(|text| {
                 prompt = Some(text.clone());
                 Message::user_with_images(text, images)
@@ -476,6 +479,20 @@ impl<'h> Agent<'h> {
                 .send(AgentEvent::ObservationLine { text, detail, end })?;
         }
         Ok(())
+    }
+
+    /// A real user message (not a notice wake, which is blank) proves the
+    /// user is engaged, so the notice wake budget starts over (design 4.3).
+    fn note_user_spoke(&self, text: &str, images: usize) {
+        if !self.audience.contains(ToolAudience::MAIN) || (text.trim().is_empty() && images == 0) {
+            return;
+        }
+        if let Some(runs) = &self.runs {
+            runs.hub.note_engaged();
+            if let Some(runs) = &self.runs {
+                runs.hub.note_engaged();
+            }
+        }
     }
 
     /// Messages from other runs, as ONE user message in the one frame
@@ -1237,6 +1254,9 @@ impl<'h> Agent<'h> {
                     let kept = self
                         .filter_user_message(input.message, input.images.len(), input.source)
                         .await?;
+                    if let Some(text) = &kept {
+                        self.note_user_spoke(text, input.images.len());
+                    }
                     let message =
                         kept.map(|text| interrupt_message(text, input.images, input.source));
                     if message.is_some() {

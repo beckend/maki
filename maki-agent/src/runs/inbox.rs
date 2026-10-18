@@ -12,8 +12,10 @@ use std::fmt::{self, Write};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use super::UnitError;
-use super::UnitId;
+use std::time::SystemTime;
+
+use super::notice::{Notice, NoticeInfo, NoticeKind};
+use super::{UnitError, UnitId};
 
 /// Hard limit of one message, in bytes.
 pub const MAX_MESSAGE_BYTES: usize = 16384;
@@ -26,6 +28,8 @@ pub const DRAIN_BYTES: usize = 32 * 1024;
 /// Per sender and recipient: this many messages per window, burst included.
 pub const PAIR_BURST: u32 = 6;
 pub const PAIR_WINDOW: Duration = Duration::from_secs(10);
+/// Identical notices within this window collapse into one with a count.
+pub const COLLAPSE_WINDOW: Duration = Duration::from_secs(30);
 /// What `INBOX_FULL` tells the sender to wait.
 const INBOX_RETRY_SECS: u64 = 5;
 
@@ -80,6 +84,8 @@ pub struct InboxItem {
     pub wake: bool,
     pub text: String,
     pub enqueued: Instant,
+    /// Set for `DeliveryKind::Notice`.
+    pub notice: Option<NoticeInfo>,
     seq: u64,
 }
 
@@ -101,8 +107,28 @@ impl InboxItem {
             wake,
             text,
             enqueued,
+            notice: None,
             seq: 0,
         }
+    }
+
+    pub fn notice(info: NoticeInfo, text: String, wake: bool, enqueued: Instant) -> Self {
+        Self {
+            id: MessageId(0),
+            from: info.run,
+            from_label: info.name.clone(),
+            kind: DeliveryKind::Notice,
+            wake,
+            text,
+            enqueued,
+            notice: Some(info),
+            seq: 0,
+        }
+    }
+
+    /// Per-inbox ordering key, also the notice's `seq`.
+    pub fn seq(&self) -> u64 {
+        self.seq
     }
 }
 
@@ -136,6 +162,8 @@ struct State {
     /// Bumped by every accepted item.
     seq: u64,
     buckets: HashMap<UnitId, Bucket>,
+    /// Notices that found the inbox full; reported by one marker at the next drain.
+    dropped_notices: u32,
 }
 
 pub struct Inbox {
@@ -171,6 +199,7 @@ impl Inbox {
                 phase,
                 seq: 0,
                 buckets: HashMap::new(),
+                dropped_notices: 0,
             }),
             wake_tx,
             wake_rx,
@@ -269,6 +298,99 @@ impl Guard<'_> {
     /// Whether something here should start or continue a turn.
     pub(crate) fn has_wakeable(&self) -> bool {
         self.state.items.iter().any(|i| i.wake)
+    }
+
+    pub(crate) fn has_non_notice_wakeable(&self) -> bool {
+        self.state
+            .items
+            .iter()
+            .any(|i| i.wake && i.kind != DeliveryKind::Notice)
+    }
+
+    /// Queues a notice. Identical queued notices within the window collapse
+    /// into one with a count; a full inbox drops it and remembers how many,
+    /// so one `Overflow` marker tells the recipient at its next drain. Never
+    /// an error: a notice has no sender to tell. `None` when the inbox is closed.
+    pub(crate) fn enqueue_notice(&mut self, mut item: InboxItem, now: Instant) -> Option<Accepted> {
+        if self.state.phase == Phase::Closed {
+            return None;
+        }
+        let wakes = item.wake;
+        let state = &mut *self.state;
+        if let Some(info) = &item.notice
+            && let Some(same) = state.items.iter_mut().find(|i| {
+                i.notice.as_ref().is_some_and(|n| {
+                    n.kind == info.kind && n.run == info.run && n.generation == info.generation
+                }) && i.text == item.text
+                    && now.saturating_duration_since(i.enqueued) <= COLLAPSE_WINDOW
+            })
+            && let Some(n) = &mut same.notice
+        {
+            n.count += 1;
+            same.wake |= wakes;
+            return Some(Accepted::Queued);
+        }
+        if state.items.len() >= MAX_PENDING {
+            state.dropped_notices += 1;
+            return Some(Accepted::Queued);
+        }
+        state.seq += 1;
+        item.seq = state.seq;
+        state.items.push_back(item);
+        Some(if wakes && state.phase == Phase::Idle {
+            Accepted::Wake
+        } else {
+            Accepted::Queued
+        })
+    }
+
+    /// Adds a quiet marker whatever the cap says: it replaces what it counts.
+    pub(crate) fn push_marker(&mut self, info: NoticeInfo, text: String, now: Instant) {
+        let state = &mut *self.state;
+        state.seq += 1;
+        let mut item = InboxItem::notice(info, text, false, now);
+        item.seq = state.seq;
+        state.items.push_back(item);
+    }
+
+    /// Waking notices become quiet. Returns how many changed.
+    pub(crate) fn demote_notice_wakes(&mut self) -> usize {
+        let mut n = 0;
+        for item in &mut self.state.items {
+            if item.kind == DeliveryKind::Notice && item.wake {
+                item.wake = false;
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// Removes queued notices the test selects: this is the "still queued" half
+    /// of the drained/queued cutoff, taken under the inbox lock.
+    pub(crate) fn remove_notices(&mut self, take: impl Fn(&InboxItem) -> bool) -> usize {
+        let before = self.state.items.len();
+        self.state
+            .items
+            .retain(|i| !(i.kind == DeliveryKind::Notice && take(i)));
+        before - self.state.items.len()
+    }
+
+    pub(crate) fn queued_notices(&self) -> Vec<Notice> {
+        self.state
+            .items
+            .iter()
+            .filter_map(|i| {
+                let info = i.notice.as_ref()?;
+                Some(Notice {
+                    seq: i.seq,
+                    run: info.run,
+                    kind: info.kind,
+                    wake: i.wake,
+                    text: notice_text(i),
+                    created: info.created,
+                })
+            })
+            .collect()
     }
 
     /// Checks the caps and the pair bucket, then queues. Nothing changes on
@@ -376,6 +498,25 @@ impl Guard<'_> {
                 out.extend(self.state.items.remove(at));
             }
         }
+        if max == 0 && self.state.dropped_notices > 0 {
+            let n = std::mem::take(&mut self.state.dropped_notices);
+            self.state.seq += 1;
+            let info = NoticeInfo {
+                kind: NoticeKind::Overflow,
+                run: UnitId::new(),
+                handle: String::new(),
+                name: String::new(),
+                generation: 0,
+                count: 1,
+                created: SystemTime::now(),
+            };
+            let text = format!(
+                "{n} more notices from your runs were dropped to protect your context; call runs() to see state."
+            );
+            let mut marker = InboxItem::notice(info, text, false, Instant::now());
+            marker.seq = self.state.seq;
+            out.push(marker);
+        }
         out
     }
 }
@@ -388,11 +529,26 @@ pub fn frame(items: &[InboxItem], step: Option<u32>) -> String {
         if n > 0 {
             out.push('\n');
         }
-        let tag = if item.kind == DeliveryKind::Notice {
-            "run-notice"
-        } else {
-            "run-message"
-        };
+        if let Some(info) = &item.notice {
+            let _ = write!(out, "<run-notice");
+            if !info.handle.is_empty() {
+                let _ = write!(
+                    out,
+                    " run=\"{}\" name=\"{}\"",
+                    escape_attr(&info.handle),
+                    escape_attr(&info.name)
+                );
+            }
+            let _ = write!(
+                out,
+                " seq=\"{}\" kind=\"{}\">{}</run-notice>",
+                item.seq,
+                info.kind.as_str(),
+                escape_body(&notice_text(item))
+            );
+            continue;
+        }
+        let tag = "run-message";
         let _ = write!(
             out,
             "<{tag} from=\"{}\" id=\"{}\"",
@@ -405,6 +561,14 @@ pub fn frame(items: &[InboxItem], step: Option<u32>) -> String {
         let _ = write!(out, ">{}</{tag}>", escape_body(&item.text));
     }
     out
+}
+
+/// The notice text with its collapse count, `(xN)`.
+fn notice_text(item: &InboxItem) -> String {
+    match item.notice.as_ref().map(|n| n.count) {
+        Some(count) if count > 1 => format!("{} (x{count})", item.text),
+        _ => item.text.clone(),
+    }
 }
 
 fn escape_attr(value: &str) -> String {

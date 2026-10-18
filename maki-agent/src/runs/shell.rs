@@ -930,8 +930,19 @@ mod tests {
         assert!(matches!(views[0].state, UnitState::Running));
         std::fs::write(&gate, "").unwrap();
         until("done", || view(&rig, id).state.is_done()).await;
-        assert_eq!(rig.hub.pending_notices(main).len(), 1);
+        // The notice follows the state change by a moment.
+        until("notice", || rig.hub.pending_notices(main).len() == 1).await;
         finished(&rig, id).await;
+        assert_eq!(
+            rig.hub.pending_notices(main).len(),
+            1,
+            "a bare wait on the hub claims nothing"
+        );
+        let claim = crate::runs::Claim {
+            runs: vec![(id, view(&rig, id).settle_gen)],
+            seqs: Vec::new(),
+        };
+        rig.hub.claim(main, None, claim);
         assert!(rig.hub.pending_notices(main).is_empty());
     }
 
@@ -1145,6 +1156,11 @@ mod tests {
 
     async fn finished_without_consuming(rig: &Rig, id: UnitId) {
         until("done", || view(rig, id).state.is_done()).await;
+        // The notice follows the state change by a moment.
+        until("notice", || {
+            !rig.hub.pending_notices(rig.hub.main()).is_empty()
+        })
+        .await;
     }
 
     /// Advances the manual clock a second per poll until `fut` is ready.
