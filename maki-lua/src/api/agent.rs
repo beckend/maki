@@ -710,7 +710,8 @@ async fn call_tool(
 ///
 /// The handle carries its own id, so you can deliver a message to the subagent
 /// from the outside with `maki.session.notify(..., { session = sess:session_id() })`.
-/// The message waits for the subagent's next `:prompt()`; see
+/// The message is read before the subagent's next request, or at its next
+/// `:prompt()` if it is idle; see
 /// [maki.agent.Session](#maki-agent-session).
 ///
 /// @example
@@ -980,8 +981,8 @@ async fn session(
             task_id: Some(Arc::from(cancellation.ui_id.as_str())),
             // Lets the parent deliver observations to this subagent. Only the
             // interactive loop reads `wake`, so a subagent clears it in
-            // `drain()` without starting a turn; it still sees the message at
-            // its next `:prompt()`, because that path keeps a user message.
+            // `drain()` without starting a turn; it still reads the message
+            // before its next request or at its next `:prompt()`.
             mailbox: Some(mailbox),
             timeouts: agent_ctx.timeouts,
             // Shared with the parent, not fresh: a lock that a subagent does
@@ -1677,9 +1678,11 @@ async fn close(_lua: Lua, this: mlua::UserDataRef<LuaSession>) -> LuaResult<()> 
 ///
 /// What reaches the subagent, and when:
 ///
-/// - The message becomes an observation in its history at the subagent's NEXT
-///   `:prompt()`. Nothing starts a subagent's turn on its own, so a message
-///   delivered while it is idle just waits for you to prompt it.
+/// - The message becomes an observation in its history before the subagent's
+///   next request, so it sees it between tool calls. A call that is still
+///   running is not interrupted: a subagent blocked in a long tool reads the
+///   note when that tool returns. A message delivered while it is idle waits
+///   for the next `:prompt()`, since nothing starts a subagent's turn on its own.
 /// - `wake` is read only by an interactive frontend loop. There is none here,
 ///   so passing it changes nothing.
 /// - `maki.session.prompt()` does NOT work on a subagent: it is a roundtrip to
@@ -1707,7 +1710,8 @@ lua_class! {
     ///
     /// `:session_id()` is how anything else reaches this one: hand it to
     /// `maki.session.notify` to deliver an observation from the outside. The
-    /// observation waits for the next `:prompt()` — a subagent has no turn of
+    /// observation is read before the subagent's next request, or at its next
+    /// `:prompt()` if it is idle. A subagent has no turn of
     /// its own to be woken into, and `maki.session.prompt` is a UI roundtrip
     /// that does not apply to it.
     "maki.agent.Session" => LuaSession, SESSION_DOCS [session_id, prompt, close]
