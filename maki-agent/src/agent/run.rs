@@ -1769,7 +1769,6 @@ mod tests {
         });
     }
 
-<<<<<<< HEAD
     /// Where an accepted notice enters the loop.
     #[derive(Clone, Copy)]
     enum NoticePath {
