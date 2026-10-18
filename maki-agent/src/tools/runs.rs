@@ -616,10 +616,11 @@ fn agent_result(v: &UnitView, full: bool) -> String {
     if !text.is_empty() {
         let _ = write!(out, "\nresult:\n{text}");
     }
-    if let Some(structured) = &result.structured
-        && text != structured.to_string()
-    {
-        let _ = write!(out, "\nstructured: {structured}");
+    if let Some(structured) = &result.structured {
+        let rendered = structured.to_string();
+        if text != rendered {
+            let _ = write!(out, "\nstructured: {rendered}");
+        }
     }
     if result.truncated
         && !full
