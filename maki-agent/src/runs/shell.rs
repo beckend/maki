@@ -1,7 +1,7 @@
 //! Shell runs: one process group per run, stdout and stderr merged into one
 //! pipe, kept in a bounded in-memory ring and appended to `<handle>.log`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
@@ -133,6 +133,15 @@ impl ShellRun {
     pub(super) fn request_stop(&self) {
         self.stop.store(true, Ordering::Release);
         self.stop_event.notify(usize::MAX);
+    }
+
+    /// Blocks further launches and returns the live group, if any.
+    pub(super) fn mark_killed(&self) -> Option<u32> {
+        *self.killed.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        match self.pid.load(Ordering::SeqCst) {
+            0 => None,
+            pid => Some(pid),
+        }
     }
 
     /// Hub teardown: no grace, nobody left to wait for it.
@@ -366,6 +375,7 @@ async fn supervise(
     #[cfg(unix)]
     crate::child_guard::sigkill_process_group(pid);
     run.pid.store(0, Ordering::Release);
+    live_groups().remove(&pid);
     or(
         async {
             let _ = pump.await;
@@ -379,6 +389,53 @@ async fn supervise(
     finish(terminal);
 }
 
+/// Process groups of shells that were launched and not yet reaped, so a
+/// signal handler or panic hook can tear them down without a hub in hand.
+static LIVE: Mutex<BTreeSet<u32>> = Mutex::new(BTreeSet::new());
+static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
+/// How long `shutdown_groups` waits between SIGTERM and SIGKILL.
+const SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
+
+fn live_groups() -> MutexGuard<'static, BTreeSet<u32>> {
+    LIVE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Process exit: stops new launches and tears down every live shell group.
+pub(super) fn shutdown_all() {
+    SHUTTING_DOWN.store(true, Ordering::SeqCst);
+    let pids: Vec<u32> = live_groups().iter().copied().collect();
+    shutdown_groups(&pids);
+}
+
+/// Synchronous and runtime-free: SIGTERM, a bounded wait, then SIGKILL.
+/// Idempotent; a group that is already gone is skipped.
+pub(super) fn shutdown_groups(pids: &[u32]) {
+    #[cfg(unix)]
+    {
+        for &pid in pids {
+            term_group(pid);
+        }
+        let deadline = std::time::Instant::now() + SHUTDOWN_GRACE;
+        while std::time::Instant::now() < deadline && pids.iter().any(|&p| group_exists(p)) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        for &pid in pids {
+            crate::child_guard::sigkill_process_group(pid);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = pids;
+}
+
+#[cfg(unix)]
+fn group_exists(pgid: u32) -> bool {
+    use rustix::process::{Pid, test_kill_process_group};
+    i32::try_from(pgid)
+        .ok()
+        .and_then(Pid::from_raw)
+        .is_some_and(|g| test_kill_process_group(g).is_ok())
+}
+
 /// `None` when the hub is already gone.
 fn launch_unless_killed(
     spec: &ShellSpec,
@@ -386,12 +443,13 @@ fn launch_unless_killed(
     opts: &ShellOptions,
 ) -> Option<io::Result<(ChildGuard, smol::Task<()>)>> {
     let gate = run.killed.lock().unwrap_or_else(|e| e.into_inner());
-    if *gate {
+    if *gate || SHUTTING_DOWN.load(Ordering::SeqCst) {
         return None;
     }
     let launched = launch(spec, run, opts);
     if let Ok((guard, _)) = &launched {
         run.pid.store(guard.id(), Ordering::SeqCst);
+        live_groups().insert(guard.id());
     }
     Some(launched)
 }
@@ -937,6 +995,93 @@ mod tests {
         let Rig { hub, .. } = rig;
         drop(hub);
         until("group gone", || !group_alive(pgid));
+    }
+
+    #[test]
+    fn hub_shutdown_kills_group_idempotently_and_bounded() {
+        let rig = rig();
+        let id = start(&rig, "echo $$; sleep 600");
+        until("pid", || read_all(&rig, id).trim().parse::<u32>().is_ok());
+        let pgid: u32 = read_all(&rig, id).trim().parse().unwrap();
+        let t = std::time::Instant::now();
+        rig.hub.shutdown();
+        rig.hub.shutdown();
+        assert!(t.elapsed() < Duration::from_secs(5));
+        until("group gone", || !group_alive(pgid));
+    }
+
+    const HARNESS_ENV: &str = "MAKI_SHELL_SIGNAL_HARNESS";
+    const HARNESS_TEST: &str = "runs::shell::tests::signal_harness";
+
+    /// Child side of `sigterm_and_sighup_tear_down_shell_groups`: inert unless
+    /// the env var is set.
+    #[test]
+    fn signal_harness() {
+        if std::env::var_os(HARNESS_ENV).is_none() {
+            return;
+        }
+        super::super::install_signal_teardown();
+        let rig = rig();
+        let id = start(&rig, "sh -c 'sleep 401 & sleep 402; wait' & echo $$; wait");
+        until("pid", || read_all(&rig, id).trim().parse::<u32>().is_ok());
+        println!("\nPGID={}", read_all(&rig, id).trim());
+        std::thread::sleep(Duration::from_secs(120));
+    }
+
+    fn group_members(pgid: u32) -> Vec<u32> {
+        let mut found = Vec::new();
+        for entry in std::fs::read_dir("/proc").unwrap().flatten() {
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|n| n.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+                continue;
+            };
+            let Some((_, rest)) = stat.rsplit_once(") ") else {
+                continue;
+            };
+            let mut fields = rest.split(' ');
+            let state = fields.next();
+            let _ppid = fields.next();
+            let group = fields.next().and_then(|g| g.parse::<u32>().ok());
+            if group == Some(pgid) && state != Some("Z") {
+                found.push(pid);
+            }
+        }
+        found
+    }
+
+    #[test_case(libc::SIGTERM ; "sigterm")]
+    #[test_case(libc::SIGHUP ; "sighup")]
+    fn sigterm_and_sighup_tear_down_shell_groups(sig: libc::c_int) {
+        use std::io::{BufRead, BufReader};
+        use std::process::{Command, Stdio};
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", HARNESS_TEST, "--nocapture", "--test-threads=1"])
+            .env(HARNESS_ENV, "1")
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+        let pgid: u32 = loop {
+            let line = lines.next().expect("harness exited early").unwrap();
+            if let Some(n) = line.strip_prefix("PGID=") {
+                break n.parse().unwrap();
+            }
+        };
+        until("sleeps running", || group_members(pgid).len() >= 3);
+        // SAFETY: signals the harness process this test spawned.
+        unsafe { libc::kill(child.id() as i32, sig) };
+        let status = child.wait().unwrap();
+        assert_eq!(
+            std::os::unix::process::ExitStatusExt::signal(&status),
+            Some(sig)
+        );
+        until("group gone", || group_members(pgid).is_empty());
     }
 
     #[test]

@@ -3105,6 +3105,7 @@ dependencies = [
  "isahc",
  "jiff",
  "jsonrepair",
+ "libc",
  "maki-config",
  "maki-otel",
  "maki-providers",

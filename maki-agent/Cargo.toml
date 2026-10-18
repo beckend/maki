@@ -51,6 +51,7 @@ tempfile = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true }
+libc = { workspace = true }
 
 [lints]
 workspace = true
