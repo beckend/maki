@@ -947,6 +947,53 @@ mod tests {
     }
 
     #[test]
+    fn journal_write_failure_degrades_with_one_notice() {
+        let dir = tempfile::tempdir().unwrap();
+        let hub = hub_with(dir.path());
+        // A directory where the message file goes makes the next body write fail.
+        std::fs::create_dir(dir.path().join(maki_storage::runs::MESSAGES_FILE)).unwrap();
+        let item = InboxItem::new(
+            MessageId(1),
+            hub.main(),
+            "main".into(),
+            DeliveryKind::Steer,
+            "hi".into(),
+            Instant::now(),
+        );
+        hub.jot(JournalRecord::Msg(message_record(
+            &item, "ag-x", "accepted",
+        )));
+        hub.journal.get().unwrap().flush();
+        assert!(hub.journal_degraded());
+        let journal_notices = |hub: &UnitHub| {
+            hub.pending_notices(hub.main())
+                .iter()
+                .filter(|n| n.kind == NoticeKind::Journal)
+                .count()
+        };
+        assert_eq!(
+            journal_notices(&hub),
+            0,
+            "told only when the hub next settles"
+        );
+        for _ in 0..2 {
+            let req: SpawnRequest = serde_json::from_value(json!({
+                "kind": "shell", "description": "echo", "command": "echo hi"
+            }))
+            .unwrap();
+            hub.spawn(hub.main(), req).unwrap();
+        }
+        until("one journal notice", || journal_notices(&hub) == 1);
+        until("both shells settled", || {
+            hub.list(hub.main(), Scope::All)
+                .iter()
+                .all(|u| u.state.is_done())
+        });
+        assert_eq!(journal_notices(&hub), 1, "a second notice was queued");
+        hub.shutdown();
+    }
+
+    #[test]
     fn messages_and_acks_are_journaled() {
         let dir = tempfile::tempdir().unwrap();
         crashed_journal(dir.path(), vec![]);
