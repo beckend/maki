@@ -424,6 +424,35 @@ enum Settled {
     Stopped,
 }
 
+/// Settles the run as failed if its driver unwinds, so a panic cannot pin a
+/// slot or leave the run `Running` forever. Does nothing once it is settled.
+struct SettleOnPanic {
+    hub: Weak<UnitHub>,
+    id: UnitId,
+}
+
+impl Drop for SettleOnPanic {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            return;
+        }
+        let Some(hub) = self.hub.upgrade() else {
+            return;
+        };
+        hub.stop_children(self.id);
+        hub.settle(
+            self.id,
+            Terminal {
+                reason: UnitDone::Failed,
+                exit_code: None,
+                detail: Some("agent driver panicked".to_owned()),
+                result: UnitResult::default(),
+            },
+            0,
+        );
+    }
+}
+
 enum Verdict {
     Idle { interrupted: bool },
     Done(UnitDone, Option<String>),
@@ -461,6 +490,10 @@ impl Driver {
     }
 
     async fn drive(self, spec: AgentSpec, launch: AgentLaunch) {
+        let _guard = SettleOnPanic {
+            hub: self.hub.clone(),
+            id: self.id,
+        };
         let mut history = History::new(
             launch
                 .fork

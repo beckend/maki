@@ -96,9 +96,12 @@ mod tests {
         let before = deadline.at().unwrap();
         let clone = deadline.clone();
 
-        smol::block_on(deadline.paused_while(smol::Timer::after(WAIT)));
+        // The timer must start inside the wrapped future. Built as an argument
+        // it starts before `paused_at` is taken and can finish by less than WAIT.
+        smol::block_on(deadline.paused_while(async {
+            smol::Timer::after(WAIT).await;
+        }));
 
-        // The timer may fire a little early; the shift is what was measured.
-        assert!(clone.at().unwrap() - before >= WAIT / 2);
+        assert!(clone.at().unwrap() - before >= WAIT);
     }
 }

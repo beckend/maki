@@ -2,6 +2,9 @@ use std::time::Duration;
 
 use maki_config::RunsConfig;
 
+/// Timeouts above this are lowered, so `Instant + timeout` cannot overflow.
+const MAX_TIMEOUT_SECS: u64 = 365 * 24 * 3600;
+
 /// Caps of one hub, from `[agent.runs]`. Values above the field's range are
 /// saturated; zero is rejected by the config validation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,8 +41,8 @@ impl From<&RunsConfig> for UnitLimits {
             max_queue: wide(config.max_queue),
             spawn_per_minute: small(config.spawn_per_minute),
             session_max_runs: wide(config.session_max_runs),
-            default_timeout: Duration::from_secs(config.default_timeout_secs),
-            max_timeout: Duration::from_secs(config.max_timeout_secs),
+            default_timeout: Duration::from_secs(config.default_timeout_secs.min(MAX_TIMEOUT_SECS)),
+            max_timeout: Duration::from_secs(config.max_timeout_secs.min(MAX_TIMEOUT_SECS)),
             siblings: config.siblings,
         }
     }
@@ -68,6 +71,22 @@ mod tests {
         );
         assert_eq!(l.default_timeout, Duration::from_secs(1800));
         assert_eq!(l.max_timeout, Duration::from_secs(86_400));
+    }
+
+    #[test]
+    fn huge_timeouts_are_lowered() {
+        let config = RunsConfig {
+            default_timeout_secs: u64::MAX,
+            max_timeout_secs: u64::MAX,
+            ..RunsConfig::default()
+        };
+        let l = UnitLimits::from(&config);
+        assert_eq!(l.max_timeout, Duration::from_secs(MAX_TIMEOUT_SECS));
+        assert!(
+            std::time::Instant::now()
+                .checked_add(l.default_timeout)
+                .is_some()
+        );
     }
 
     #[test]

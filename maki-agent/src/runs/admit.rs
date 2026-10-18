@@ -119,6 +119,7 @@ impl Pool {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::pin::pin;
     use std::sync::Arc;
     use std::time::Duration;
@@ -508,5 +509,209 @@ mod tests {
         // A finished shell frees its place.
         finish(&hub, first.id);
         assert!(sh(&hub, main).is_ok());
+    }
+
+    type Fut = std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>;
+
+    /// Polls every future once and drops the ones that finished.
+    async fn poll_all(futs: &mut Vec<Fut>) {
+        let mut i = 0;
+        while i < futs.len() {
+            if poll_once(futs[i].as_mut()).await.is_some() {
+                drop(futs.swap_remove(i));
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    fn check_pool(hub: &UnitHub, cap: usize, ctx: &str) {
+        let table = hub.table();
+        let pool = &table.pool;
+        assert!(
+            pool.held.len() <= cap,
+            "{ctx}: held {} > cap",
+            pool.held.len()
+        );
+        let mut seen = HashSet::new();
+        for id in pool.priority.iter().chain(pool.fifo.iter()) {
+            assert!(seen.insert(*id), "{ctx}: {id:?} queued twice");
+            assert!(!pool.held.contains(id), "{ctx}: {id:?} queued and held");
+            assert!(
+                !table.units[id].state.is_done(),
+                "{ctx}: terminal run in line"
+            );
+            assert!(!pool.blocked.contains_key(id), "{ctx}: blocked and queued");
+        }
+        for id in &pool.held {
+            assert!(!table.units[id].state.is_done(), "{ctx}: terminal run held");
+        }
+        for (at, id) in pool.fifo.iter().enumerate() {
+            assert_eq!(pool.position(*id), Some((at + 1, pool.fifo.len())), "{ctx}");
+        }
+        // Work conserving: a free slot never sits next to a waiting run.
+        if pool.held.len() < cap {
+            assert!(
+                pool.priority.is_empty() && pool.fifo.is_empty(),
+                "{ctx}: free slot, line not empty"
+            );
+        }
+        for (id, unit) in &table.units {
+            if matches!(unit.state, UnitState::Queued) {
+                assert!(pool.is_waiting(*id), "{ctx}: Queued run {id:?} not in line");
+            }
+        }
+    }
+
+    /// Seeded model run with waits, soft and hard stops, timeouts on the
+    /// manual clock and idle wakes. Checks the pool after every operation.
+    #[test]
+    fn pool_invariants_over_many_seeds() {
+        const CAP: usize = 3;
+        for seed in 1..=1000u64 {
+            smol::block_on(async {
+                let (tx, rx) = flume::unbounded::<Envelope>();
+                std::mem::forget(rx);
+                let clock = Arc::new(ManualClock::default());
+                let hub = UnitHub::new(
+                    UnitLimits {
+                        max_queue: 500,
+                        ..agents(CAP as u8)
+                    },
+                    EventSender::new(tx, 0),
+                    clock.clone(),
+                );
+                let main = hub.main();
+                let token = CancelToken::none();
+                let mut rng = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+                let mut next = move |n: usize| {
+                    rng ^= rng << 13;
+                    rng ^= rng >> 7;
+                    rng ^= rng << 17;
+                    (rng % n as u64) as usize
+                };
+                let mut ids: Vec<super::UnitId> = Vec::new();
+                let mut waits: Vec<Fut> = Vec::new();
+                let mut acquires: Vec<Fut> = Vec::new();
+                for step in 0..150 {
+                    let ctx = format!("seed {seed} step {step}");
+                    match next(9) {
+                        0 | 1 => {
+                            let owner = if ids.is_empty() || next(2) == 0 {
+                                main
+                            } else {
+                                ids[next(ids.len())]
+                            };
+                            if let Ok(ack) = hub.spawn(owner, request(RunKind::Agent, "r")) {
+                                ids.push(ack.id);
+                            }
+                        }
+                        2 if !ids.is_empty() => finish(&hub, ids[next(ids.len())]),
+                        3 if !ids.is_empty() => {
+                            let id = ids[next(ids.len())];
+                            hub.stop(main, &[id], Default::default());
+                            if next(2) == 0 {
+                                finish(&hub, id);
+                            }
+                        }
+                        4 if !ids.is_empty() => {
+                            let owner = ids[next(ids.len())];
+                            let below: Vec<_> = hub
+                                .list(owner, Scope::Descendants)
+                                .into_iter()
+                                .map(|v| v.id)
+                                .collect();
+                            if !below.is_empty() {
+                                let hub = Arc::clone(&hub);
+                                let token = token.clone();
+                                let mode = if next(2) == 0 {
+                                    WaitMode::All
+                                } else {
+                                    WaitMode::Any
+                                };
+                                let secs = 5 + next(60) as u64;
+                                let mut fut: Fut = Box::pin(async move {
+                                    let _ = hub
+                                        .wait(
+                                            owner,
+                                            &below,
+                                            mode,
+                                            Duration::from_secs(secs),
+                                            &token,
+                                        )
+                                        .await;
+                                });
+                                if poll_once(fut.as_mut()).await.is_none() {
+                                    waits.push(fut);
+                                }
+                            }
+                        }
+                        5 => {
+                            clock.advance(Duration::from_secs(1 + next(30) as u64));
+                            poll_all(&mut waits).await;
+                        }
+                        6 if !ids.is_empty() => {
+                            // A running agent goes idle...
+                            hub.settle_idle(ids[next(ids.len())], UnitResult::default(), false);
+                        }
+                        7 if !ids.is_empty() => {
+                            // ...and an idle one is woken: it asks for a slot again.
+                            let id = ids[next(ids.len())];
+                            let idle = matches!(hub.get(id).unwrap().state, UnitState::Idle);
+                            if idle {
+                                hub.table().units.get_mut(&id).unwrap().state = UnitState::Running;
+                                let hub = Arc::clone(&hub);
+                                let token = token.clone();
+                                let mut fut: Fut = Box::pin(async move {
+                                    let _ = hub.acquire(id, &token, false).await;
+                                });
+                                if poll_once(fut.as_mut()).await.is_none() {
+                                    acquires.push(fut);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                    poll_all(&mut acquires).await;
+                    check_pool(&hub, CAP, &ctx);
+                }
+                for id in &ids {
+                    finish(&hub, *id);
+                }
+                poll_all(&mut waits).await;
+                poll_all(&mut acquires).await;
+                check_pool(&hub, CAP, &format!("seed {seed} end"));
+                let table = hub.table();
+                assert!(table.pool.held.is_empty(), "seed {seed}: slots leaked");
+                assert!(table.pool.blocked.is_empty(), "seed {seed}: blocked left");
+                assert!(table.pool.fifo.is_empty() && table.pool.priority.is_empty());
+            });
+        }
+    }
+
+    /// A woken idle agent queues behind runs that never started (it is not a
+    /// resumed waiter), and a resumed waiter goes ahead of it.
+    #[test]
+    fn woken_idle_agent_queues_in_fifo_order() {
+        smol::block_on(async {
+            let hub = hub_with(agents(1));
+            let main = hub.main();
+            let token = CancelToken::none();
+            let idle = agent(&hub, main, "idle");
+            assert!(hub.settle_idle(idle, UnitResult::default(), false));
+            let holder = agent(&hub, main, "holder");
+            let queued = agent(&hub, main, "queued");
+            assert_eq!(state(&hub, queued), "queued (position 1 of 1)");
+            hub.table().units.get_mut(&idle).unwrap().state = UnitState::Running;
+            let mut woken = pin!(hub.acquire(idle, &token, false));
+            assert!(poll_once(woken.as_mut()).await.is_none());
+            assert_eq!(state(&hub, idle), "queued (position 2 of 2)");
+            finish(&hub, holder);
+            assert_eq!(state(&hub, queued), "running");
+            assert!(poll_once(woken.as_mut()).await.is_none());
+            finish(&hub, queued);
+            assert_eq!(poll_once(woken.as_mut()).await, Some(true));
+            assert_eq!(hub.slots_in_use(), 1);
+        });
     }
 }
