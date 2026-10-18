@@ -1527,9 +1527,9 @@ impl UnitHub {
                 if table.claims.len() >= 64 {
                     table.claims.clear();
                 }
-                let entry = table.claims.entry(id.to_owned()).or_default();
-                entry.runs.extend(claim.runs);
-                entry.seqs.extend(claim.seqs);
+                // Replace, never merge: a provider may reuse a call id, and a
+                // stale claim of an abandoned call must not ride on a new one.
+                table.claims.insert(id.to_owned(), claim);
             }
             None => self.finalize(owner, &claim),
         }
@@ -1626,6 +1626,11 @@ impl UnitHub {
 
     /// The user spoke, or the model read run state itself: it is engaged, so
     /// the wake budget starts over.
+    #[cfg(test)]
+    pub(crate) fn wake_streak(&self) -> u32 {
+        self.wake.lock().unwrap_or_else(|e| e.into_inner()).streak
+    }
+
     pub fn note_engaged(&self) {
         let mut budget = self.wake.lock().unwrap_or_else(|e| e.into_inner());
         budget.streak = 0;
