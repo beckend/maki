@@ -190,6 +190,8 @@ pub struct Agent<'h> {
     runs: Option<RunsCtx>,
     /// What other runs send this one; present for `main` and native agents.
     inbox: Option<Arc<crate::runs::Inbox>>,
+    /// Run messages in history that no sent request has carried yet.
+    landed: Vec<(crate::runs::InboxItem, u32)>,
     model_sync: Option<Arc<ArcSwap<ModelSlot>>>,
     stop_continuations: u32,
 }
@@ -241,6 +243,7 @@ impl<'h> Agent<'h> {
                 .as_ref()
                 .and_then(|runs| runs.hub.inbox_of(runs.self_run)),
             runs: params.runs,
+            landed: Vec::new(),
             model_sync: None,
             stop_continuations: 0,
         }
@@ -474,8 +477,30 @@ impl<'h> Agent<'h> {
             return;
         }
         let step = self.num_turns + 1;
+        self.landed.extend(
+            items
+                .iter()
+                .filter(|i| i.id.0 != 0)
+                .cloned()
+                .map(|i| (i, step)),
+        );
         let text = crate::runs::inbox::frame(items, Some(step));
         self.history.push(Message::observation(text));
+    }
+
+    /// A request carrying the landed run messages went out: only now are
+    /// they delivered (design 4.6). A failure before that leaves them
+    /// accepted.
+    fn confirm_landed(&mut self) {
+        if self.landed.is_empty() {
+            return;
+        }
+        let landed = std::mem::take(&mut self.landed);
+        if let Some(runs) = &self.runs {
+            for (item, step) in landed {
+                runs.hub.message_delivered(&[item], Some(step));
+            }
+        }
     }
 
     fn turns_exhausted(&self) -> bool {
@@ -634,6 +659,7 @@ impl<'h> Agent<'h> {
         .await
         {
             Ok(r) => {
+                self.confirm_landed();
                 self.reauth_attempts = 0;
                 self.overflow_recoveries = 0;
                 r

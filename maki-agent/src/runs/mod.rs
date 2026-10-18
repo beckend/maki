@@ -2,6 +2,7 @@
 //! machine and hub. Shell runs execute (`shell.rs`); agent runs get a driver
 //! task that owns their history (`agent.rs`).
 
+pub mod ack;
 pub mod agent;
 #[cfg(test)]
 mod agent_run;
@@ -39,6 +40,8 @@ use crate::tools::ToolAudience;
 use crate::tools::registry::Tool;
 use crate::{AgentEvent, Envelope, SubagentInfo};
 
+use ack::Acks;
+pub use ack::{AckRecord, AckState};
 use agent::AgentRun;
 pub use agent::{AgentLaunch, resolve_model};
 pub use clock::{Clock, ManualClock, SystemClock};
@@ -749,6 +752,8 @@ pub struct UnitHub {
     /// The reserved sender of text the user types into a run's tab.
     user: UnitId,
     message_seq: AtomicU64,
+    /// Delivery acks per sender. A leaf lock: nothing is taken under it.
+    acks: Mutex<Acks>,
 }
 
 /// Messages the ping-pong guard keeps per pair before it refuses more.
@@ -790,6 +795,7 @@ impl UnitHub {
             notices_in_flight: AtomicUsize::new(0),
             user: UnitId::new(),
             message_seq: AtomicU64::new(0),
+            acks: Mutex::default(),
         })
     }
 
@@ -1252,7 +1258,8 @@ impl UnitHub {
             run.interrupt_turn();
         }
         for (id, run) in plan.cancel {
-            run.cancel_run();
+            let left = run.cancel_run();
+            self.messages_dropped(&left, "recipient_stopped");
             self.watch_for_force_settle(id);
         }
         outcomes
@@ -1736,7 +1743,7 @@ impl UnitHub {
     /// recipient (moving it to `Running`) in the same inbox critical section,
     /// so the driver's settle cannot miss it.
     pub fn send(
-        &self,
+        self: &Arc<Self>,
         from: UnitId,
         to: UnitId,
         text: String,
@@ -1813,6 +1820,7 @@ impl UnitHub {
                     });
                 }
                 pair.held.push((to, item));
+                self.ack_insert(from, id, to, AckState::Held);
                 let first = !std::mem::replace(&mut pair.notified, true);
                 if first {
                     self.guard_notice(&mut table, from, to);
@@ -1831,12 +1839,17 @@ impl UnitHub {
         }
         self.release(table);
         self.deliver_all(released);
+        // Before the enqueue: a drain right after it must find the record.
+        self.ack_insert(from, id, to, AckState::Accepted);
         let delivered = self.deliver(to, &inbox, item, now, true);
         if delivered.is_ok() && agents {
             let mut table = self.table();
             table.pairs.entry(PairKey::of(from, to)).or_default().count += 1;
         }
-        delivered?;
+        if let Err(e) = delivered {
+            self.acks().remove(from, id);
+            return Err(e);
+        }
         Ok(SendAck {
             id,
             state,
@@ -1913,10 +1926,115 @@ impl UnitHub {
     fn deliver_all(&self, items: Vec<(UnitId, InboxItem)>) {
         let now = self.clock.now();
         for (to, item) in items {
-            if let Some(inbox) = self.inbox_of(to) {
-                let _ = self.deliver(to, &inbox, item, now, false);
+            let failed = match self.inbox_of(to) {
+                Some(inbox) => match self.deliver(to, &inbox, item.clone(), now, false) {
+                    Ok(()) => continue,
+                    Err(UnitError::InboxFull { .. }) => "inbox_full",
+                    Err(_) => "recipient_stopped",
+                },
+                None => "recipient_stopped",
+            };
+            self.messages_dropped(&[item], failed);
+        }
+    }
+
+    fn acks(&self) -> MutexGuard<'_, Acks> {
+        self.acks.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The user types into tabs and has no `runs`, so nothing is kept for it.
+    fn ack_insert(self: &Arc<Self>, from: UnitId, id: MessageId, to: UnitId, state: AckState) {
+        if from == self.user {
+            return;
+        }
+        self.acks().insert(from, AckRecord { id, to, state });
+        let hub = Arc::downgrade(self);
+        let clock = Arc::clone(&self.clock);
+        smol::spawn(async move {
+            clock.sleep_until(clock.now() + ack::SLOW_DELIVERY).await;
+            if let Some(hub) = hub.upgrade() {
+                hub.slow_delivery(from, id, to);
+            }
+        })
+        .detach();
+    }
+
+    fn slow_delivery(&self, from: UnitId, id: MessageId, to: UnitId) {
+        if !self.acks().is_pending(from, id) {
+            return;
+        }
+        let text = format!(
+            "message {id} to {} is not delivered after {}s; it is still waiting",
+            self.run_label(to),
+            ack::SLOW_DELIVERY.as_secs()
+        );
+        self.ack_notice(from, to, text);
+    }
+
+    fn run_label(&self, id: UnitId) -> String {
+        if id == self.main {
+            return "main".to_owned();
+        }
+        self.table()
+            .units
+            .get(&id)
+            .map_or_else(|| "?".to_owned(), |u| u.handle.to_string())
+    }
+
+    /// A quiet notice to the sender; nothing for the user.
+    fn ack_notice(&self, from: UnitId, to: UnitId, text: String) {
+        if from == self.user {
+            return;
+        }
+        self.table().pending_notices.push(PendingNotice {
+            owner: from,
+            info: NoticeInfo {
+                kind: NoticeKind::Delivery,
+                run: to,
+                handle: String::new(),
+                name: String::new(),
+                generation: 0,
+                count: 1,
+                created: SystemTime::now(),
+            },
+            text,
+            wake: false,
+        });
+        self.flush_notices();
+    }
+
+    /// The messages are in the recipient's history for a request that went
+    /// out. Notices carry no ack. Never call with an inbox lock held.
+    pub fn message_delivered(&self, items: &[InboxItem], step: Option<u32>) {
+        let mut acks = self.acks();
+        for item in items.iter().filter(|i| i.kind != DeliveryKind::Notice) {
+            acks.advance(item.from, item.id, AckState::Delivered { step });
+        }
+    }
+
+    /// The messages will never be delivered: the sender learns it through
+    /// `runs` and one quiet notice each. Never call with an inbox lock held.
+    pub fn messages_dropped(&self, items: &[InboxItem], reason: &'static str) {
+        for item in items.iter().filter(|i| i.kind != DeliveryKind::Notice) {
+            let to = self
+                .acks()
+                .advance(item.from, item.id, AckState::Dropped(reason));
+            if let Some(to) = to {
+                let text = format!(
+                    "message {} to {} was dropped: {}",
+                    item.id,
+                    self.run_label(to),
+                    reason.replace('_', " ")
+                );
+                self.ack_notice(item.from, to, text);
             }
         }
+    }
+
+    /// What `from` sent to `to` that is pending or dropped, and the last one
+    /// delivered.
+    pub fn acks_to(&self, from: UnitId, to: UnitId) -> Vec<AckRecord> {
+        self.acks().to(from, to)
     }
 
     /// The inbox critical section: enqueue, and when that wakes an idle

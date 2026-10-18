@@ -15,6 +15,8 @@ pub enum NoticeKind {
     Guard,
     /// Notices were dropped or demoted to protect the owner's context.
     Overflow,
+    /// A message the run sent was dropped or is slow to arrive.
+    Delivery,
 }
 
 impl NoticeKind {
@@ -23,6 +25,7 @@ impl NoticeKind {
             Self::Settled => "settled",
             Self::Guard => "guard",
             Self::Overflow => "overflow",
+            Self::Delivery => "delivery",
         }
     }
 }

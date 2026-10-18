@@ -752,7 +752,7 @@ mod inbox {
 mod hub {
     use super::*;
 
-    fn pair(script: &Arc<Script>) -> (Rig, UnitId, UnitId) {
+    pub(super) fn pair(script: &Arc<Script>) -> (Rig, UnitId, UnitId) {
         let rig = rig(script);
         let a = spawn(&rig, "PARENT-A", json!({}));
         let b = spawn_as(&rig, a.id, agent_req("CHILD-B", json!({"name": "kid"})));
@@ -1132,5 +1132,139 @@ mod topology {
         rig.hub.stop(rig.hub.main(), &[a.id], StopOpts::default());
         settle(&rig, a.id);
         assert_eq!(rig.hub.topology_facts(rig.hub.main()), None);
+    }
+}
+
+mod ack {
+    use super::*;
+    use crate::runs::AckState;
+
+    fn state_of(rig: &Rig, from: UnitId, to: UnitId) -> Vec<AckState> {
+        rig.hub
+            .acks_to(from, to)
+            .into_iter()
+            .map(|r| r.state)
+            .collect()
+    }
+
+    #[test]
+    fn accepted_then_delivered_order() {
+        let (release, gate) = flume::bounded::<()>(1);
+        let script = Script::new(vec![(
+            CHILD,
+            vec![
+                Step::Gate(gate, reply("first")),
+                Step::Reply(reply("second")),
+            ],
+        )]);
+        let rig = rig(&script);
+        let ack = spawn(&rig, CHILD, json!({}));
+        await_requests(&script, CHILD, 1);
+        let main = rig.hub.main();
+        say(&rig, main, ack.id, "note", DeliveryKind::Steer);
+        assert_eq!(state_of(&rig, main, ack.id), [AckState::Accepted]);
+        release.send(()).unwrap();
+        settle(&rig, ack.id);
+        let states = state_of(&rig, main, ack.id);
+        assert!(
+            matches!(states[..], [AckState::Delivered { step: Some(_) }]),
+            "{states:?}"
+        );
+        assert!(seen_text(&script, CHILD)[1].contains("note"));
+    }
+
+    #[test]
+    fn dropped_when_recipient_stopped_notifies_sender() {
+        let script = Script::new(vec![(CHILD, vec![Step::Hang])]);
+        let rig = rig(&script);
+        let ack = spawn(&rig, CHILD, json!({}));
+        await_requests(&script, CHILD, 1);
+        let main = rig.hub.main();
+        let sent = say(&rig, main, ack.id, "too late", DeliveryKind::Steer);
+        rig.hub.stop(main, &[ack.id], StopOpts::default());
+        assert_eq!(
+            state_of(&rig, main, ack.id),
+            [AckState::Dropped("recipient_stopped")]
+        );
+        let notices = rig.hub.pending_notices(main);
+        let text = notices.iter().map(|n| n.text.as_str()).collect::<String>();
+        assert!(
+            text.contains(&format!("message {} to ", sent.id))
+                && text.contains("was dropped: recipient stopped"),
+            "{text}"
+        );
+        settle(&rig, ack.id);
+    }
+
+    #[test]
+    fn guard_release_into_full_inbox_is_dropped_and_reported() {
+        let script = Script::new(vec![("PARENT-A", vec![]), ("CHILD-B", vec![])]);
+        let (rig, a, b) = super::hub::pair(&script);
+        for n in 0..crate::runs::inbox::PAIR_BURST {
+            say(&rig, b, a, &format!("q{n}"), DeliveryKind::Quiet);
+        }
+        let held = say(&rig, a, b, "held", DeliveryKind::Quiet);
+        assert!(held.held);
+        assert_eq!(state_of(&rig, a, b), [AckState::Held]);
+        let inbox = rig.hub.inbox_of(b).unwrap();
+        for n in 0..crate::runs::inbox::MAX_PENDING {
+            let item = InboxItem::new(
+                MessageId(900 + n as u64),
+                rig.hub.main(),
+                "main".into(),
+                DeliveryKind::Quiet,
+                "x".into(),
+                std::time::Instant::now(),
+            );
+            inbox
+                .lock()
+                .enqueue_with(item, std::time::Instant::now(), false)
+                .unwrap();
+        }
+        rig.hub.note_work(b);
+        assert_eq!(state_of(&rig, a, b), [AckState::Dropped("inbox_full")]);
+        let text = rig
+            .hub
+            .pending_notices(a)
+            .iter()
+            .map(|n| n.text.clone())
+            .collect::<String>();
+        assert!(text.contains("was dropped: inbox full"), "{text}");
+    }
+
+    #[test]
+    fn records_are_bounded_per_sender_and_never_regress() {
+        let script = Script::new(vec![(CHILD, vec![Step::Hang])]);
+        let rig = rig(&script);
+        let ack = spawn(&rig, CHILD, json!({}));
+        let main = rig.hub.main();
+        for n in 0..(crate::runs::ack::MAX_ACKS_PER_SENDER + 5) {
+            rig.hub
+                .send(main, ack.id, format!("m{n}"), DeliveryKind::Quiet)
+                .ok();
+        }
+        assert!(rig.hub.acks_to(main, ack.id).len() <= crate::runs::ack::MAX_ACKS_PER_SENDER);
+        rig.hub.stop(main, &[ack.id], StopOpts::default());
+        settle(&rig, ack.id);
+    }
+
+    #[test]
+    fn slow_delivery_notice_after_sixty_seconds() {
+        let script = Script::new(vec![(CHILD, vec![Step::Hang])]);
+        let rig = rig(&script);
+        let ack = spawn(&rig, CHILD, json!({}));
+        await_requests(&script, CHILD, 1);
+        let main = rig.hub.main();
+        let sent = say(&rig, main, ack.id, "slow", DeliveryKind::Quiet);
+        rig.hub.slow_delivery(main, sent.id, ack.id);
+        let text = rig
+            .hub
+            .pending_notices(main)
+            .iter()
+            .map(|n| n.text.clone())
+            .collect::<String>();
+        assert!(text.contains("is not delivered after 60s"), "{text}");
+        rig.hub.stop(main, &[ack.id], StopOpts::default());
+        settle(&rig, ack.id);
     }
 }

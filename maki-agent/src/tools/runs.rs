@@ -584,7 +584,8 @@ fn list_or_show(
             .hub
             .resolve(runs.self_run, &key)
             .map_err(|e| format!("{e}: {key}"))?;
-        if !runs.hub.can_reach(runs.self_run, id) {
+        // A run may always read its own record.
+        if id != runs.self_run && !runs.hub.can_reach(runs.self_run, id) {
             return Err(format!("{}: {key}", UnitError::NotReachable));
         }
         let view = runs
@@ -592,6 +593,9 @@ fn list_or_show(
             .get(id)
             .ok_or_else(|| format!("UNKNOWN_RUN: {key}"))?;
         let mut out = record(&view);
+        for ack in runs.hub.acks_to(runs.self_run, id) {
+            let _ = write!(out, "\nmessage {}: {}", ack.id, ack.state);
+        }
         if view.kind == RunKind::Agent {
             out.push_str(&agent_result(&view, args.full.unwrap_or(false)));
         }
@@ -843,6 +847,43 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("steer, followup, quiet"), "{err}");
+    }
+
+    #[test]
+    fn runs_id_shows_message_acks_and_a_run_reads_itself() {
+        let ctx = ctx();
+        call(
+            Which::Spawn,
+            &ctx,
+            json!({"kind": "agent", "description": "Audit auth", "prompt": "look"}),
+        )
+        .unwrap();
+        call(
+            Which::Send,
+            &ctx,
+            json!({"to": "audit-auth", "message": "hello", "mode": "quiet"}),
+        )
+        .unwrap();
+        let record = call(Which::Runs, &ctx, json!({"id": "audit-auth"})).unwrap();
+        // The child may already have started and drained it.
+        assert!(record.contains("message m-1: "), "{record}");
+
+        // The child reads its own record; its parent is still out of reach.
+        let runs = ctx.runs.as_ref().unwrap();
+        let child = runs.hub.resolve(runs.self_run, "audit-auth").unwrap();
+        let mut own = stub_ctx(&AgentMode::Build);
+        own.runs = Some(RunsCtx {
+            hub: Arc::clone(&runs.hub),
+            self_run: child,
+        });
+        let me = call(Which::Runs, &own, json!({"id": "audit-auth"})).unwrap();
+        assert!(me.contains("description: Audit auth"), "{me}");
+        assert!(!me.contains("message m-1"), "{me}");
+        let err = call(Which::Runs, &own, json!({"id": "main"})).unwrap_err();
+        assert!(
+            err.starts_with("NOT_REACHABLE") || err.starts_with("UNKNOWN_RUN"),
+            "{err}"
+        );
     }
 
     #[test]
