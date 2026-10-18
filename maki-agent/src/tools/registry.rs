@@ -79,8 +79,14 @@ impl ToolAudience {
 
 #[derive(Clone, Debug)]
 pub enum ToolSource {
-    Mcp { server: Arc<str> },
-    Lua { plugin: Arc<str> },
+    Mcp {
+        server: Arc<str>,
+    },
+    Lua {
+        plugin: Arc<str>,
+    },
+    /// Rust built-ins registered by `runs::sync_registration`.
+    Native,
 }
 
 impl ToolSource {
@@ -88,6 +94,7 @@ impl ToolSource {
         match self {
             Self::Mcp { server } => Cow::Owned(format!("mcp:{server}")),
             Self::Lua { plugin } => Cow::Owned(format!("lua:{plugin}")),
+            Self::Native => Cow::Borrowed("native"),
         }
     }
 }
@@ -452,6 +459,16 @@ impl ToolRegistry {
             return Err(e);
         }
         Ok(())
+    }
+
+    pub fn clear_native(&self) {
+        self.tools.rcu(|current| {
+            current
+                .iter()
+                .filter(|t| !matches!(t.source, ToolSource::Native))
+                .cloned()
+                .collect::<Vec<_>>()
+        });
     }
 
     pub fn clear_lua(&self) {
@@ -832,5 +849,73 @@ mod tests {
         let result: ToolExecResult = base.into();
         let result = result.with_written_path(path);
         assert_eq!(result.written_path.as_deref(), expected);
+    }
+
+    fn native_registry(enabled: bool) -> ToolRegistry {
+        let reg = ToolRegistry::new();
+        let config = maki_config::RunsConfig {
+            enabled,
+            ..Default::default()
+        };
+        crate::runs::sync_registration(&reg, &config).unwrap();
+        reg
+    }
+
+    #[test]
+    fn native_tool_logs_source() {
+        let reg = native_registry(true);
+        let spawn = reg.get("spawn").unwrap();
+        assert!(matches!(spawn.source, ToolSource::Native));
+        assert_eq!(spawn.source.as_log_field(), "native");
+    }
+
+    #[test]
+    fn native_tools_declare_reach() {
+        let reg = native_registry(true);
+        let snapshot = reg.iter();
+        assert_eq!(snapshot.len(), 5);
+        for entry in snapshot.iter() {
+            let reach = entry.tool.reach().unwrap_or_else(|| {
+                panic!("native tool {} leaves its reach undeclared", entry.name())
+            });
+            let spawn = entry.name() == "spawn";
+            assert_eq!(reach.prompted, spawn, "{}", entry.name());
+            let expected = if spawn {
+                Permission::Run
+            } else {
+                Permission::Agent
+            };
+            assert_eq!(reach.permission, expected, "{}", entry.name());
+        }
+    }
+
+    #[test_case(ToolAudience::MAIN, &["send", "runs", "spawn", "stop", "wait"] ; "main")]
+    #[test_case(ToolAudience::GENERAL_SUB, &["send", "runs", "spawn", "stop", "wait"] ; "general_sub")]
+    #[test_case(ToolAudience::RESEARCH_SUB, &["send", "runs", "wait"] ; "research_sub")]
+    #[test_case(ToolAudience::INTERPRETER, &[] ; "interpreter")]
+    fn native_run_tools_per_audience(audience: ToolAudience, expected: &[&str]) {
+        let mut names: Vec<String> = crate::runs::native_run_tools(audience)
+            .iter()
+            .map(|t| t.name().to_owned())
+            .collect();
+        names.sort();
+        let mut expected: Vec<&str> = expected.to_vec();
+        expected.sort();
+        assert_eq!(names, expected);
+    }
+
+    #[test]
+    fn sync_registration_follows_the_flag() {
+        let reg = native_registry(false);
+        assert!(reg.iter().is_empty());
+        let on = maki_config::RunsConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        crate::runs::sync_registration(&reg, &on).unwrap();
+        crate::runs::sync_registration(&reg, &on).unwrap();
+        assert_eq!(reg.iter().len(), 5);
+        crate::runs::sync_registration(&reg, &Default::default()).unwrap();
+        assert!(reg.iter().is_empty());
     }
 }

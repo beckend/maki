@@ -11,6 +11,7 @@ pub mod grep;
 pub mod hook;
 pub mod interpreter_bridge;
 pub mod registry;
+pub mod runs;
 pub mod schema;
 
 pub use deadline::Deadline;
@@ -39,6 +40,7 @@ use crate::cancel::{CancelMap, CancelToken};
 use crate::mcp::McpSession;
 use crate::permissions::PermissionManager;
 use crate::prompt::ResolvedPrompts;
+use crate::runs::RunsCtx;
 use crate::{AgentConfig, AgentMode, EventSender, RunLedger, SharedBuf};
 use maki_config::{ModelPolicy, ToolOutputLines};
 use maki_providers::Model;
@@ -370,6 +372,8 @@ pub struct ToolContext {
     /// clears it, and each caller sets it for its own call only.
     pub live_sink: Option<flume::Sender<ToolLive>>,
     pub model_policy: Arc<ModelPolicy>,
+    /// `None` for `maki index` and tests, or when `[agent.runs]` is off.
+    pub runs: Option<RunsCtx>,
 }
 
 /// Live progress of a dispatched child tool, streamed while it runs.
@@ -519,7 +523,9 @@ pub fn truncate_output(text: String, max_lines: usize, max_bytes: usize) -> Stri
 pub fn is_builtin_tool(name: &str) -> bool {
     let bundled_tool = maki_config::DEFAULT_BUILTINS.contains(&name)
         && !maki_config::PROVIDER_BUILTINS.contains(&name);
-    bundled_tool || maki_config::EDIT_SUB_TOOLS.contains(&name)
+    bundled_tool
+        || maki_config::EDIT_SUB_TOOLS.contains(&name)
+        || runs::RUN_TOOL_NAMES.contains(&name)
 }
 
 pub fn all_builtin_tool_names() -> Vec<&'static str> {
@@ -527,6 +533,7 @@ pub fn all_builtin_tool_names() -> Vec<&'static str> {
         .iter()
         .filter(|name| !maki_config::PROVIDER_BUILTINS.contains(name))
         .chain(maki_config::EDIT_SUB_TOOLS.iter())
+        .chain(runs::RUN_TOOL_NAMES.iter())
         .copied()
         .collect()
 }
@@ -601,6 +608,7 @@ pub fn interpreter_ctx(
         local_tools: LocalTools::default(),
         live_sink: None,
         model_policy: Arc::new(ModelPolicy::default()),
+        runs: None,
     }
 }
 

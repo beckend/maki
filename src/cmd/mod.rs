@@ -100,6 +100,12 @@ fn load_plugins(
     maki_lua::set_allowed_private_hosts(&config.net.allowed_private_hosts);
     maki_lua::set_shell_preference(config.agent.shell.clone());
 
+    // Before the builtins load, so a plugin cannot shadow a native tool.
+    if let Err(e) = maki_agent::runs::sync_registration(ToolRegistry::global(), &config.agent.runs)
+    {
+        warnings.push(format!("agent.runs: {e}"));
+    }
+
     if let Err(e) = host.load_builtins(&config.plugins) {
         let e = color_eyre::eyre::Report::from(e).wrap_err("load builtin plugins");
         match on_builtin_failure {

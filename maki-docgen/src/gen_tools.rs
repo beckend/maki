@@ -1,6 +1,7 @@
 use maki_agent::template::Vars;
+use maki_agent::tools::runs::RUN_TOOL_NAMES;
 use maki_agent::tools::{DescriptionContext, ToolAudience, ToolFilter, ToolRegistry, ToolSource};
-use maki_config::{PluginFileConfig, PluginsConfig};
+use maki_config::{PluginFileConfig, PluginsConfig, RunsConfig};
 use regex::Regex;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -39,6 +40,7 @@ const SECTIONS: &[(&str, &[&str])] = &[
         "Agent & Knowledge",
         &["task", "todo_write", "memory", "skill"],
     ),
+    ("Background Runs", &RUN_TOOL_NAMES),
     ("Web", &["webfetch", "websearch"]),
 ];
 
@@ -232,6 +234,14 @@ fn load_registry_with_builtins() -> (Arc<ToolRegistry>, HashSet<String>) {
     let config = PluginsConfig::from_plugins(HashMap::from([("edit".to_owned(), edit)]));
 
     let registry = Arc::new(ToolRegistry::new());
+    maki_agent::runs::sync_registration(
+        &registry,
+        &RunsConfig {
+            enabled: true,
+            ..RunsConfig::default()
+        },
+    )
+    .expect("registering native run tools");
     let host = in_registration_window(|| {
         let mut host = PluginHost::new(Arc::clone(&registry)).expect("plugin host");
         host.load_builtins(&config)
@@ -246,6 +256,7 @@ fn load_registry_with_builtins() -> (Arc<ToolRegistry>, HashSet<String>) {
         .flatten()
         .filter(|o| o.ty == OptionType::Boolean && o.default == Some(Value::Bool(false)))
         .map(|o| o.name)
+        .chain(RUN_TOOL_NAMES.iter().map(|n| (*n).to_owned()))
         .collect();
     (registry, opt_in)
 }
@@ -297,9 +308,9 @@ pub fn generate() -> String {
     writeln!(
         out,
         "Maki ships with {total} built-in tools in this reference \
-         ({default_n} on by default, {opt_in_n} opt-in via plugin options). \
+         ({default_n} on by default, {opt_in_n} opt-in via plugin options or `agent.runs.enabled`). \
          Tools marked **opt-in** are off until you enable them under `plugins` \
-         in [Configuration](/docs/configuration/)."
+         or `agent.runs` in [Configuration](/docs/configuration/)."
     )
     .unwrap();
 

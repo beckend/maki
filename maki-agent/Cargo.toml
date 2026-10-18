@@ -3,6 +3,10 @@ name = "maki-agent"
 version.workspace = true
 edition.workspace = true
 
+[features]
+# Scripted providers in `test_support`, for suites in other crates.
+test-support = []
+
 [dependencies]
 maki-providers = { workspace = true }
 maki-config = { workspace = true }
