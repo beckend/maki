@@ -85,6 +85,8 @@ pub struct Chat {
     /// The moved call `/tasks` lists this task under.
     pub(crate) parent: Option<TaskParent>,
     pub(crate) clock: Option<TaskClock>,
+    /// What a native run is, for the session record (`StoredSubagent::run`).
+    pub(crate) run: Option<maki_storage::sessions::StoredRun>,
     pub cost: Option<f64>,
     /// This chat's slice of the session's list-price reference cost; mirrors
     /// `cost`, but only ever set for subsidised models.
@@ -134,6 +136,7 @@ impl Chat {
             backs_moved_call: false,
             parent: None,
             clock: None,
+            run: None,
             cost: None,
             list_cost: None,
             context_size: 0,

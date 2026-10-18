@@ -250,7 +250,7 @@ impl App {
     /// task dropped from it must still come back on reload. Called only
     /// where the meta is read, every checkpoint and a rewind, so no
     /// transition has to remember it.
-    fn sync_subagents(&mut self) {
+    pub(crate) fn sync_subagents(&mut self) {
         let subagents = self
             .chats
             .iter()
@@ -267,7 +267,7 @@ impl App {
                     cost: chat.cost,
                     started_at: chat.clock.as_ref().and_then(TaskClock::started_at),
                     ended_at: chat.clock.as_ref().and_then(TaskClock::ended_at),
-                    run: None,
+                    run: chat.run.clone(),
                 })
             })
             .collect();

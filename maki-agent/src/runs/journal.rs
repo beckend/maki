@@ -271,6 +271,7 @@ impl UnitHub {
                 self.jot(JournalRecord::Term(term));
             }
             report.requeued_notices = self.requeue_notices(&replay);
+            self.adopt_tombstones(&replay);
         }
         if let Some((info, wake, text)) = notice {
             self.push_notice(self.main, info, text, wake);
@@ -442,10 +443,62 @@ impl UnitHub {
 
 /// The table entry for a run the journal shows as unfinished.
 fn restore_lost(run: &RunState, detail: &str) -> Option<Unit> {
+    restore_unit(
+        run,
+        UnitState::Done(Box::new(Terminal {
+            reason: DoneReason::Lost,
+            exit_code: None,
+            detail: Some(detail.to_owned()),
+            result: UnitResult::default(),
+        })),
+    )
+}
+
+/// The spec a run was started with, as `spawn_record` wrote it.
+pub(super) fn agent_spec_from_json(spec: &Value) -> AgentSpec {
+    let text = |key: &str| spec.get(key).and_then(Value::as_str).map(str::to_owned);
+    let flag = |key: &str| spec.get(key).and_then(Value::as_bool).unwrap_or(false);
+    AgentSpec {
+        prompt: text("prompt").unwrap_or_default(),
+        subagent_type: text("subagent_type").unwrap_or_else(|| "general".to_owned()),
+        model_tier: text("model_tier"),
+        thinking: text("thinking"),
+        output_schema: spec.get("output_schema").filter(|v| !v.is_null()).cloned(),
+        fork: flag("fork"),
+        one_shot: flag("one_shot"),
+        timeout_secs: spec
+            .get("timeout_secs")
+            .and_then(Value::as_u64)
+            .unwrap_or(DEFAULT_AGENT_TIMEOUT_SECS),
+    }
+}
+
+/// A finished run of an earlier process as the journal recorded it.
+pub(super) fn restore_finished(run: &RunState) -> Option<Unit> {
+    let term = run.term.as_ref()?;
+    let mut unit = restore_unit(
+        run,
+        UnitState::Done(Box::new(Terminal {
+            reason: DoneReason::parse(&term.reason).unwrap_or(DoneReason::Completed),
+            exit_code: term.exit_code,
+            detail: term.detail.clone(),
+            result: UnitResult {
+                cost: term.cost,
+                turns: term.turns,
+                elapsed_ms: term.elapsed_ms,
+                ..UnitResult::default()
+            },
+        })),
+    )?;
+    unit.cost = term.cost;
+    unit.finished_at = Some(time_of(run.term_ts));
+    Some(unit)
+}
+
+fn restore_unit(run: &RunState, state: UnitState) -> Option<Unit> {
     let spawn = &run.spawn;
     let spec = &spawn.spec;
     let text = |key: &str| spec.get(key).and_then(Value::as_str).map(str::to_owned);
-    let flag = |key: &str| spec.get(key).and_then(Value::as_bool).unwrap_or(false);
     let secs = spec
         .get("timeout_secs")
         .and_then(Value::as_u64)
@@ -458,16 +511,7 @@ fn restore_lost(run: &RunState, detail: &str) -> Option<Unit> {
             watch: text("watch"),
         })
     } else {
-        UnitKind::Agent(AgentSpec {
-            prompt: text("prompt").unwrap_or_default(),
-            subagent_type: text("subagent_type").unwrap_or_else(|| "general".to_owned()),
-            model_tier: text("model_tier"),
-            thinking: text("thinking"),
-            output_schema: spec.get("output_schema").filter(|v| !v.is_null()).cloned(),
-            fork: flag("fork"),
-            one_shot: flag("one_shot"),
-            timeout_secs: secs,
-        })
+        UnitKind::Agent(agent_spec_from_json(spec))
     };
     let id = UnitId(spawn.id.parse::<MakiId>().ok()?);
     let owner = spawn.owner.parse::<MakiId>().map_or_else(|_| id, UnitId);
@@ -491,12 +535,7 @@ fn restore_lost(run: &RunState, detail: &str) -> Option<Unit> {
         kind,
         description: spawn.desc.clone(),
         origin_tool_use_id: spawn.origin_tool_use_id.as_deref().map(Arc::from),
-        state: UnitState::Done(Box::new(Terminal {
-            reason: DoneReason::Lost,
-            exit_code: None,
-            detail: Some(detail.to_owned()),
-            result: UnitResult::default(),
-        })),
+        state,
         created_at: time_of(run.spawn_ts),
         started_at: Some(time_of(run.spawn_ts)),
         finished_at: Some(SystemTime::now()),
@@ -608,11 +647,11 @@ mod tests {
         cmd.spawn().unwrap()
     }
 
-    fn until(what: &str, mut f: impl FnMut() -> bool) {
+    async fn until(what: &str, mut f: impl FnMut() -> bool) {
         let deadline = Instant::now() + Duration::from_secs(20);
         while !f() {
             assert!(Instant::now() < deadline, "timed out waiting for {what}");
-            std::thread::sleep(Duration::from_millis(10));
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
 
@@ -621,8 +660,8 @@ mod tests {
         hub.get(id).unwrap()
     }
 
-    #[test]
-    fn running_agent_becomes_lost() {
+    #[tokio::test]
+    async fn running_agent_becomes_lost() {
         let dir = tempfile::tempdir().unwrap();
         crashed_journal(
             dir.path(),
@@ -655,8 +694,8 @@ mod tests {
         assert!(again.pending_notices(again.main()).len() <= 1);
     }
 
-    #[test]
-    fn reconcile_without_journal_is_a_noop() {
+    #[tokio::test]
+    async fn reconcile_without_journal_is_a_noop() {
         let (tx, _rx) = flume::unbounded::<Envelope>();
         let hub = UnitHub::new(
             UnitLimits::default(),
@@ -666,8 +705,8 @@ mod tests {
         assert_eq!(hub.reconcile(), ReconcileReport::default());
     }
 
-    #[test]
-    fn lost_notice_queued_once_idempotent() {
+    #[tokio::test]
+    async fn lost_notice_queued_once_idempotent() {
         let dir = tempfile::tempdir().unwrap();
         crashed_journal(
             dir.path(),
@@ -705,8 +744,8 @@ mod tests {
         assert!(hub.pending_notices(hub.main()).is_empty());
     }
 
-    #[test]
-    fn single_lost_run_uses_the_per_run_wording() {
+    #[tokio::test]
+    async fn single_lost_run_uses_the_per_run_wording() {
         let dir = tempfile::tempdir().unwrap();
         crashed_journal(dir.path(), vec![spawn_rec("ag-aaaaaa", "agent", "quiet")]);
         let hub = hub_with(dir.path());
@@ -720,8 +759,8 @@ mod tests {
         assert!(!notices[0].wake);
     }
 
-    #[test]
-    fn orphan_killed_only_when_start_time_matches() {
+    #[tokio::test]
+    async fn orphan_killed_only_when_start_time_matches() {
         let dir = tempfile::tempdir().unwrap();
         let mut right = sleeper();
         let mut recycled = sleeper();
@@ -748,7 +787,7 @@ mod tests {
         let hub = hub_with(dir.path());
         let report = hub.reconcile();
         assert_eq!(report.orphans_killed, vec![right.id()]);
-        until("orphan to die", || right.try_wait().unwrap().is_some());
+        until("orphan to die", || right.try_wait().unwrap().is_some()).await;
         assert!(
             recycled.try_wait().unwrap().is_none(),
             "recycled pid was killed"
@@ -764,8 +803,8 @@ mod tests {
         let _ = recycled.wait();
     }
 
-    #[test]
-    fn a_non_leader_at_the_recorded_pid_is_left_alone() {
+    #[tokio::test]
+    async fn a_non_leader_at_the_recorded_pid_is_left_alone() {
         let dir = tempfile::tempdir().unwrap();
         // Same process, same start time, but not the leader of its own group.
         let mut child = Command::new("sleep").arg("311").spawn().unwrap();
@@ -788,8 +827,8 @@ mod tests {
         let _ = child.wait();
     }
 
-    #[test]
-    fn a_record_from_another_boot_never_kills() {
+    #[tokio::test]
+    async fn a_record_from_another_boot_never_kills() {
         let dir = tempfile::tempdir().unwrap();
         let mut child = sleeper();
         let (pid, ticks) = (child.id(), proc_info(child.id()).unwrap().start_ticks);
@@ -828,8 +867,8 @@ mod tests {
         let _ = child.wait();
     }
 
-    #[test]
-    fn a_shell_is_recorded_before_it_runs_its_command() {
+    #[tokio::test]
+    async fn a_shell_is_recorded_before_it_runs_its_command() {
         // The command writes a marker; the journal must already know the
         // process when the marker appears.
         let dir = tempfile::tempdir().unwrap();
@@ -842,7 +881,7 @@ mod tests {
         .unwrap();
         let journal = Arc::clone(hub.journal.get().unwrap());
         hub.spawn(hub.main(), req).unwrap();
-        until("marker", || marker.exists());
+        until("marker", || marker.exists()).await;
         // Read the file directly: no flush may be what makes it durable.
         let on_disk = Replay::read(journal.dir());
         assert!(
@@ -852,8 +891,8 @@ mod tests {
         hub.shutdown();
     }
 
-    #[test]
-    fn clean_shutdown_with_a_running_shell_reports_nothing_lost() {
+    #[tokio::test]
+    async fn clean_shutdown_with_a_running_shell_reports_nothing_lost() {
         let dir = tempfile::tempdir().unwrap();
         let hub = hub_with(dir.path());
         let req: SpawnRequest = serde_json::from_value(json!({
@@ -864,13 +903,14 @@ mod tests {
         let journal = Arc::clone(hub.journal.get().unwrap());
         until("proc record", || {
             journal.replay().runs.iter().any(|r| r.proc.is_some())
-        });
+        })
+        .await;
         let pgid = journal.replay().runs[0].proc.as_ref().unwrap().pgid;
         hub.shutdown();
         let replay = Replay::read(journal.dir());
         assert!(replay.clean_mark);
         assert!(replay.runs[0].term.is_some(), "{:?}", replay.runs[0]);
-        until("group gone", || !shell::group_exists(pgid));
+        until("group gone", || !shell::group_exists(pgid)).await;
         drop(journal);
         drop(hub);
         let again = hub_with(dir.path());
@@ -884,8 +924,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn live_spawn_is_journaled_and_settles() {
+    #[tokio::test]
+    async fn live_spawn_is_journaled_and_settles() {
         let dir = tempfile::tempdir().unwrap();
         let hub = hub_with(dir.path());
         let req: SpawnRequest = serde_json::from_value(json!({
@@ -900,15 +940,16 @@ mod tests {
                 .runs
                 .iter()
                 .any(|r| r.spawn.handle == ack.handle.to_string() && r.term.is_some())
-        });
+        })
+        .await;
         let run = &journal.replay().runs[0];
         assert!(run.proc.is_some());
         assert_eq!(run.spawn.spec["command"], "echo hi");
         assert_eq!(run.term.as_ref().unwrap().exit_code, Some(0));
     }
 
-    #[test]
-    fn messages_and_acks_are_journaled() {
+    #[tokio::test]
+    async fn messages_and_acks_are_journaled() {
         let dir = tempfile::tempdir().unwrap();
         crashed_journal(dir.path(), vec![]);
         let hub = hub_with(dir.path());
@@ -941,8 +982,8 @@ mod session_tests {
         EventSender::new(tx, 0)
     }
 
-    #[test]
-    fn disabled_creates_no_files() {
+    #[tokio::test]
+    async fn disabled_creates_no_files() {
         let root = tempfile::tempdir().unwrap();
         let config = maki_config::RunsConfig {
             enabled: false,
@@ -955,8 +996,8 @@ mod session_tests {
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
     }
 
-    #[test]
-    fn enabled_journals_a_new_session_in_a_private_dir() {
+    #[tokio::test]
+    async fn enabled_journals_a_new_session_in_a_private_dir() {
         let root = tempfile::tempdir().unwrap();
         let dir = root.path().join("s1");
         let config = maki_config::RunsConfig {

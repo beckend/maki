@@ -88,10 +88,11 @@ pub enum JournalRecord {
 impl JournalRecord {
     /// Records that must survive a crash a moment later.
     fn critical(&self) -> bool {
-        matches!(
-            self,
-            Self::Hdr(_) | Self::Spawn(_) | Self::Term(_) | Self::Proc(_) | Self::Mark(_)
-        )
+        matches!(self, Self::State(s) if s.state == STATE_REVIVED)
+            || matches!(
+                self,
+                Self::Hdr(_) | Self::Spawn(_) | Self::Term(_) | Self::Proc(_) | Self::Mark(_)
+            )
     }
 }
 
@@ -238,6 +239,20 @@ pub struct Replay {
     pub corrupt: usize,
     pub unknown: usize,
     pub dropped: u64,
+    /// Where the journal lives, when it was read from a directory: a finished
+    /// run whose transcript is still there outlives the retention window.
+    pub dir: Option<PathBuf>,
+}
+
+/// `StateRec.state` of a run that was finished and works again (cold revive).
+pub const STATE_REVIVED: &str = "revived";
+
+/// Directory of the per-turn transcripts of agent runs, beside the journal.
+pub const TRANSCRIPTS_DIR: &str = "transcripts";
+
+/// `<dir>/transcripts/<handle>.ndjson`.
+pub fn transcript_path(dir: &Path, handle: &str) -> PathBuf {
+    dir.join(TRANSCRIPTS_DIR).join(format!("{handle}.ndjson"))
 }
 
 impl Replay {
@@ -246,6 +261,7 @@ impl Replay {
             Ok(file) => Self::parse_reader(io::BufReader::new(file)),
             Err(_) => Self::default(),
         };
+        replay.dir = Some(dir.to_owned());
         let bodies = read_bodies(dir);
         for m in &mut replay.messages {
             m.rec.body = bodies.get(&m.rec.id).cloned();
@@ -322,10 +338,16 @@ impl Replay {
                 }
             }
             JournalRecord::State(s) => {
-                if let Some(run) = self.run_mut(&s.handle)
-                    && run.term.is_none()
-                {
-                    run.state = s.state;
+                if let Some(run) = self.run_mut(&s.handle) {
+                    if s.state == STATE_REVIVED {
+                        // A finished agent got a message and works again: it
+                        // is unfinished once more, so a crash now loses it.
+                        run.term = None;
+                        run.term_ts = 0;
+                        run.state = "running".to_owned();
+                    } else if run.term.is_none() {
+                        run.state = s.state;
+                    }
                 }
             }
             JournalRecord::Proc(p) => {
@@ -370,6 +392,15 @@ impl Replay {
         self.runs.iter_mut().find(|r| r.spawn.handle == handle)
     }
 
+    /// A tombstone (design 7.4) lives as long as the transcript it points to.
+    fn has_transcript(&self, spawn: &SpawnRec) -> bool {
+        spawn.kind == "agent"
+            && self
+                .dir
+                .as_ref()
+                .is_some_and(|d| transcript_path(d, &spawn.handle).exists())
+    }
+
     /// The records that rebuild this state and nothing else: terminal runs
     /// older than a day, delivered message bodies and settled notices go.
     pub fn compacted(&self, now_ms: u64) -> Vec<Entry> {
@@ -386,7 +417,9 @@ impl Replay {
         )];
         let mut kept: Vec<&str> = Vec::new();
         for run in &self.runs {
-            let old = run.term.is_some() && now_ms.saturating_sub(run.term_ts) > RETAIN_TERMINAL_MS;
+            let old = run.term.is_some()
+                && now_ms.saturating_sub(run.term_ts) > RETAIN_TERMINAL_MS
+                && !self.has_transcript(&run.spawn);
             if old {
                 continue;
             }
@@ -1173,6 +1206,48 @@ mod tests {
         assert_eq!(r.runs.len(), 200);
         j.append(term("live-0", "completed"));
         assert!(j.replay().runs[0].term.is_some());
+    }
+
+    #[test]
+    fn old_agent_with_a_transcript_survives_compaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = Arc::new(AtomicU64::new(1_000));
+        let j = RunJournal::open_in(dir.path().to_owned(), opts(Arc::clone(&now), 4096)).unwrap();
+        for h in ["ag-kept", "ag-gone"] {
+            j.append(spawn(h));
+            j.append(term(h, "completed"));
+        }
+        let path = transcript_path(dir.path(), "ag-kept");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "{}\n").unwrap();
+        j.flush();
+        now.store(1_000 + RETAIN_TERMINAL_MS + 10, Ordering::Relaxed);
+        for i in 0..200 {
+            j.append(spawn(&format!("live-{i}")));
+        }
+        let handles: Vec<_> = j
+            .replay()
+            .runs
+            .iter()
+            .map(|r| r.spawn.handle.clone())
+            .collect();
+        assert!(handles.contains(&"ag-kept".to_owned()));
+        assert!(!handles.contains(&"ag-gone".to_owned()));
+    }
+
+    #[test]
+    fn revived_state_reopens_a_finished_run() {
+        let r = Replay::parse(
+            format!(
+                "{}\n{}\n{}\n",
+                r#"{"v":1,"ts":1,"t":"spawn","handle":"ag-a","kind":"agent"}"#,
+                r#"{"v":1,"ts":2,"t":"term","handle":"ag-a","reason":"completed"}"#,
+                r#"{"v":1,"ts":3,"t":"state","handle":"ag-a","state":"revived"}"#,
+            )
+            .as_bytes(),
+        );
+        assert!(r.runs[0].term.is_none());
+        assert_eq!(r.runs[0].state, "running");
     }
 
     #[test]

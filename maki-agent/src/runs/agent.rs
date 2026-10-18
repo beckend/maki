@@ -4,7 +4,7 @@
 //! anything the parent's turn cancels.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
@@ -118,9 +118,18 @@ pub struct AgentLaunch {
     mode: AgentMode,
     pub(super) model_spec: String,
     pub(super) fork: Option<Arc<Vec<Message>>>,
+    /// Rebuilt from a saved transcript (`fork` is that transcript) and started
+    /// by a message, not by `spec.prompt`.
+    pub(super) revived: bool,
 }
 
 impl AgentLaunch {
+    /// Whether the run has to end with a `structured_output` call.
+    #[cfg(test)]
+    pub(super) fn has_schema(&self) -> bool {
+        self.structured.is_some()
+    }
+
     pub(super) fn request_options(&self) -> RequestOptions {
         self.opts
     }
@@ -262,6 +271,7 @@ impl AgentLaunch {
             mode: AgentMode::Build,
             model_spec,
             fork: None,
+            revived: false,
         })
     }
 }
@@ -404,6 +414,11 @@ pub(super) fn start(
     launch.params.runs = hub
         .upgrade()
         .map(|hub| super::RunsCtx { hub, self_run: id });
+    let path = hub.upgrade().and_then(|hub| hub.transcript_path(&handle));
+    let saved = match (&launch.fork, launch.revived) {
+        (Some(loaded), true) => loaded.len(),
+        _ => 0,
+    };
     let driver = Driver {
         hub,
         id,
@@ -413,6 +428,8 @@ pub(super) fn start(
         started: Instant::now(),
         turns: AtomicU32::new(0),
         staged: Mutex::default(),
+        transcript: path,
+        saved: AtomicUsize::new(saved),
     };
     let task = tokio::spawn(driver.drive(spec, launch));
     *lock(&run.task) = Some(task);
@@ -428,6 +445,10 @@ struct Driver {
     turns: AtomicU32,
     /// Taken from the inbox to start or restart a turn, not yet in history.
     staged: Mutex<Vec<InboxItem>>,
+    /// Where the history is saved turn by turn; `None` without a journal.
+    transcript: Option<std::path::PathBuf>,
+    /// How many history messages the transcript file already holds.
+    saved: AtomicUsize,
 }
 
 /// How one `Agent::run` ended, with what the model said.
@@ -539,14 +560,20 @@ impl Driver {
         let (tx, rx) = flume::unbounded::<Envelope>();
         let events = EventSender::new(tx, 0);
 
-        let mut message = spec.prompt.clone();
-        if launch.structured.is_some() {
+        let mut message = if launch.revived {
+            String::new()
+        } else {
+            spec.prompt.clone()
+        };
+        if launch.structured.is_some() && !launch.revived {
             message.push_str(STRUCTURED_OUTPUT_PROMPT_SUFFIX);
         }
         let first = self.run.inbox.take_start();
         self.delivered(&first);
         if !first.is_empty() {
-            message.push_str("\n\n");
+            if !message.is_empty() {
+                message.push_str("\n\n");
+            }
             message.push_str(&inbox::frame(&first, None));
         }
         loop {
@@ -593,6 +620,7 @@ impl Driver {
             // Before the state change, so whoever sees the state also finds the
             // transcript.
             self.send_history(history);
+            self.persist(history).await;
             let ledger = launch.params.ledger.totals();
             result.turns = self.turns.load(Ordering::Relaxed);
             result.elapsed_ms = elapsed_ms(self.started);
@@ -605,14 +633,21 @@ impl Driver {
                 Verdict::Idle { interrupted } if !spec.one_shot => {
                     match self.settle(result, !interrupted) {
                         Settled::Restart(text) => message = text,
-                        Settled::Idle => match self.idle_until_woken().await {
-                            Some(text) => message = text,
-                            None => {
-                                self.finish(UnitDone::Killed, None, UnitResult::default())
-                                    .await;
-                                return;
+                        Settled::Idle => {
+                            // Not under the inbox lock `settle` held: a sweep
+                            // may stop other runs.
+                            if let Some(hub) = self.hub() {
+                                hub.sweep();
                             }
-                        },
+                            match self.idle_until_woken().await {
+                                Some(text) => message = text,
+                                None => {
+                                    self.finish(UnitDone::Killed, None, UnitResult::default())
+                                        .await;
+                                    return;
+                                }
+                            }
+                        }
                         Settled::Stopped => {
                             self.finish(UnitDone::Killed, None, UnitResult::default())
                                 .await;
@@ -924,6 +959,33 @@ impl Driver {
                 subagent: Some(self.run.info.clone()),
                 run_id: crate::BACKGROUND_RUN_ID,
             });
+        }
+    }
+
+    /// Appends what the turn added to the transcript file. Off the executor:
+    /// it is a file write, and the run is not waiting on anything else.
+    async fn persist(&self, history: &History) {
+        let Some(path) = self.transcript.clone() else {
+            return;
+        };
+        let all = history.as_slice();
+        let saved = self.saved.load(Ordering::Relaxed);
+        let shrunk = all.len() < saved;
+        let slice = if shrunk { all } else { &all[saved..] };
+        let batch = slice.to_vec();
+        let total = all.len();
+        let wrote = tokio::task::spawn_blocking(move || {
+            if shrunk {
+                super::transcript::rewrite(&path, &batch)
+            } else {
+                super::transcript::append(&path, &batch)
+            }
+        })
+        .await;
+        match wrote {
+            Ok(Ok(())) => self.saved.store(total, Ordering::Relaxed),
+            Ok(Err(e)) => tracing::warn!(error = %e, "transcript write failed"),
+            Err(e) => tracing::warn!(error = %e, "transcript write failed"),
         }
     }
 
