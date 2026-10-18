@@ -556,6 +556,31 @@ mod tests {
         assert!(context_update(&told, &now, &ResolvedPrompts::default()).is_none());
     }
 
+    /// A resumed session: the history says the main agent has children, the
+    /// hub is empty. The next update corrects the model; and replaying
+    /// several updates leaves the latest topology.
+    #[test]
+    fn resumed_session_is_corrected_and_latest_update_wins() {
+        let mut told = facts();
+        told.topology = Some(main_topology());
+        let now = facts();
+        let update = context_update(&told, &now, &ResolvedPrompts::default()).unwrap();
+        let text = update.first_text_content().unwrap();
+        assert!(text.contains("You have no unfinished runs."), "{text}");
+
+        let mut replayed = facts();
+        let mut grown = main_topology();
+        grown.children.push(("ag-zzzzzz".into(), "zed".into(), 0));
+        for topology in [main_topology(), grown.clone()] {
+            let mut step = replayed.clone();
+            step.topology = Some(topology);
+            let u = context_update(&replayed, &step, &ResolvedPrompts::default()).unwrap();
+            replayed.apply(u.facts_update().unwrap());
+        }
+        replayed.apply(update.facts_update().unwrap());
+        assert_eq!(replayed, now);
+    }
+
     /// The cache key of a session is its system prompt and its tools. Telling
     /// the topology appends a message and touches neither.
     #[test]
