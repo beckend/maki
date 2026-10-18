@@ -236,7 +236,7 @@ get DEPTH_LIMIT and must do the work yourself.
 | `subagent_type` | string | no |  | agent only. research is read-only; general can edit. Default general. |
 | `thinking` | string | no |  |  |
 | `timeout_secs` | integer | no |  | Wall clock limit. Default: 1800 for agents, 3600 for shell. Expiry ends the run as timed_out. |
-| `watch` | string | no |  | shell only. Regex; each matching output line becomes a notice (max 1 per second, then batched). |
+| `watch` | string | no |  | shell only. Regex (Rust syntax) matched against each stdout/stderr line; matches become notices, at most 1 per second (lines in between are batched) and 20 per minute, then one overflow notice. Wakes you only with notify=wake. A bad regex is rejected. |
 
 ### `send` <span class="badge badge-optin">opt-in</span> {#send}
 

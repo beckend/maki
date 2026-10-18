@@ -316,7 +316,7 @@ Schema:
     "command": {"type": "string", "description": "shell only. Command line run with the user's shell."},
     "cwd": {"type": "string"},
     "timeout_secs": {"type": "integer", "minimum": 1, "description": "Wall clock limit. Default: 1800 for agents, 3600 for shell. Expiry ends the run as timed_out."},
-    "watch": {"type": "string", "description": "shell only (phase 2b). Regex; each matching output line becomes a notice (max 1 per second, then batched)."},
+    "watch": {"type": "string", "description": "shell only. Regex (Rust syntax) matched against each stdout/stderr line; matches become notices, at most 1 per second (lines in between are batched) and 20 per minute, then one overflow notice. Wakes you only with notify=wake. A bad regex is rejected."},
     "notify": {"enum": ["wake", "quiet", "never"], "description": "On finish: wake starts a turn if you are idle (default), quiet waits for your next turn, never sends nothing (read with runs)."}
   }
 }
@@ -1336,6 +1336,8 @@ unless `notify=wake`. Tests: `shell::match_notices_rate_limited`, `shell::bad_re
 `shell::match_batches_after_first_per_second`. E2E: spawn a loop echoing `error` lines with
 `watch=error`; `runs` shows the batched matches.
 Commit: `feat: shell watch notices`.
+
+Notes from the build: the code is `runs/watch.rs`. The shell's stdout and stderr already share one pipe, so the pump feeds the raw chunks to a `Watch` (line splitter, `regex::Regex`, pure `Limiter`) before the log-cap check, which means matching continues after the log limit is hit; a trailing line without a newline is matched at EOF and an 8 KiB line is matched in pieces. The regex is compiled in `SpawnRequest::into_kind`, so a bad one fails `spawn` with `BAD_FIELD: "watch" is not a valid regex` and no run is created (Rust `regex` syntax; the pump compiles it again). The limiter sends the first match at once, holds later ones for at least 1 s (a pump timer on the hub clock flushes them when the output goes quiet; at most 50 lines per notice, the rest counted as `(+N more matching lines)`), and after 20 match notices in a 60 s window sends one `Overflow` notice and drops matches until the window rolls over; held lines are flushed at EOF. Notices are `Match` kind with generation 0, so the inbox's existing collapse folds identical texts into `(xN)` and a read of a finished run does not consume them (only `Settled` ones are claimed). They wake only under `notify=wake` (the default) and so spend the wake budget like any waking notice (a noisy watch can use up the three wakes; the claim then demotes them and queues the usual overflow marker); `notify=quiet` makes them quiet and `never` suppresses them (read with `runs`). Match lines are cut at 300 characters in the notice. The limits are constants (`MIN_GAP`, `WINDOW`, `MAX_PER_WINDOW`). Tests: `watch::tests::match_notices_rate_limited` (limiter cap and roll-over), `shell::tests::match_batches_after_first_per_second`, `shell::tests::bad_regex_rejected` and a real-process test (`sh -c 'echo a; echo ERROR b; sleep 1'` with `watch=ERROR` yields one waking notice naming only `ERROR b`). Not built: a live TUI run of the loop e2e, and a migration table in the user docs beyond the schema text.
 
 ### Phase 2c: bash foreground-to-background promotion
 

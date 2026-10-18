@@ -15,6 +15,7 @@ use futures_lite::AsyncReadExt;
 use futures_lite::future::or;
 
 use super::clock::Clock;
+use super::watch::Watch;
 use super::{BodyRef, DoneReason, ShellSpec, Terminal, UnitHub, UnitId, UnitResult};
 use crate::child_guard::ChildGuard;
 
@@ -305,7 +306,11 @@ async fn supervise(
             hub.record_proc(handle, pid);
         }
     };
-    let Some(launched) = launch_unless_killed(&spec, &run, &opts, &record) else {
+    let watch = spec
+        .watch
+        .as_deref()
+        .and_then(|re| Watch::new(re, hub.clone(), id, Arc::clone(&clock)));
+    let Some(launched) = launch_unless_killed(&spec, &run, &opts, watch, &record) else {
         return;
     };
     let (mut guard, pump) = match launched {
@@ -452,13 +457,14 @@ fn launch_unless_killed(
     spec: &ShellSpec,
     run: &Arc<ShellRun>,
     opts: &ShellOptions,
+    watch: Option<Watch>,
     record: &dyn Fn(u32),
 ) -> Option<io::Result<(ChildGuard, smol::Task<()>)>> {
     let gate = run.killed.lock().unwrap_or_else(|e| e.into_inner());
     if *gate || SHUTTING_DOWN.load(Ordering::SeqCst) {
         return None;
     }
-    let launched = launch(spec, run, opts, record);
+    let launched = launch(spec, run, opts, watch, record);
     if let Ok((guard, _)) = &launched {
         run.pid.store(guard.id(), Ordering::SeqCst);
         live_groups().insert(guard.id());
@@ -470,6 +476,7 @@ fn launch(
     spec: &ShellSpec,
     run: &Arc<ShellRun>,
     opts: &ShellOptions,
+    watch: Option<Watch>,
     record: &dyn Fn(u32),
 ) -> io::Result<(ChildGuard, smol::Task<()>)> {
     let log = run.log_path.as_ref().and_then(|path| {
@@ -517,6 +524,7 @@ fn launch(
         Arc::clone(run),
         log,
         opts.log_cap,
+        watch,
     ));
     Ok((ChildGuard::new(child), pump))
 }
@@ -573,15 +581,47 @@ async fn pump(
     run: Arc<ShellRun>,
     mut log: Option<File>,
     cap: u64,
+    mut watch: Option<Watch>,
 ) {
+    enum Step {
+        Read(io::Result<usize>),
+        Tick,
+    }
     let mut chunk = [0u8; READ_CHUNK];
     let mut logged = 0u64;
     let mut discarding = false;
     loop {
-        let n = match reader.read(&mut chunk).await {
-            Ok(0) | Err(_) => return,
-            Ok(n) => n,
+        let due = watch
+            .as_ref()
+            .and_then(|w| Some((w.deadline()?, Arc::clone(&w.clock))));
+        let step = match due {
+            Some((at, clock)) => {
+                or(async { Step::Read(reader.read(&mut chunk).await) }, async {
+                    clock.sleep_until(at).await;
+                    Step::Tick
+                })
+                .await
+            }
+            None => Step::Read(reader.read(&mut chunk).await),
         };
+        let n = match step {
+            Step::Tick => {
+                if let Some(w) = &mut watch {
+                    w.tick();
+                }
+                continue;
+            }
+            Step::Read(Ok(0) | Err(_)) => {
+                if let Some(w) = &mut watch {
+                    w.finish();
+                }
+                return;
+            }
+            Step::Read(Ok(n)) => n,
+        };
+        if let Some(w) = &mut watch {
+            w.feed(&chunk[..n]);
+        }
         if discarding {
             continue;
         }
@@ -1070,6 +1110,92 @@ mod tests {
         let id = rig.hub.spawn(rig.hub.main(), req).unwrap().id;
         until("done", || view(&rig, id).state.is_done());
         assert!(rig.hub.pending_notices(rig.hub.main()).is_empty());
+    }
+
+    fn watch_start(rig: &Rig, command: &str, watch: &str) -> UnitId {
+        let mut req = crate::runs::tests::request(RunKind::Shell, "job");
+        req.command = Some(command.into());
+        req.watch = Some(watch.into());
+        rig.hub.spawn(rig.hub.main(), req).unwrap().id
+    }
+
+    fn match_notices(rig: &Rig) -> Vec<crate::runs::notice::Notice> {
+        use crate::runs::notice::NoticeKind;
+        rig.hub
+            .pending_notices(rig.hub.main())
+            .into_iter()
+            .filter(|n| n.kind == NoticeKind::Match)
+            .collect()
+    }
+
+    #[test]
+    fn bad_regex_rejected() {
+        let rig = rig();
+        let mut req = crate::runs::tests::request(RunKind::Shell, "job");
+        req.watch = Some("(".into());
+        let err = rig.hub.spawn(rig.hub.main(), req).unwrap_err();
+        assert_eq!(err.to_string(), "BAD_FIELD: \"watch\" is not a valid regex");
+    }
+
+    #[test]
+    fn real_process_match_notice_wakes_and_skips_other_lines() {
+        let rig = rig();
+        watch_start(&rig, "echo a; echo ERROR b; sleep 1", "ERROR");
+        until("match notice", || !match_notices(&rig).is_empty());
+        let notices = match_notices(&rig);
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0].wake);
+        assert!(notices[0].text.contains("ERROR b"), "{}", notices[0].text);
+        assert!(!notices[0].text.contains("\na\n"), "{}", notices[0].text);
+        assert!(notices[0].text.contains("/ERROR/"), "{}", notices[0].text);
+    }
+
+    #[test]
+    fn stderr_is_watched_and_quiet_policy_does_not_wake() {
+        let rig = rig();
+        let mut req = crate::runs::tests::request(RunKind::Shell, "job");
+        req.command = Some("echo boom >&2".into());
+        req.watch = Some("boom".into());
+        req.notify = Some(NoticePolicy::Quiet);
+        rig.hub.spawn(rig.hub.main(), req).unwrap();
+        until("match notice", || !match_notices(&rig).is_empty());
+        assert!(!match_notices(&rig)[0].wake);
+    }
+
+    #[test]
+    fn never_policy_sends_no_match_notices() {
+        let rig = rig();
+        let mut req = crate::runs::tests::request(RunKind::Shell, "job");
+        req.command = Some("echo boom".into());
+        req.watch = Some("boom".into());
+        req.notify = Some(NoticePolicy::Never);
+        let id = rig.hub.spawn(rig.hub.main(), req).unwrap().id;
+        until("done", || view(&rig, id).state.is_done());
+        assert!(rig.hub.pending_notices(rig.hub.main()).is_empty());
+    }
+
+    #[test]
+    fn match_batches_after_first_per_second() {
+        let rig = rig();
+        let id = watch_start(
+            &rig,
+            "echo ERROR 1; echo ERROR 2; echo ERROR 3; sleep 30",
+            "ERROR",
+        );
+        until("all output", || output_has(&rig, id, "ERROR 3"));
+        until("first notice", || !match_notices(&rig).is_empty());
+        let first = match_notices(&rig);
+        assert_eq!(first.len(), 1, "{first:?}");
+        assert!(first[0].text.contains("ERROR 1"));
+        assert!(!first[0].text.contains("ERROR 2"));
+        rig.clock.advance(Duration::from_secs(1));
+        until("batched notice", || match_notices(&rig).len() == 2);
+        let batch = &match_notices(&rig)[1].text;
+        assert!(
+            batch.contains("ERROR 2") && batch.contains("ERROR 3"),
+            "{batch}"
+        );
+        rig.hub.stop(rig.hub.main(), &[id], Default::default());
     }
 
     #[test]
