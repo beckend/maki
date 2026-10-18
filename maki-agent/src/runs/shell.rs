@@ -861,7 +861,13 @@ mod tests {
         let first = rig.hub.stop(main, &[id], Default::default());
         let again = rig.hub.stop(main, &[id], Default::default());
         assert!(matches!(first[0].status, Ok(StopStatus::Requested)));
-        assert!(matches!(again[0].status, Ok(StopStatus::Requested)));
+        // The shell may already have died of the first SIGTERM on a busy host.
+        assert!(
+            matches!(&again[0].status, Ok(StopStatus::Requested))
+                || matches!(&again[0].status, Ok(StopStatus::AlreadyFinished(s)) if s == "killed"),
+            "{:?}",
+            again[0].status
+        );
         let t = finished(&rig, id).await;
         assert_eq!(t.reason, DoneReason::Killed);
         let after = rig.hub.stop(main, &[id], Default::default());
@@ -1025,7 +1031,7 @@ mod tests {
         let id = start(&rig, "sh -c 'sleep 401 & sleep 402; wait' & echo $$; wait");
         until("pid", || read_all(&rig, id).trim().parse::<u32>().is_ok()).await;
         println!("\nPGID={}", read_all(&rig, id).trim());
-        std::thread::sleep(Duration::from_secs(120));
+        tokio::time::sleep(Duration::from_secs(120)).await;
     }
 
     fn group_members(pgid: u32) -> Vec<u32> {
@@ -1085,8 +1091,8 @@ mod tests {
         until("group gone", || group_members(pgid).is_empty()).await;
     }
 
-    #[test]
-    fn cursors_are_per_reader() {
+    #[tokio::test]
+    async fn cursors_are_per_reader() {
         let run = ShellRun::new(None);
         let (a, b) = (UnitId::new(), UnitId::new());
         run.out().push(b"1\n2\n");
@@ -1098,8 +1104,8 @@ mod tests {
         assert_eq!((b_view.text.as_str(), b_view.next_offset), ("1\n2\n3\n", 6));
     }
 
-    #[test]
-    fn tail_and_paging() {
+    #[tokio::test]
+    async fn tail_and_paging() {
         let run = ShellRun::new(None);
         let reader = UnitId::new();
         run.out().push(b"1\n2\n3\n4\n");
@@ -1117,8 +1123,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn ring_overflow_reads_older_bytes_from_the_log() {
+    #[tokio::test]
+    async fn ring_overflow_reads_older_bytes_from_the_log() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("x.log");
         let line = "0123456789abcdef\n";
