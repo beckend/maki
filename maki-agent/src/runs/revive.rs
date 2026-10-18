@@ -55,6 +55,14 @@ impl UnitHub {
         transcript::load(&self.transcript_file(handle)?)
     }
 
+    /// Whether `run` is still the agent run of `id` (a revive replaces it).
+    pub(super) fn is_current_run(&self, id: UnitId, run: &Arc<AgentRun>) -> bool {
+        self.table()
+            .agents
+            .get(&id)
+            .is_none_or(|cur| Arc::ptr_eq(cur, run))
+    }
+
     fn can_message(&self, table: &UnitTable, from: UnitId, unit: &Unit) -> bool {
         from == self.main
             || from == self.user

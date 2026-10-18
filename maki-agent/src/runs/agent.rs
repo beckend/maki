@@ -751,8 +751,15 @@ impl Driver {
         let left = self.run.inbox.close();
         let Some(hub) = self.hub() else { return };
         hub.messages_dropped(&left, "recipient_stopped");
+        if !hub.is_current_run(self.id, &self.run) {
+            // Evicted while idle and revived since: the id is the new run's.
+            return;
+        }
         hub.stop_children(self.id);
         hub.children_settled(self.id).await;
+        if !hub.is_current_run(self.id, &self.run) {
+            return;
+        }
         let terminal = Terminal {
             reason,
             exit_code: None,
