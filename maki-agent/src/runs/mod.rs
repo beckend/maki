@@ -2439,15 +2439,26 @@ impl UnitHub {
         if let Some(root) = root {
             root.cancel();
         }
-        let pids = {
+        let (pids, open) = {
             let table = self.units.lock().unwrap_or_else(|e| e.into_inner());
-            table
+            let open: Vec<String> = table
+                .shells
+                .keys()
+                .filter_map(|id| table.units.get(id))
+                .filter(|u| !matches!(u.state, UnitState::Done(_)))
+                .map(|u| u.handle.to_string())
+                .collect();
+            let pids = table
                 .shells
                 .values()
                 .filter_map(|run| run.mark_killed())
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            (pids, open)
         };
         shell::shutdown_groups(&pids);
+        // The shells are dead and this process is about to be: say so, or the
+        // next start would report them lost.
+        self.journal_shells_killed(&open);
         self.journal_mark("clean_shutdown");
     }
 }
@@ -2456,6 +2467,7 @@ impl UnitHub {
 /// SIGHUP, SIGINT, a panic on the main thread and normal exit.
 pub fn shutdown_all() {
     shell::shutdown_all();
+    journal::shutdown_hubs();
 }
 
 /// Makes SIGTERM, SIGHUP and SIGINT run [`shutdown_all`] and then die of that
@@ -2566,6 +2578,7 @@ fn start_session_in(
             match maki_storage::runs::RunJournal::open_in(dir, Default::default()) {
                 Ok(journal) => {
                     hub.attach_journal(Arc::new(journal));
+                    journal::register(&hub);
                     let report = hub.reconcile();
                     if !report.lost.is_empty() {
                         tracing::info!(lost = report.lost.len(), "runs lost with the last process");

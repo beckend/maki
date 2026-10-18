@@ -294,7 +294,18 @@ async fn supervise(
         },
     };
 
-    let Some(launched) = launch_unless_killed(&spec, &run, &opts) else {
+    // Looked up before the launch: that holds the `killed` gate, and teardown
+    // takes the table lock first and that gate second.
+    let handle = hub
+        .upgrade()
+        .and_then(|h| h.handle_of(id))
+        .map(|h| h.to_string());
+    let record = |pid: u32| {
+        if let (Some(hub), Some(handle)) = (hub.upgrade(), &handle) {
+            hub.record_proc(handle, pid);
+        }
+    };
+    let Some(launched) = launch_unless_killed(&spec, &run, &opts, &record) else {
         return;
     };
     let (mut guard, pump) = match launched {
@@ -309,9 +320,6 @@ async fn supervise(
         }
     };
     let pid = guard.id();
-    if let Some(hub) = hub.upgrade() {
-        hub.record_proc(id, pid);
-    }
 
     let ended = or(async { Ended::Exited(guard.status().await) }, async {
         Ended::Stop(
@@ -444,12 +452,13 @@ fn launch_unless_killed(
     spec: &ShellSpec,
     run: &Arc<ShellRun>,
     opts: &ShellOptions,
+    record: &dyn Fn(u32),
 ) -> Option<io::Result<(ChildGuard, smol::Task<()>)>> {
     let gate = run.killed.lock().unwrap_or_else(|e| e.into_inner());
     if *gate || SHUTTING_DOWN.load(Ordering::SeqCst) {
         return None;
     }
-    let launched = launch(spec, run, opts);
+    let launched = launch(spec, run, opts, record);
     if let Ok((guard, _)) = &launched {
         run.pid.store(guard.id(), Ordering::SeqCst);
         live_groups().insert(guard.id());
@@ -461,6 +470,7 @@ fn launch(
     spec: &ShellSpec,
     run: &Arc<ShellRun>,
     opts: &ShellOptions,
+    record: &dyn Fn(u32),
 ) -> io::Result<(ChildGuard, smol::Task<()>)> {
     let log = run.log_path.as_ref().and_then(|path| {
         private_log(path)
@@ -471,18 +481,35 @@ fn launch(
     });
     let (reader, writer) = io::pipe()?;
     let mut cmd = std::process::Command::new(SHELL);
+    #[cfg(unix)]
+    cmd.arg("-c").arg(GATE_SCRIPT).arg(SHELL).arg(&spec.command);
+    #[cfg(not(unix))]
     cmd.arg("-c").arg(&spec.command);
     if let Some(cwd) = &spec.cwd {
         cmd.current_dir(cwd);
     }
     #[cfg(unix)]
     std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+    // The child waits before exec until the parent has made its pid durable,
+    // so a crash of maki can never leave a shell that no journal knows.
+    #[cfg(unix)]
+    let gate = install_gate(&mut cmd)?;
     // Stdio is set here: converting resets whatever the std command had.
     let mut cmd = smol::process::Command::from(cmd);
     cmd.stdin(Stdio::null())
         .stdout(writer.try_clone()?)
         .stderr(writer);
     let child = cmd.spawn()?;
+    #[cfg(unix)]
+    {
+        let (read_end, mut write_end) = gate;
+        drop(read_end);
+        record(child.id());
+        // A failed write means the child already gave up and exited.
+        let _ = io::Write::write_all(&mut write_end, b"\n");
+    }
+    #[cfg(not(unix))]
+    record(child.id());
     // Drops the parent's write ends, so the pipe closes with the last child.
     drop(cmd);
     let pump = smol::spawn(pump(
@@ -492,6 +519,45 @@ fn launch(
         opts.log_cap,
     ));
     Ok((ChildGuard::new(child), pump))
+}
+
+/// The gate fd the wrapper shell reads before it runs the command.
+#[cfg(unix)]
+const GATE_FD: libc::c_int = 3;
+
+/// Blocks on the gate until the parent has made the shell's pid durable and
+/// sent a byte, then replaces itself (same pid, same start time) with the real
+/// `sh -c`. EOF, which is what the parent's death looks like, ends it with 127
+/// before anything ran. `$1` is the command. (`pre_exec` cannot do the waiting:
+/// `spawn` blocks until exec, so that would deadlock the handshake.)
+#[cfg(unix)]
+const GATE_SCRIPT: &str = "read -r _ <&3 || exit 127; exec 3<&-; exec sh -c \"$1\"";
+
+/// Wires the pipe the wrapper reads: fd 3 in the child is its read end.
+#[cfg(unix)]
+fn install_gate(cmd: &mut std::process::Command) -> io::Result<(io::PipeReader, io::PipeWriter)> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+    let (reader, writer) = io::pipe()?;
+    let rfd = reader.as_raw_fd();
+    // SAFETY: the closure only calls dup2 and fcntl, both async-signal-safe.
+    unsafe {
+        cmd.pre_exec(move || {
+            // dup2 clears close-on-exec on the new fd; when the pipe already
+            // sits on fd 3 only the flag has to go.
+            let ok = if rfd == GATE_FD {
+                libc::fcntl(rfd, libc::F_SETFD, 0) != -1
+            } else {
+                libc::dup2(rfd, GATE_FD) != -1
+            };
+            if ok {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            }
+        });
+    }
+    Ok((reader, writer))
 }
 
 fn private_log(path: &std::path::Path) -> io::Result<File> {
@@ -1203,5 +1269,31 @@ mod tests {
 
     fn group_alive(pgid: u32) -> bool {
         rustix::process::test_kill_process_group(pid_of(pgid)).is_ok()
+    }
+
+    #[test]
+    fn gate_without_go_ahead_runs_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("marker");
+        let run = |release: bool| {
+            let mut cmd = std::process::Command::new(SHELL);
+            cmd.arg("-c")
+                .arg(GATE_SCRIPT)
+                .arg(SHELL)
+                .arg(format!("touch {}", marker.display()));
+            let (reader, mut writer) = install_gate(&mut cmd).unwrap();
+            let mut child = cmd.spawn().unwrap();
+            drop(reader);
+            if release {
+                std::io::Write::write_all(&mut writer, b"\n").unwrap();
+            }
+            // The parent "dies" here: the write end closes.
+            drop(writer);
+            child.wait().unwrap()
+        };
+        assert_eq!(run(false).code(), Some(127));
+        assert!(!marker.exists());
+        assert!(run(true).success());
+        assert!(marker.exists());
     }
 }

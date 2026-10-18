@@ -15,6 +15,7 @@ tracing = { workspace = true }
 etcetera = { workspace = true }
 bs58 = { workspace = true }
 uuid = { workspace = true }
+libc = { workspace = true }
 
 [dev-dependencies]
 test-case = { workspace = true }
