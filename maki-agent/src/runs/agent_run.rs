@@ -2057,13 +2057,13 @@ mod perm {
     }
 
     #[test]
-    fn headless_inherit_yolo_allows() {
-        use UnattendedMode::{Deny, InheritYolo};
+    fn headless_allow_under_yolo_allows() {
+        use UnattendedMode::{AllowUnderYolo, Deny};
         assert_eq!(
-            unattended_answer(InheritYolo, true),
+            unattended_answer(AllowUnderYolo, true),
             PermissionAnswer::AllowOnce
         );
-        for (mode, yolo) in [(Deny, true), (Deny, false), (InheritYolo, false)] {
+        for (mode, yolo) in [(Deny, true), (Deny, false), (AllowUnderYolo, false)] {
             assert!(
                 matches!(
                     unattended_answer(mode, yolo),

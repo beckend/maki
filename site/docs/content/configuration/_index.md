@@ -149,7 +149,7 @@ How many lines of output to show per tool in the UI. All values are `usize` with
 | `default_timeout_secs` | u64 | `1800` | 1 | Wall clock limit of an agent run (seconds) unless `spawn` sets `timeout_secs`; counted from when it starts working |
 | `max_timeout_secs` | u64 | `86400` | 1 | Largest `timeout_secs` a `spawn` may ask for (seconds); larger values are lowered to it |
 | `permission_timeout_secs` | u64 | `120` | 1 | How long a run's permission prompt waits for the user (seconds) before it is denied; the run gives up its slot meanwhile |
-| `unattended_permissions` | string | `deny` | - | A run's permission prompt when nobody can answer (`maki -p`): `deny`, or `inherit_yolo` to allow it under `--yolo` |
+| `unattended_permissions` | string | `deny` | - | A run's permission prompt when nobody can answer (`maki -p`): `deny`, or `allow_under_yolo` to allow it under `--yolo` (`inherit_yolo` is a deprecated alias) |
 | `max_retained` | u32 | `64` | 1 | Finished runs kept in memory; older ones leave a tombstone and can still be revived by `send` while their transcript exists |
 | `max_idle` | u32 | `16` | 1 | Idle agents kept in memory; the least recently active leaves silently and is revived by `send` |
 | `idle_timeout_secs` | u64 | `1800` | 1 | How long an agent may stay idle in memory (seconds) before it leaves silently; `send` revives it |

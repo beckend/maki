@@ -137,7 +137,7 @@ impl PermissionBroker {
     pub(super) fn begin(&self, b: Begin<'_>) -> Option<String> {
         let hub = b.hub;
         if !hub.attended.load(Ordering::Relaxed) {
-            let allow = hub.limits.unattended == UnattendedMode::InheritYolo && b.yolo;
+            let allow = hub.limits.unattended == UnattendedMode::AllowUnderYolo && b.yolo;
             self.answer(
                 b.request,
                 if allow {
