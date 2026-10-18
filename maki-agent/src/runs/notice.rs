@@ -23,6 +23,8 @@ pub enum NoticeKind {
     Permission,
     /// Runs that were still going when the previous process died.
     Lost,
+    /// The run journal stopped writing, so runs are no longer persisted.
+    Journal,
 }
 
 impl NoticeKind {
@@ -35,6 +37,7 @@ impl NoticeKind {
             Self::Delivery => "delivery",
             Self::Permission => "permission",
             Self::Lost => "lost",
+            Self::Journal => "journal",
         }
     }
 
@@ -47,6 +50,7 @@ impl NoticeKind {
             Self::Delivery,
             Self::Permission,
             Self::Lost,
+            Self::Journal,
         ]
         .into_iter()
         .find(|k| k.as_str() == kind)

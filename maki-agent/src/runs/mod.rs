@@ -20,6 +20,8 @@ mod revive;
 pub mod shell;
 #[cfg(unix)]
 mod signals;
+#[cfg(test)]
+mod soak;
 mod topology;
 mod transcript;
 mod watch;
@@ -840,6 +842,8 @@ pub struct UnitHub {
     main_busy: AtomicBool,
     /// Notices taken out of the pending list and not yet in an inbox.
     notices_in_flight: AtomicUsize,
+    /// Set once the owner was told that the journal stopped writing.
+    journal_told: AtomicBool,
     /// The reserved sender of text the user types into a run's tab.
     user: UnitId,
     message_seq: AtomicU64,
@@ -892,6 +896,7 @@ impl UnitHub {
             wake: Mutex::new(WakeBudget::default()),
             main_busy: AtomicBool::new(false),
             notices_in_flight: AtomicUsize::new(0),
+            journal_told: AtomicBool::new(false),
             user: UnitId::new(),
             message_seq: AtomicU64::new(0),
             acks: Mutex::default(),
@@ -1812,9 +1817,33 @@ impl UnitHub {
             .unwrap_or_default()
     }
 
+    /// One quiet notice to `main`, the first time the journal is seen to have
+    /// stopped writing. The writer is asynchronous, so this runs from
+    /// `flush_notices` (no lock held) and notices it at the next settle.
+    fn tell_journal_degraded(&self) {
+        if !self.journal_degraded() || self.journal_told.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        self.table().pending_notices.push(PendingNotice {
+            owner: self.main,
+            info: NoticeInfo {
+                kind: NoticeKind::Journal,
+                run: self.main,
+                handle: String::new(),
+                name: String::new(),
+                generation: 0,
+                count: 1,
+                created: SystemTime::now(),
+            },
+            text: "the run journal could not be written, so runs are no longer saved: they continue, but a crash or restart will not recover them".to_owned(),
+            wake: false,
+        });
+    }
+
     /// Moves what settling queued under the hub lock into the owners' inboxes.
     /// Called with no lock held.
     fn flush_notices(&self) {
+        self.tell_journal_degraded();
         let batch = {
             let mut table = self.table();
             let batch = std::mem::take(&mut table.pending_notices);

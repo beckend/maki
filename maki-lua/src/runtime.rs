@@ -5008,12 +5008,18 @@ pub fn spawn(
             // a live sender, so dropping the receivers alone does not free
             // queued requests. Drain them so their reply channels drop and
             // no caller blocks on a dead host.
+            //
+            // The pool clear comes first: each pooled client owns a curl
+            // thread and its connection cache, nothing else hands them back,
+            // and joining them can take long under load. A request sent
+            // while it ran would sit in the queue (a dropped receiver does
+            // not free queued messages) and strand its caller, so the drain
+            // goes last and the receivers are dropped right after it.
+            crate::api::net::clear_client_pool();
             for _ in rx.drain() {}
             for _ in prio_rx.drain() {}
-            // Each pooled client owns a curl thread and its connection cache.
-            // Nothing else hands them back, so a host that fetched once would
-            // keep its sockets open for the rest of the process.
-            crate::api::net::clear_client_pool();
+            drop(rx);
+            drop(prio_rx);
         })
         .map_err(|e| PluginError::Io {
             path: PathBuf::from("lua-thread"),
