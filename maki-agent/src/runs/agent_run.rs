@@ -822,3 +822,168 @@ mod hub {
         );
     }
 }
+
+/// The driver's turn end -> settle -> Idle -> wake sequence, entered at every
+/// point by parking the driver (see `Driver::pause`); no sleeps.
+mod race {
+    use super::*;
+
+    type Held = (flume::Receiver<()>, flume::Sender<()>);
+
+    fn park(rig: &Rig, id: UnitId, at: &'static str) -> Held {
+        let (reached_tx, reached_rx) = flume::unbounded();
+        let (go_tx, go_rx) = flume::unbounded();
+        rig.hub
+            .table()
+            .agents
+            .get(&id)
+            .unwrap()
+            .pauses
+            .lock()
+            .unwrap()
+            .insert(at, (reached_tx, go_rx));
+        (reached_rx, go_tx)
+    }
+
+    fn reached(held: &Held) {
+        held.0
+            .recv_timeout(Duration::from_secs(20))
+            .expect("the driver never reached the pause point");
+    }
+
+    fn quiesce(rig: &Rig, script: &Script, id: UnitId, requests: usize) {
+        for _ in 0..50_000_000u64 {
+            let view = rig.hub.get(id).unwrap();
+            if script.requests(CHILD) >= requests
+                && view.state.label() == "idle"
+                && rig.hub.inbox_of(id).unwrap().is_empty()
+            {
+                return;
+            }
+            std::thread::yield_now();
+        }
+        panic!("never quiesced: requests={}", script.requests(CHILD));
+    }
+
+    fn count(script: &Script, n: usize, needle: &str) -> usize {
+        script
+            .messages_of(CHILD, n)
+            .iter()
+            .map(Value::to_string)
+            .collect::<String>()
+            .matches(needle)
+            .count()
+    }
+
+    #[test]
+    fn message_at_every_point_of_settle_is_delivered_once() {
+        for (point, expect_state) in [("before_settle", "running"), ("after_idle", "idle")] {
+            let (release, gate) = flume::bounded::<()>(1);
+            let script = Script::new(vec![(
+                CHILD,
+                vec![Step::Gate(gate, reply("r1")), Step::Reply(reply("r2"))],
+            )]);
+            let rig = rig(&script);
+            let ack = spawn(&rig, CHILD, json!({}));
+            await_requests(&script, CHILD, 1);
+            let held = park(&rig, ack.id, point);
+            release.send(()).unwrap();
+            reached(&held);
+            let marker = format!("ZZ-{point}");
+            let sent = say(&rig, rig.hub.main(), ack.id, &marker, DeliveryKind::Steer);
+            assert_eq!(sent.state, expect_state, "{point}");
+            held.1.send(()).unwrap();
+            quiesce(&rig, &script, ack.id, 2);
+            assert_eq!(script.requests(CHILD), 2, "{point}: no extra turn");
+            assert_eq!(count(&script, 0, &marker), 0);
+            assert_eq!(count(&script, 1, &marker), 1, "{point}: exactly once");
+            assert_eq!(rig.hub.get(ack.id).unwrap().state.label(), "idle");
+        }
+    }
+
+    #[test]
+    fn two_messages_across_the_wake_coalesce_into_one_turn() {
+        let script = Script::new(vec![(
+            CHILD,
+            vec![Step::Reply(reply("r1")), Step::Reply(reply("r2"))],
+        )]);
+        let rig = rig(&script);
+        let ack = spawn(&rig, CHILD, json!({}));
+        settle(&rig, ack.id);
+        let held = park(&rig, ack.id, "woken");
+        let first = say(&rig, rig.hub.main(), ack.id, "ZZ-one", DeliveryKind::Steer);
+        assert_eq!(first.state, "idle");
+        reached(&held);
+        let second = say(
+            &rig,
+            rig.hub.main(),
+            ack.id,
+            "ZZ-two",
+            DeliveryKind::Followup,
+        );
+        assert_eq!(second.state, "running", "already woken: no second wake");
+        held.1.send(()).unwrap();
+        quiesce(&rig, &script, ack.id, 2);
+        assert_eq!(script.requests(CHILD), 2);
+        assert_eq!(count(&script, 1, "ZZ-one"), 1);
+        assert_eq!(count(&script, 1, "ZZ-two"), 1);
+    }
+
+    #[test]
+    fn quiet_at_settle_never_wakes_and_waits_for_the_next_turn() {
+        let (release, gate) = flume::bounded::<()>(1);
+        let script = Script::new(vec![(
+            CHILD,
+            vec![Step::Gate(gate, reply("r1")), Step::Reply(reply("r2"))],
+        )]);
+        let rig = rig(&script);
+        let ack = spawn(&rig, CHILD, json!({}));
+        await_requests(&script, CHILD, 1);
+        let held = park(&rig, ack.id, "before_settle");
+        release.send(()).unwrap();
+        reached(&held);
+        say(
+            &rig,
+            rig.hub.main(),
+            ack.id,
+            "ZZ-quiet",
+            DeliveryKind::Quiet,
+        );
+        held.1.send(()).unwrap();
+        settle(&rig, ack.id);
+        assert_eq!(rig.hub.inbox_of(ack.id).unwrap().len(), 1);
+        assert_eq!(script.requests(CHILD), 1);
+        say(&rig, rig.hub.main(), ack.id, "ZZ-wake", DeliveryKind::Steer);
+        quiesce(&rig, &script, ack.id, 2);
+        assert_eq!(count(&script, 1, "ZZ-quiet"), 1);
+        assert_eq!(count(&script, 1, "ZZ-wake"), 1);
+    }
+
+    #[test]
+    fn stopping_and_done_refuse_and_lose_nothing_silently() {
+        let (release, gate) = flume::bounded::<()>(1);
+        let script = Script::new(vec![(CHILD, vec![Step::Gate(gate, reply("r1"))])]);
+        let rig = rig(&script);
+        let ack = spawn(&rig, CHILD, json!({}));
+        await_requests(&script, CHILD, 1);
+        let held = park(&rig, ack.id, "before_settle");
+        release.send(()).unwrap();
+        reached(&held);
+        let main = rig.hub.main();
+        rig.hub.stop(main, &[ack.id], StopOpts::default());
+        let err = rig
+            .hub
+            .send(main, ack.id, "late".into(), DeliveryKind::Steer)
+            .unwrap_err();
+        assert_eq!(err, UnitError::RecipientTerminal);
+        held.1.send(()).unwrap();
+        settle(&rig, ack.id);
+        let err = rig
+            .hub
+            .send(main, ack.id, "later".into(), DeliveryKind::Steer)
+            .unwrap_err();
+        assert_eq!(err, UnitError::RecipientTerminal);
+        assert!(rig.hub.inbox_of(ack.id).unwrap().is_empty());
+        assert_eq!(script.requests(CHILD), 1);
+    }
+}
