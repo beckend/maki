@@ -640,6 +640,11 @@ impl<'h> Agent<'h> {
         if !continues_answer {
             // Notes that came in during the last turn. A user message after
             // the tool results is fine, `tell_changes` does the same.
+            self.land_mailbox()?;
+            if let Some(inbox) = &self.inbox {
+                let items = inbox.drain_step();
+                self.land_run_messages(&items);
+            }
             self.tell_changes();
         }
         Ok(())

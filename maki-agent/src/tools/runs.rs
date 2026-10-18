@@ -758,6 +758,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn send_oversize_is_counted_in_bytes_not_chars() {
+        let ctx = ctx();
+        call(
+            Which::Spawn,
+            &ctx,
+            json!({"kind": "agent", "description": "Audit auth", "prompt": "look"}),
+        )
+        .await
+        .unwrap();
+        // 8193 chars of 2 bytes: fewer than 16384 chars, more than 16384 bytes.
+        let big = "\u{e9}".repeat(8193);
+        let err = call(
+            Which::Send,
+            &ctx,
+            json!({"to": "audit-auth", "message": big}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err, "TOO_LARGE max=16384");
+        let ok = "\u{e9}".repeat(8192);
+        let queued = call(
+            Which::Send,
+            &ctx,
+            json!({"to": "audit-auth", "message": ok}),
+        )
+        .await
+        .unwrap();
+        assert!(queued.contains("queued for"), "{queued}");
+        let err = call(
+            Which::Send,
+            &ctx,
+            json!({"to": "audit-auth", "message": "x", "mode": "loud"}),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("steer, followup, quiet"), "{err}");
+    }
+
+    #[tokio::test]
     async fn spawn_starts_an_agent_record() {
         let ctx = ctx();
         let started = call(
