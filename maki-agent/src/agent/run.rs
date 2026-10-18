@@ -28,6 +28,7 @@ use crate::mcp::{McpSession, ToolDeferral};
 use crate::permissions::PermissionManager;
 use crate::prompt::ResolvedPrompts;
 use crate::runs::RunsCtx;
+use crate::runs::inbox::TurnEnd;
 use crate::tools::hook::Verdict;
 use crate::tools::{
     Deadline, FileAccess, LocalTools, ToolAudience, ToolContext, ToolFilter, ToolOutputMode,
@@ -187,6 +188,8 @@ pub struct Agent<'h> {
     local_tools: LocalTools,
     model_policy: Arc<ModelPolicy>,
     runs: Option<RunsCtx>,
+    /// What other runs send this one; present for `main` and native agents.
+    inbox: Option<Arc<crate::runs::Inbox>>,
     model_sync: Option<Arc<ArcSwap<ModelSlot>>>,
     stop_continuations: u32,
 }
@@ -233,6 +236,10 @@ impl<'h> Agent<'h> {
             workflow: false,
             local_tools: LocalTools::default(),
             model_policy: params.model_policy,
+            inbox: params
+                .runs
+                .as_ref()
+                .and_then(|runs| runs.hub.inbox_of(runs.self_run)),
             runs: params.runs,
             model_sync: None,
             stop_continuations: 0,
@@ -414,6 +421,12 @@ impl<'h> Agent<'h> {
         if !message.content.is_empty() {
             self.history.push(message);
         }
+        // After the prompt, which stays the first message of a fresh run; the
+        // model reads what other runs said right before it answers.
+        if let Some(inbox) = &self.inbox {
+            let items = inbox.take_start();
+            self.land_run_messages(&items);
+        }
         Ok(())
     }
 
@@ -437,6 +450,18 @@ impl<'h> Agent<'h> {
             }
         }
         Ok(())
+    }
+
+    /// Messages from other runs, as ONE user message in the one frame
+    /// format. Only ever called where the history ends on a user message or a
+    /// finished answer, never between a `tool_use` and its `tool_result`.
+    fn land_run_messages(&mut self, items: &[crate::runs::InboxItem]) {
+        if items.is_empty() {
+            return;
+        }
+        let step = self.num_turns + 1;
+        let text = crate::runs::inbox::frame(items, Some(step));
+        self.history.push(Message::observation(text));
     }
 
     fn turns_exhausted(&self) -> bool {
@@ -555,6 +580,10 @@ impl<'h> Agent<'h> {
             // Notes that came in during the last turn. A user message after
             // the tool results is fine, `tell_changes` does the same.
             self.land_notes()?;
+            if let Some(inbox) = &self.inbox {
+                let items = inbox.drain_step();
+                self.land_run_messages(&items);
+            }
             self.tell_changes();
         }
         Ok(())
@@ -671,6 +700,17 @@ impl<'h> Agent<'h> {
 
         if has_tools {
             return Ok(TurnOutcome::Continue);
+        }
+        // A turn never ends with a pending steer, and one followup starts
+        // the next stretch of work.
+        if let Some(inbox) = &self.inbox {
+            match inbox.continue_at_turn_end() {
+                TurnEnd::Done => {}
+                TurnEnd::Steer(items) | TurnEnd::Followup(items) => {
+                    self.land_run_messages(&items);
+                    return Ok(TurnOutcome::Continue);
+                }
+            }
         }
         let reason = stop_reason.into();
         if self.keep_going(reason).await? {

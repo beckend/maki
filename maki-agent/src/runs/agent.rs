@@ -19,6 +19,7 @@ use maki_providers::{
 use maki_storage::sessions::StoredThinking;
 use serde_json::{Value, json};
 
+use super::inbox::{self, Inbox, Phase};
 use super::notice::BODY_FILE_SUFFIX;
 use super::{
     AgentSpec, BodyRef, Clock, DoneReason as UnitDone, Terminal, UnitHub, UnitId, UnitResult,
@@ -307,6 +308,8 @@ pub(super) struct AgentRun {
     soft: AtomicBool,
     timed_out: AtomicBool,
     pub(super) info: SubagentInfo,
+    /// What other runs and the user send to this agent.
+    pub(super) inbox: Arc<Inbox>,
     task: Mutex<Option<smol::Task<()>>>,
 }
 
@@ -320,12 +323,14 @@ impl AgentRun {
             soft: AtomicBool::new(false),
             timed_out: AtomicBool::new(false),
             info,
+            inbox: Arc::new(Inbox::new(Phase::Running)),
             task: Mutex::new(None),
         })
     }
 
     /// Hard stop: the run's token, which every turn token descends from.
     pub(super) fn cancel_run(&self) {
+        self.inbox.close();
         let trigger = lock(&self.cancel).take();
         if let Some(trigger) = trigger {
             trigger.cancel();
@@ -400,6 +405,12 @@ struct TurnEnd {
     text: String,
 }
 
+enum Settled {
+    Restart(String),
+    Idle,
+    Stopped,
+}
+
 enum Verdict {
     Idle { interrupted: bool },
     Done(UnitDone, Option<String>),
@@ -431,70 +442,147 @@ impl Driver {
         if launch.structured.is_some() {
             message.push_str(STRUCTURED_OUTPUT_PROMPT_SUFFIX);
         }
-        let mut nudges = 0;
-        let (verdict, mut result) = loop {
-            let end = self
-                .turn(
-                    &launch,
-                    &mut history,
-                    &mut gauge,
-                    &events,
-                    &rx,
-                    message,
-                    deadline,
-                )
-                .await;
-            let (judged, result) = self.judge(&launch, end);
-            match judged {
-                Judged::Nudge(next) if nudges < MAX_NUDGES => {
-                    nudges += 1;
-                    message = next;
-                }
-                Judged::Nudge(_) => {
-                    let detail = match &launch.structured {
-                        Some(c) => match lock(&c.last_errors).clone() {
-                            Some(errors) => format!("{INVALID_STRUCTURED}:\n{errors}"),
-                            None => MISSING_STRUCTURED.to_owned(),
-                        },
-                        None => MISSING_SUMMARY.to_owned(),
-                    };
-                    break (Verdict::Done(UnitDone::Failed, Some(detail)), result);
-                }
-                Judged::Final(v) => break (v, result),
-            }
-        };
-
-        // Before the state change, so whoever sees the state also finds the
-        // transcript.
-        self.send_history(&history);
-        let ledger = launch.params.ledger.totals();
-        result.turns = self.turns.load(Ordering::Relaxed);
-        result.elapsed_ms = elapsed_ms(self.started);
-        result.usage = ledger.usage;
-        result.cost = ledger.cost.unwrap_or(0.0);
-        self.spill(&mut result).await;
-
-        match verdict {
-            Verdict::Idle { interrupted } if !spec.one_shot => {
-                let idle = self
-                    .hub()
-                    .is_some_and(|hub| hub.settle_idle(self.id, result, !interrupted));
-                if idle {
-                    // Nothing wakes an idle agent before phase 4a: it waits for
-                    // its stop.
-                    self.run.token.cancelled().await;
-                }
-                self.finish(UnitDone::Killed, None, UnitResult::default())
+        let first = self.run.inbox.take_start();
+        if !first.is_empty() {
+            message.push_str("\n\n");
+            message.push_str(&inbox::frame(&first, None));
+        }
+        loop {
+            let mut nudges = 0;
+            let (verdict, mut result) = loop {
+                let end = self
+                    .turn(
+                        &launch,
+                        &mut history,
+                        &mut gauge,
+                        &events,
+                        &rx,
+                        message,
+                        deadline,
+                    )
                     .await;
+                let (judged, result) = self.judge(&launch, end);
+                match judged {
+                    Judged::Nudge(next) if nudges < MAX_NUDGES => {
+                        nudges += 1;
+                        message = next;
+                    }
+                    Judged::Nudge(_) => {
+                        let detail = match &launch.structured {
+                            Some(c) => match lock(&c.last_errors).clone() {
+                                Some(errors) => format!("{INVALID_STRUCTURED}:\n{errors}"),
+                                None => MISSING_STRUCTURED.to_owned(),
+                            },
+                            None => MISSING_SUMMARY.to_owned(),
+                        };
+                        break (Verdict::Done(UnitDone::Failed, Some(detail)), result);
+                    }
+                    Judged::Final(v) => break (v, result),
+                }
+            };
+
+            // Before the state change, so whoever sees the state also finds the
+            // transcript.
+            self.send_history(&history);
+            let ledger = launch.params.ledger.totals();
+            result.turns = self.turns.load(Ordering::Relaxed);
+            result.elapsed_ms = elapsed_ms(self.started);
+            result.usage = ledger.usage;
+            result.cost = ledger.cost.unwrap_or(0.0);
+            self.spill(&mut result).await;
+
+            match verdict {
+                Verdict::Idle { interrupted } if !spec.one_shot => {
+                    match self.settle(result, !interrupted) {
+                        Settled::Restart(text) => message = text,
+                        Settled::Idle => match self.wait_for_wake().await {
+                            Some(text) => message = text,
+                            None => {
+                                self.finish(UnitDone::Killed, None, UnitResult::default())
+                                    .await;
+                                return;
+                            }
+                        },
+                        Settled::Stopped => {
+                            self.finish(UnitDone::Killed, None, UnitResult::default())
+                                .await;
+                            return;
+                        }
+                    }
+                }
+                Verdict::Idle { .. } => {
+                    self.finish(UnitDone::Completed, None, result).await;
+                    return;
+                }
+                Verdict::Done(reason, detail) => {
+                    self.finish(reason, detail, result).await;
+                    return;
+                }
             }
-            Verdict::Idle { .. } => self.finish(UnitDone::Completed, None, result).await,
-            Verdict::Done(reason, detail) => self.finish(reason, detail, result).await,
+        }
+    }
+
+    /// The turn is over. Under the inbox lock: anything that arrived while
+    /// the run was returning starts the next turn, otherwise the run goes
+    /// `Idle`, so a send either lands before this check or sees `Idle` and
+    /// wakes the run. Nothing is lost between the two.
+    fn settle(&self, result: UnitResult, notify: bool) -> Settled {
+        let mut guard = self.run.inbox.lock();
+        if self.run.token.is_cancelled() {
+            return Settled::Stopped;
+        }
+        if guard.has_wakeable() {
+            return Settled::Restart(inbox::frame(&guard.take_start(), None));
+        }
+        guard.set_phase(Phase::Idle);
+        let idle = self
+            .hub()
+            .is_some_and(|hub| hub.settle_idle(self.id, result, notify));
+        if idle {
+            Settled::Idle
+        } else {
+            guard.set_phase(Phase::Closed);
+            Settled::Stopped
+        }
+    }
+
+    /// Parks an `Idle` agent until something wakes it (the text to start the
+    /// next turn with) or its stop arrives (`None`).
+    async fn wait_for_wake(&self) -> Option<String> {
+        enum Woke {
+            Message,
+            Cancel,
+        }
+        loop {
+            let woke = or(
+                async {
+                    self.run.inbox.woken().await;
+                    Woke::Message
+                },
+                async {
+                    self.run.token.cancelled().await;
+                    Woke::Cancel
+                },
+            )
+            .await;
+            if matches!(woke, Woke::Cancel) {
+                return None;
+            }
+            let mut guard = self.run.inbox.lock();
+            match guard.phase() {
+                Phase::Closed => return None,
+                Phase::Running => {
+                    return Some(inbox::frame(&guard.take_start(), None));
+                }
+                Phase::Idle => {}
+            }
         }
     }
 
     /// Children go first, then the parent settles: a notice never reports a
     /// finished parent with live children.
     async fn finish(&self, reason: UnitDone, detail: Option<String>, result: UnitResult) {
+        self.run.inbox.close();
         let Some(hub) = self.hub() else { return };
         hub.stop_children(self.id);
         hub.children_settled(self.id).await;

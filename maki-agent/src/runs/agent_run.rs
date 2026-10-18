@@ -508,3 +508,317 @@ fn wait_and_stop_are_caller_scoped() {
     rig.hub
         .stop(rig.hub.main(), &[a.id, b.id], StopOpts::default());
 }
+
+fn say(rig: &Rig, from: UnitId, to: UnitId, text: &str, kind: DeliveryKind) -> SendAck {
+    rig.hub.send(from, to, text.to_owned(), kind).unwrap()
+}
+
+/// Every request the route saw, as flat strings.
+fn seen_text(script: &Script, route: &str) -> Vec<String> {
+    script
+        .seen
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(r, _)| r == route)
+        .map(|(_, m)| Value::Array(m.clone()).to_string())
+        .collect()
+}
+
+mod inbox {
+    use super::*;
+
+    #[test]
+    fn steer_extends_open_turn() {
+        let (release, gate) = flume::bounded::<()>(1);
+        let script = Script::new(vec![(
+            CHILD,
+            vec![
+                Step::Gate(gate, reply("first")),
+                Step::Reply(reply("second")),
+            ],
+        )]);
+        let rig = rig(&script);
+        let ack = spawn(&rig, CHILD, json!({}));
+        await_requests(&script, CHILD, 1);
+        let sent = say(
+            &rig,
+            rig.hub.main(),
+            ack.id,
+            "the secret code is X",
+            DeliveryKind::Steer,
+        );
+        assert_eq!(sent.state, "running");
+        release.send(()).unwrap();
+        let view = settle(&rig, ack.id);
+        assert_eq!(view.result.unwrap().summary, "second");
+        let second = &seen_text(&script, CHILD)[1];
+        assert!(
+            second.contains("<run-message from=\\\"main\\\""),
+            "{second}"
+        );
+        assert!(second.contains("the secret code is X"));
+        assert!(second.contains("delivered_step"));
+    }
+
+    #[test]
+    fn steer_never_between_tool_use_and_result() {
+        let (release, gate) = flume::bounded::<()>(1);
+        let script = Script::new(vec![(
+            CHILD,
+            vec![
+                Step::Gate(gate, tool_use("t1", "runs", json!({}))),
+                Step::Reply(reply("done")),
+            ],
+        )]);
+        let rig = rig(&script);
+        let ack = spawn(&rig, CHILD, json!({}));
+        await_requests(&script, CHILD, 1);
+        say(
+            &rig,
+            rig.hub.main(),
+            ack.id,
+            "late note",
+            DeliveryKind::Steer,
+        );
+        release.send(()).unwrap();
+        settle(&rig, ack.id);
+        let messages = script.messages_of(CHILD, 1);
+        let at = messages
+            .iter()
+            .position(|m| m.to_string().contains("\"tool_use\""))
+            .expect("the tool call is in the request");
+        assert!(
+            messages[at + 1].to_string().contains("tool_result"),
+            "the result follows its call directly"
+        );
+        assert!(
+            messages.last().unwrap().to_string().contains("late note"),
+            "the note lands after the result"
+        );
+    }
+
+    #[test]
+    fn idle_agent_woken_by_steer() {
+        let script = Script::new(vec![(
+            CHILD,
+            vec![Step::Reply(reply("first")), Step::Reply(reply("second"))],
+        )]);
+        let rig = rig(&script);
+        let ack = spawn(&rig, CHILD, json!({}));
+        assert_eq!(settle(&rig, ack.id).state.label(), "idle");
+        let sent = say(
+            &rig,
+            rig.hub.main(),
+            ack.id,
+            "again please",
+            DeliveryKind::Steer,
+        );
+        assert_eq!(sent.state, "idle");
+        assert_eq!(rig.hub.get(ack.id).unwrap().state.label(), "running");
+        let view = settle(&rig, ack.id);
+        assert_eq!(view.result.unwrap().summary, "second");
+        assert!(seen_text(&script, CHILD)[1].contains("again please"));
+    }
+
+    #[test]
+    fn idle_agent_woken_by_followup() {
+        let script = Script::new(vec![(
+            CHILD,
+            vec![Step::Reply(reply("first")), Step::Reply(reply("second"))],
+        )]);
+        let rig = rig(&script);
+        let ack = spawn(&rig, CHILD, json!({}));
+        settle(&rig, ack.id);
+        say(
+            &rig,
+            rig.hub.main(),
+            ack.id,
+            "next job",
+            DeliveryKind::Followup,
+        );
+        assert_eq!(settle(&rig, ack.id).result.unwrap().summary, "second");
+    }
+
+    #[test]
+    fn quiet_drains_at_next_model_request() {
+        let (release, gate) = flume::bounded::<()>(1);
+        let script = Script::new(vec![(
+            CHILD,
+            vec![
+                Step::Gate(gate, tool_use("t1", "runs", json!({}))),
+                Step::Reply(reply("done")),
+            ],
+        )]);
+        let rig = rig(&script);
+        let ack = spawn(&rig, CHILD, json!({}));
+        await_requests(&script, CHILD, 1);
+        say(&rig, rig.hub.main(), ack.id, "fyi", DeliveryKind::Quiet);
+        assert!(!seen_text(&script, CHILD)[0].contains("fyi"));
+        release.send(()).unwrap();
+        settle(&rig, ack.id);
+        assert!(seen_text(&script, CHILD)[1].contains("fyi"));
+
+        // An idle agent is not woken by a quiet note.
+        say(&rig, rig.hub.main(), ack.id, "later", DeliveryKind::Quiet);
+        let state = rig.hub.get(ack.id).unwrap().state.label();
+        assert_eq!(state, "idle");
+        assert_eq!(rig.hub.inbox_of(ack.id).unwrap().len(), 1);
+        assert_eq!(script.requests(CHILD), 2);
+    }
+
+    /// Whatever the interleaving of sends and the settle, every message
+    /// reaches the model and the agent ends up idle with an empty inbox.
+    #[test]
+    fn message_arriving_during_settle_not_lost() {
+        let script = Script::new(vec![(
+            CHILD,
+            (0..16)
+                .map(|n| Step::Reply(reply(&format!("r{n}"))))
+                .collect(),
+        )]);
+        let rig = rig(&script);
+        let ack = spawn(&rig, CHILD, json!({}));
+        let hub = Arc::clone(&rig.hub);
+        let id = ack.id;
+        let sender = std::thread::spawn(move || {
+            for n in 0..6 {
+                hub.send(hub.main(), id, format!("note-{n}"), DeliveryKind::Steer)
+                    .unwrap();
+                std::thread::yield_now();
+            }
+        });
+        sender.join().unwrap();
+        let inbox = rig.hub.inbox_of(id).unwrap();
+        let mut idle = false;
+        for _ in 0..50_000_000u64 {
+            let seen = seen_text(&script, CHILD).join("");
+            let all = (0..6).all(|n| seen.contains(&format!("note-{n}")));
+            idle = rig.hub.get(id).unwrap().state.label() == "idle";
+            if all && idle && inbox.is_empty() {
+                return;
+            }
+            std::thread::yield_now();
+        }
+        panic!(
+            "lost a message: idle={idle} state={} requests={} pending={} seen={:?}",
+            rig.hub.get(id).unwrap().state.label(),
+            script.requests(CHILD),
+            inbox.len(),
+            seen_text(&script, CHILD)
+                .iter()
+                .map(|s| s.len())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn child_to_parent_main_lands_in_main_inbox() {
+        let script = Script::new(vec![(CHILD, vec![Step::Reply(reply("ok"))])]);
+        let rig = rig(&script);
+        let ack = spawn(&rig, CHILD, json!({}));
+        settle(&rig, ack.id);
+        let to = rig.hub.resolve(ack.id, "parent").unwrap();
+        assert_eq!(to, rig.hub.main());
+        say(&rig, ack.id, to, "may I?", DeliveryKind::Steer);
+        let items = rig.hub.inbox_of(to).unwrap().drain_step();
+        assert_eq!(items.len(), 1);
+        let text = crate::runs::inbox::frame(&items, None);
+        assert!(text.starts_with("<run-message from=\"work\""), "{text}");
+    }
+}
+
+mod hub {
+    use super::*;
+
+    fn pair(script: &Arc<Script>) -> (Rig, UnitId, UnitId) {
+        let rig = rig(script);
+        let a = spawn(&rig, "PARENT-A", json!({}));
+        let b = spawn_as(&rig, a.id, agent_req("CHILD-B", json!({"name": "kid"})));
+        (rig, a.id, b.id)
+    }
+
+    #[test]
+    fn pingpong_guard_holds_and_notifies_parent() {
+        let script = Script::new(vec![("PARENT-A", vec![]), ("CHILD-B", vec![])]);
+        let (rig, a, b) = pair(&script);
+        for n in 0..crate::runs::inbox::PAIR_BURST {
+            let sent = say(&rig, b, a, &format!("q{n}"), DeliveryKind::Quiet);
+            assert!(!sent.held);
+        }
+        let held = say(&rig, a, b, "held one", DeliveryKind::Quiet);
+        assert!(held.held);
+        assert_eq!(rig.hub.inbox_of(b).unwrap().len(), 0);
+        let notices = rig.hub.pending_notices(rig.hub.main());
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(notices[0].text.contains("exchanged 6 messages"));
+        // Held again: one notice per burst, not per message.
+        say(&rig, a, b, "held two", DeliveryKind::Quiet);
+        assert_eq!(rig.hub.pending_notices(rig.hub.main()).len(), 1);
+        // Other work by either side releases them.
+        rig.hub.note_work(b);
+        assert_eq!(rig.hub.inbox_of(b).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn pingpong_held_messages_are_bounded() {
+        let script = Script::new(vec![("PARENT-A", vec![]), ("CHILD-B", vec![])]);
+        let (rig, a, b) = pair(&script);
+        for n in 0..crate::runs::inbox::PAIR_BURST {
+            say(&rig, b, a, &format!("q{n}"), DeliveryKind::Quiet);
+        }
+        for _ in 0..4 {
+            assert!(say(&rig, a, b, "h", DeliveryKind::Quiet).held);
+        }
+        let err = rig
+            .hub
+            .send(a, b, "h".into(), DeliveryKind::Quiet)
+            .unwrap_err();
+        assert!(matches!(err, UnitError::RateLimited { .. }), "{err}");
+    }
+
+    #[test]
+    fn send_to_sibling_rejected_by_default() {
+        let script = Script::new(vec![("PARENT-A", vec![]), ("CHILD-B", vec![])]);
+        let rig = rig(&script);
+        let a = spawn(&rig, "PARENT-A", json!({}));
+        let b = spawn(&rig, "CHILD-B", json!({}));
+        let err = rig
+            .hub
+            .send(a.id, b.id, "hi".into(), DeliveryKind::Steer)
+            .unwrap_err();
+        assert_eq!(err, UnitError::NotReachable);
+    }
+
+    #[test]
+    fn send_errors_are_the_documented_codes() {
+        let script = Script::new(vec![(CHILD, vec![])]);
+        let rig = rig(&script);
+        let a = spawn(&rig, CHILD, json!({}));
+        let main = rig.hub.main();
+        let send = |to, text: String| rig.hub.send(main, to, text, DeliveryKind::Steer);
+        assert_eq!(send(main, "x".into()).unwrap_err(), UnitError::SelfSend);
+        let big = "x".repeat(crate::runs::inbox::MAX_MESSAGE_BYTES + 1);
+        assert_eq!(
+            send(a.id, big).unwrap_err().to_string(),
+            "TOO_LARGE max=16384"
+        );
+        assert_eq!(
+            send(UnitId::new(), "x".into()).unwrap_err(),
+            UnitError::UnknownRun
+        );
+        // The flood: 6 per pair, then the bucket says wait.
+        for _ in 0..crate::runs::inbox::PAIR_BURST {
+            send(a.id, "x".into()).unwrap();
+        }
+        assert_eq!(
+            send(a.id, "x".into()).unwrap_err().to_string(),
+            "RATE_LIMITED retry_after=2s"
+        );
+        rig.hub.stop(main, &[a.id], StopOpts::default());
+        assert_eq!(
+            send(a.id, "x".into()).unwrap_err(),
+            UnitError::RecipientTerminal
+        );
+    }
+}

@@ -1098,6 +1098,17 @@ pub(super) async fn process_tool_calls(
     // before this assistant turn, which ends on a complete user or tool result
     // boundary. The turn in flight is pushed only after the copy.
     if let Some(runs) = &ctx.runs {
+        // Work other than talking resets the ping-pong guard (design 4.7).
+        if tool_uses.iter().any(|(_, name, _)| {
+            !matches!(
+                name.as_str(),
+                crate::tools::runs::SEND_TOOL_NAME
+                    | crate::tools::runs::RUNS_TOOL_NAME
+                    | crate::tools::runs::WAIT_TOOL_NAME
+            )
+        }) {
+            runs.hub.note_work(runs.self_run);
+        }
         let forks: Vec<String> = tool_uses
             .iter()
             .filter(|(_, name, input)| {
