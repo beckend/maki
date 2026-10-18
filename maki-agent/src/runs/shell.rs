@@ -104,6 +104,9 @@ pub(super) struct ShellRun {
     log_path: Option<PathBuf>,
     pid: AtomicU32,
     stop: AtomicBool,
+    /// `true` once the hub is gone. Launching and publishing the pid happen
+    /// under this lock, so teardown either stops the launch or sees the pid.
+    killed: Mutex<bool>,
     stop_event: Event,
 }
 
@@ -114,6 +117,7 @@ impl ShellRun {
             log_path,
             pid: AtomicU32::new(0),
             stop: AtomicBool::new(false),
+            killed: Mutex::new(false),
             stop_event: Event::new(),
         })
     }
@@ -133,8 +137,9 @@ impl ShellRun {
 
     /// Hub teardown: no grace, nobody left to wait for it.
     pub(super) fn kill_now(&self) {
+        *self.killed.lock().unwrap_or_else(|e| e.into_inner()) = true;
         self.request_stop();
-        let pid = self.pid.load(Ordering::Acquire);
+        let pid = self.pid.load(Ordering::SeqCst);
         if pid != 0 {
             #[cfg(unix)]
             crate::child_guard::sigkill_process_group(pid);
@@ -280,7 +285,10 @@ async fn supervise(
         },
     };
 
-    let (mut guard, pump) = match launch(&spec, &run, &opts) {
+    let Some(launched) = launch_unless_killed(&spec, &run, &opts) else {
+        return;
+    };
+    let (mut guard, pump) = match launched {
         Ok(launched) => launched,
         Err(e) => {
             finish(result(
@@ -292,7 +300,6 @@ async fn supervise(
         }
     };
     let pid = guard.id();
-    run.pid.store(pid, Ordering::Release);
 
     let ended = or(async { Ended::Exited(guard.status().await) }, async {
         Ended::Stop(
@@ -372,13 +379,30 @@ async fn supervise(
     finish(terminal);
 }
 
+/// `None` when the hub is already gone.
+fn launch_unless_killed(
+    spec: &ShellSpec,
+    run: &Arc<ShellRun>,
+    opts: &ShellOptions,
+) -> Option<io::Result<(ChildGuard, smol::Task<()>)>> {
+    let gate = run.killed.lock().unwrap_or_else(|e| e.into_inner());
+    if *gate {
+        return None;
+    }
+    let launched = launch(spec, run, opts);
+    if let Ok((guard, _)) = &launched {
+        run.pid.store(guard.id(), Ordering::SeqCst);
+    }
+    Some(launched)
+}
+
 fn launch(
     spec: &ShellSpec,
     run: &Arc<ShellRun>,
     opts: &ShellOptions,
 ) -> io::Result<(ChildGuard, smol::Task<()>)> {
     let log = run.log_path.as_ref().and_then(|path| {
-        File::create(path)
+        private_log(path)
             .inspect_err(
                 |e| tracing::warn!(?path, %e, "shell log unavailable, keeping output in memory"),
             )
@@ -407,6 +431,14 @@ fn launch(
         opts.log_cap,
     ));
     Ok((ChildGuard::new(child), pump))
+}
+
+fn private_log(path: &std::path::Path) -> io::Result<File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+    opts.open(path)
 }
 
 async fn pump(
@@ -538,7 +570,8 @@ pub fn command_scopes(command: &str) -> (Vec<String>, bool) {
                 }
             },
             (None, '`' | '(' | ')' | '{' | '}' | '#') => return whole(),
-            (None, '$') if chars.peek() == Some(&'{') => return whole(),
+            // `$'..'` has escape rules this scanner does not follow.
+            (None, '$') if matches!(chars.peek(), Some('{' | '\'' | '"')) => return whole(),
             (None, '<') if chars.peek() == Some(&'<') => return whole(),
             (None, ';' | '\n') => segments.push(std::mem::take(&mut cur)),
             (None, '&') if chars.peek() == Some(&'&') => {
@@ -707,6 +740,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(log, "a\nb\nc\n");
+        let path = rig
+            .dir
+            .path()
+            .join(format!("{}.log", view(&rig, id).handle));
+        let mode = std::os::unix::fs::PermissionsExt::mode(
+            &std::fs::metadata(path).unwrap().permissions(),
+        );
+        assert_eq!(mode & 0o077, 0, "log is private");
     }
 
     #[test]
@@ -959,6 +1000,7 @@ mod tests {
     #[test_case("echo 'open", &["echo 'open"], true ; "unterminated")]
     #[test_case("cat <<EOF\nx\nEOF", &["cat <<EOF\nx\nEOF"], true ; "heredoc")]
     #[test_case("echo ${HOME}", &["echo ${HOME}"], true ; "brace_expansion")]
+    #[test_case("echo $'\\'' ; rm x ; echo $'\\'''", &["echo $'\\'' ; rm x ; echo $'\\'''"], true ; "ansi_c_quote")]
     fn scopes_follow_the_bash_rules(command: &str, scopes: &[&str], force: bool) {
         assert_eq!(
             command_scopes(command),
