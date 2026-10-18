@@ -8453,3 +8453,39 @@ fn ctrl_l_opens_model_picker() {
     app.update(Msg::Key(key));
     assert!(app.model_picker.is_open());
 }
+
+#[test]
+fn native_run_creates_tab_keyed_by_handle() {
+    const HANDLE: &str = "ag-k3x9ab";
+    let mut app = streaming_app();
+    let native = |event| {
+        subagent_msg_with_run_id(event, HANDLE, Some("reader"), maki_agent::BACKGROUND_RUN_ID)
+    };
+    app.update(native(AgentEvent::RunStarted {
+        handle: HANDLE.into(),
+        name: "reader".into(),
+        kind: "agent".into(),
+    }));
+    let idx = *app.chat_index.get(HANDLE).expect("tab keyed by the handle");
+    assert_eq!(app.chats.len(), 2);
+    assert_eq!(app.chats[idx].task_id().map(|id| &**id), Some(HANDLE));
+
+    // A background event is not stale just because the turn counter moved on.
+    app.update(native(AgentEvent::TextDelta {
+        text: "found it".into(),
+    }));
+    assert!(!app.chats[idx].is_finished());
+
+    // The legacy task key space shares the strip without clashing.
+    start_subagent(&mut app, "toolu_legacy", RESEARCH_NAME);
+    assert_eq!(app.chats.len(), 3);
+    assert_ne!(app.chat_index["toolu_legacy"], idx);
+
+    app.update(native(AgentEvent::RunFinished {
+        handle: HANDLE.into(),
+        reason: "completed".into(),
+        detail: None,
+    }));
+    assert!(app.chats[idx].is_finished());
+    assert!(!app.chats[app.chat_index["toolu_legacy"]].is_finished());
+}

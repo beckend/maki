@@ -582,7 +582,7 @@ impl UnitTable {
         Envelope {
             event,
             subagent: self.agents.get(&id).map(|run| run.info.clone()),
-            run_id: 0,
+            run_id: crate::BACKGROUND_RUN_ID,
         }
     }
 
@@ -688,7 +688,7 @@ impl UnitHub {
             clock,
             shell,
             settled: Event::new(),
-            events,
+            events: events.with_run_id(crate::BACKGROUND_RUN_ID),
             cancel,
             cancel_root: Mutex::new(Some(trigger)),
         })

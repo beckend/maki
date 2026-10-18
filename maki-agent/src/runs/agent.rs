@@ -653,7 +653,7 @@ impl Driver {
             | AgentEvent::StreamClosed => return,
             _ => {}
         }
-        envelope.run_id = 0;
+        envelope.run_id = crate::BACKGROUND_RUN_ID;
         envelope
             .subagent
             .get_or_insert_with(|| self.run.info.clone());
@@ -665,7 +665,7 @@ impl Driver {
             let _ = hub.events.send_envelope(Envelope {
                 event,
                 subagent: Some(self.run.info.clone()),
-                run_id: 0,
+                run_id: crate::BACKGROUND_RUN_ID,
             });
         }
     }
