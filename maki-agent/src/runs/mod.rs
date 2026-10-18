@@ -22,6 +22,7 @@ pub mod shell;
 mod signals;
 mod topology;
 mod transcript;
+mod watch;
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
@@ -422,6 +423,7 @@ impl fmt::Display for UnitError {
                 ),
                 "taken" => write!(f, "BAD_FIELD: \"{field}\" is already in use"),
                 "missing" => write!(f, "BAD_FIELD: \"{field}\" is required for this kind"),
+                "regex" => write!(f, "BAD_FIELD: \"{field}\" is not a valid regex"),
                 other => write!(f, "BAD_FIELD: \"{field}\" ({other})"),
             },
         }
@@ -500,6 +502,11 @@ impl SpawnRequest {
                 let Some(command) = self.command else {
                     return Err(bad("command", "missing"));
                 };
+                if let Some(pattern) = &self.watch
+                    && regex::Regex::new(pattern).is_err()
+                {
+                    return Err(bad("watch", "regex"));
+                }
                 UnitKind::Shell(ShellSpec {
                     command,
                     cwd: self.cwd,
@@ -2323,6 +2330,50 @@ impl UnitHub {
             .units
             .get(&id)
             .map_or_else(|| "?".to_owned(), |u| u.handle.to_string())
+    }
+
+    /// A shell's output matched its `watch`, or the matches hit the rate cap.
+    /// Wakes the owner only under `notify=wake`; `notify=never` sends nothing.
+    fn watch_notice(&self, id: UnitId, pattern: &str, out: watch::Out) {
+        {
+            let mut table = self.table();
+            let Some(unit) = table.units.get(&id) else {
+                return;
+            };
+            if unit.notice_policy == NoticePolicy::Never || unit.state.is_done() {
+                return;
+            }
+            let (owner, handle, name) =
+                (unit.owner, unit.handle.to_string(), unit.name.to_string());
+            let wake = unit.notice_policy == NoticePolicy::Wake;
+            let (kind, text, wake) = match out {
+                watch::Out::Match { lines, extra } => (
+                    NoticeKind::Match,
+                    notice::shell_match(&handle, &name, pattern, &lines, extra),
+                    wake,
+                ),
+                watch::Out::Overflow => (
+                    NoticeKind::Overflow,
+                    notice::shell_match_overflow(&handle, &name, pattern),
+                    false,
+                ),
+            };
+            table.pending_notices.push(PendingNotice {
+                owner,
+                info: NoticeInfo {
+                    kind,
+                    run: id,
+                    handle,
+                    name,
+                    generation: 0,
+                    count: 1,
+                    created: SystemTime::now(),
+                },
+                text,
+                wake,
+            });
+        }
+        self.flush_notices();
     }
 
     /// A quiet notice to the sender; nothing for the user.
