@@ -60,7 +60,7 @@ pub use limits::UnitLimits;
 pub use notice::{Notice, NoticeInfo, NoticeKind};
 pub use revive::{RevivePlan, TombstoneView};
 use shell::ShellRun;
-pub use shell::{OutputSlice, ShellOptions};
+pub use shell::{AdoptEvent, Adopted, OutputSlice, ShellOptions};
 
 const AGENT_HANDLE_PREFIX: &str = "ag";
 const SHELL_HANDLE_PREFIX: &str = "sh";
@@ -948,7 +948,21 @@ impl UnitHub {
         caller: UnitId,
         req: SpawnRequest,
     ) -> Result<SpawnAck, UnitError> {
-        self.spawn_with(caller, req, None)
+        self.spawn_with(caller, req, None, None)
+    }
+
+    /// Takes over a process a foreground tool started and could not finish in
+    /// time (bash timeout). It becomes a shell run like any other and is
+    /// subject to every spawn limit; on `Err` nothing was created and the
+    /// caller still owns the process. `req` is a shell request whose command
+    /// is only a label.
+    pub fn adopt_shell(
+        self: &Arc<Self>,
+        caller: UnitId,
+        req: SpawnRequest,
+        adopted: shell::Adopted,
+    ) -> Result<SpawnAck, UnitError> {
+        self.spawn_with(caller, req, None, Some(adopted))
     }
 
     /// Starts an agent run: its driver task owns the history and the cancel
@@ -961,7 +975,7 @@ impl UnitHub {
         req: SpawnRequest,
         launch: AgentLaunch,
     ) -> Result<SpawnAck, UnitError> {
-        self.spawn_with(caller, req, Some(launch))
+        self.spawn_with(caller, req, Some(launch), None)
     }
 
     fn spawn_with(
@@ -969,6 +983,7 @@ impl UnitHub {
         caller: UnitId,
         mut req: SpawnRequest,
         mut launch: Option<AgentLaunch>,
+        adopted: Option<shell::Adopted>,
     ) -> Result<SpawnAck, UnitError> {
         let description = req.description.clone();
         let name = req.name.take();
@@ -1172,14 +1187,12 @@ impl UnitHub {
         table.outbox.push(started_event);
         self.release(table);
         if let Some((spec, run)) = started {
-            shell::start(
-                Arc::downgrade(self),
-                id,
-                run,
-                spec,
-                Arc::clone(&self.clock),
-                self.shell.clone(),
-            );
+            let hub = Arc::downgrade(self);
+            let (clock, opts) = (Arc::clone(&self.clock), self.shell.clone());
+            match adopted {
+                Some(adopted) => shell::start_adopted(hub, id, run, spec, clock, opts, adopted),
+                None => shell::start(hub, id, run, spec, clock, opts),
+            }
         }
         if let Some((spec, launch, run)) = agent_started {
             agent::start(

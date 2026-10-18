@@ -274,7 +274,7 @@ maki.setup({
 |-------|------|---------|-----|-------------|
 | `max_output_bytes` | integer | - | - | Override `agent.max_output_bytes` for this tool. |
 | `max_output_lines` | integer | - | - | Override `agent.max_output_lines` for this tool. |
-| `timeout_secs` | integer | `120` | 5 | Kill the command after this many seconds. A call's `timeout` param overrides it. |
+| `timeout_secs` | integer | `120` | 5 | Stop waiting for the command after this many seconds and kill it; with native runs enabled it keeps running as a background shell run instead. A call's `timeout` param overrides it. |
 
 ### `plugins.code_execution`
 

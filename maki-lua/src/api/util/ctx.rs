@@ -379,6 +379,68 @@ impl UserData for LuaCtx {
             Ok(maki_agent::is_instruction_file(&name))
         });
 
+        // Hands a task job that outlived its deadline to the run hub, which
+        // owns the process from then on. `(nil, why)` leaves the job exactly
+        // as it was, so the caller can fall back to killing it.
+        methods.add_method(
+            "promote",
+            |lua, this, (job_id, opts): (u32, mlua::Table)| {
+                let Some(agent) = this.agent() else {
+                    return Ok(this.cap_err_pair("promote"));
+                };
+                let Some(runs) = agent.runs.clone() else {
+                    return Ok((None, Some("runs are not enabled".to_owned())));
+                };
+                let command: String = opts.get("command")?;
+                let output: String = opts.get::<Option<String>>("output")?.unwrap_or_default();
+                let label: String = command
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .chars()
+                    .take(60)
+                    .collect();
+                let req: maki_agent::runs::SpawnRequest =
+                    serde_json::from_value(serde_json::json!({
+                        "kind": "shell",
+                        "description": format!("bash: {label}"),
+                        "command": command,
+                    }))
+                    .map_err(mlua::Error::external)?;
+                let mut req = req;
+                req.origin_tool_use_id = agent.tool_use_id.as_deref().map(Arc::from);
+                let task_id = crate::runtime::active_task_id(lua);
+                let Some((pid, source)) = crate::runtime::with_jobs(lua, |store| {
+                    store.take_for_adoption(job_id, task_id)
+                }) else {
+                    return Ok((None, Some("the command already finished".to_owned())));
+                };
+                let mut initial = output.into_bytes();
+                if !initial.is_empty() {
+                    initial.push(b'\n');
+                }
+                let (tx, rx) = flume::unbounded();
+                let adopted = maki_agent::runs::Adopted {
+                    pid,
+                    initial,
+                    events: rx,
+                };
+                match runs.hub.adopt_shell(runs.self_run, req, adopted) {
+                    Ok(ack) => {
+                        crate::runtime::with_jobs(lua, |store| store.finish(lua, job_id));
+                        forward_job_events(source, tx);
+                        Ok((Some(ack.handle.to_string()), None))
+                    }
+                    Err(e) => {
+                        crate::runtime::with_jobs(lua, |store| {
+                            store.restore_receiver(job_id, source)
+                        });
+                        Ok((None, Some(e.to_string())))
+                    }
+                }
+            },
+        );
+
         methods.add_method_mut("finish", |lua, this, val: LuaValue| {
             if !matches!(this.caps, Caps::Handler { .. }) {
                 return Ok(this.cap_err_pair("finish"));
@@ -403,6 +465,33 @@ fn resolve_abs_with_cwd(path: String, cwd: &Path) -> PathBuf {
     } else {
         cwd.join(&path)
     }
+}
+
+/// Moves a job's remaining lines and its exit to the run that adopted it. A
+/// thread, because the source is a blocking channel and nothing else reads it.
+fn forward_job_events(
+    source: flume::Receiver<crate::api::r#fn::JobEvent>,
+    tx: flume::Sender<maki_agent::runs::AdoptEvent>,
+) {
+    use crate::api::r#fn::JobEvent;
+    use maki_agent::runs::AdoptEvent;
+    let _ = std::thread::Builder::new()
+        .name("job-adopt".into())
+        .spawn(move || {
+            for event in source.iter() {
+                let (out, done) = match event {
+                    JobEvent::Stdout(line) | JobEvent::Stderr(line) => {
+                        let mut bytes = line.into_bytes();
+                        bytes.push(b'\n');
+                        (AdoptEvent::Output(bytes), false)
+                    }
+                    JobEvent::Exit(code) => (AdoptEvent::Exit((code >= 0).then_some(code)), true),
+                };
+                if tx.send(out).is_err() || done {
+                    break;
+                }
+            }
+        });
 }
 
 #[cfg(test)]
