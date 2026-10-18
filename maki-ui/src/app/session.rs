@@ -267,6 +267,7 @@ impl App {
                     cost: chat.cost,
                     started_at: chat.clock.as_ref().and_then(TaskClock::started_at),
                     ended_at: chat.clock.as_ref().and_then(TaskClock::ended_at),
+                    run: None,
                 })
             })
             .collect();

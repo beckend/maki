@@ -1897,7 +1897,7 @@ mod perm {
             if rig.hub.table().pool.is_waiting(a.id) {
                 break;
             }
-            std::thread::yield_now();
+            tokio::task::yield_now().await;
         }
         assert!(
             rig.hub.table().pool.is_waiting(a.id),

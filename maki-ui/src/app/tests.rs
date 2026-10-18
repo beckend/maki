@@ -11615,6 +11615,7 @@ fn a_restored_receipt_nobody_answered_reads_lost() {
         cost: None,
         started_at: None,
         ended_at: None,
+        run: None,
     }]);
     session.set_subagent_messages(RECEIPT_TURN_ID.into(), vec![]);
 
