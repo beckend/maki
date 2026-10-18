@@ -1263,7 +1263,7 @@ mod ack {
             ("PARENT-A", vec![Step::Hang]),
             ("CHILD-B", vec![Step::Hang]),
         ]);
-        let (rig, a, b) = super::hub::pair(&script).await.await;
+        let (rig, a, b) = super::hub::pair(&script).await;
         await_requests(&script, "PARENT-A", 1).await;
         await_requests(&script, "CHILD-B", 1).await;
         for n in 0..crate::runs::inbox::PAIR_BURST {
@@ -2610,10 +2610,9 @@ mod revive {
         );
     }
 
-    #[tokio::test]
-    async fn finished_runs_of_an_earlier_process_are_tombstones() {
-        let script = Script::new(vec![(CHILD, vec![Step::Reply(reply("again"))])]);
-        let rig = rig(&script);
+    /// Writes a finished agent and its transcript to the rig's journal dir
+    /// as an earlier process would have, and attaches the journal.
+    fn adopt_finished_agent(rig: &Rig) {
         let dir = rig.dir.path().join("journal");
         std::fs::create_dir_all(&dir).unwrap();
         let journal = RunJournal::open_in(dir.clone(), JournalOptions::default()).unwrap();
@@ -2647,6 +2646,13 @@ mod revive {
         rig.hub.attach_journal(Arc::new(
             RunJournal::open_in(dir, JournalOptions::default()).unwrap(),
         ));
+    }
+
+    #[tokio::test]
+    async fn finished_runs_of_an_earlier_process_are_tombstones() {
+        let script = Script::new(vec![(CHILD, vec![Step::Reply(reply("again"))])]);
+        let rig = rig(&script);
+        adopt_finished_agent(&rig);
         assert!(rig.hub.reconcile().lost.is_empty());
         let tombs = rig.hub.tombstones(rig.hub.main());
         assert_eq!(tombs.len(), 1);
@@ -2654,6 +2660,35 @@ mod revive {
         let id = tombs[0].id;
         revive(&rig, id, "hello again").await.unwrap();
         assert_eq!(settle(&rig, id).await.result.unwrap().summary, "again");
+    }
+
+    #[tokio::test]
+    async fn adopted_tombstones_do_not_use_up_the_session_run_cap() {
+        let script = Script::new(vec![(CHILD, vec![Step::Reply(reply("fine"))])]);
+        let rig = rig_with(
+            &script,
+            UnitLimits {
+                session_max_runs: 1,
+                ..UnitLimits::default()
+            },
+        );
+        adopt_finished_agent(&rig);
+        assert!(rig.hub.reconcile().lost.is_empty());
+        assert_eq!(rig.hub.tombstones(rig.hub.main()).len(), 1);
+        // One spawn of this process is allowed; the earlier run does not count.
+        let ack = spawn(&rig, CHILD, json!({})).await;
+        assert_eq!(settle(&rig, ack.id).await.result.unwrap().summary, "fine");
+        // The cap itself holds, and it is what bounds tombstones made here.
+        let spec = match agent_req(CHILD, json!({})).into_kind().unwrap() {
+            UnitKind::Agent(spec) => spec,
+            UnitKind::Shell(_) => unreachable!(),
+        };
+        let launch = AgentLaunch::prepare(&rig.ctx, &spec).await.unwrap();
+        let err = rig
+            .hub
+            .spawn_agent(rig.hub.main(), agent_req(CHILD, json!({})), launch)
+            .unwrap_err();
+        assert_eq!(err, UnitError::SpawnLimit);
     }
 }
 
