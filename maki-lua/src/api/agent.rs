@@ -21,8 +21,8 @@ use maki_agent::types::ALLOWED_BY;
 use maki_agent::{
     Agent, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, AgentSeed, DoneReason,
     EMPTY_RESPONSE_MARKER, Envelope, EventSender, EventStreamGuard, History, InputSource,
-    McpSession, RunContext, RunContextBuilder, RunLedger, SessionEvents, SubagentInbox,
-    SubagentInfo, ToolDoneEvent, UNAVAILABLE_RESULT, event_stream,
+    McpSession, RunContext, RunContextBuilder, RunLedger, SessionEvents, SessionMailbox,
+    SubagentInbox, SubagentInfo, ToolDoneEvent, UNAVAILABLE_RESULT, event_stream,
 };
 use maki_lua_macro::{lua_class, lua_fn, lua_table};
 use maki_providers::model::ModelTier;
@@ -707,6 +707,13 @@ async fn call_tool(
 ///     setting if omitted, and is capped at it otherwise.
 ///   `fast` (boolean?) - use fast mode. Inherits parent setting if omitted.
 /// @return (Session?, string?) Session handle, or `(nil, err)` on failure.
+///
+/// The handle carries its own id, so you can deliver a message to the subagent
+/// from the outside with `maki.session.notify(..., { session = sess:session_id() })`.
+/// The message is read before the subagent's next request, or at its next
+/// `:prompt()` if it is idle; see
+/// [maki.agent.Session](#maki-agent-session).
+///
 /// @example
 /// local tools = maki.agent.tools(ctx, { audience = "general_sub" })
 /// local sess, err = maki.agent.session(ctx, {
@@ -875,6 +882,14 @@ async fn session(
         .tool_use_id
         .clone()
         .unwrap_or_else(|| format!("session-{}", MakiId::generate()));
+    // The address `maki.session.notify` reaches this subagent at. Its own id,
+    // deliberately not `agent_ctx.session_id`: that is the parent's, kept for
+    // provider affinity, and two live sessions sharing one id would deliver
+    // each other's observations. Holding the mailbox is what keeps the id
+    // resolvable, and `params.mailbox` owns it for exactly as long as the
+    // handle that carries the id.
+    let session_id = MakiId::generate();
+    let mailbox = SessionMailbox::register(session_id);
     let upstream = match &owner {
         Some((session, ..)) => Upstream::Chat {
             session: *session,
@@ -964,7 +979,11 @@ async fn session(
             session_id: agent_ctx.session_id.clone(),
             background_for: agent_ctx.background_for,
             task_id: Some(Arc::from(cancellation.ui_id.as_str())),
-            mailbox: None,
+            // Lets the parent deliver observations to this subagent. Only the
+            // interactive loop reads `wake`, so a subagent clears it in
+            // `drain()` without starting a turn; it still reads the message
+            // before its next request or at its next `:prompt()`.
+            mailbox: Some(mailbox),
             timeouts: agent_ctx.timeouts,
             // Shared with the parent, not fresh: a lock that a subagent does
             // not take is no lock at all once two of them edit one file, and a
@@ -1009,6 +1028,7 @@ async fn session(
     let sess = lua.create_userdata(LuaSession {
         inner: Arc::new(AsyncMutex::new(state)),
         cancellation,
+        session_id,
     })?;
     Ok((Some(sess), None))
 }
@@ -1339,6 +1359,7 @@ impl SessionState {
         }
         self.closed = true;
         self.stream_guard.take();
+        self.params.mailbox = None;
         self.cancellation.cancel();
         let usage = self.params.ledger.totals().usage;
         let messages = std::mem::replace(&mut self.history, History::new(Vec::new())).into_vec();
@@ -1357,6 +1378,10 @@ impl SessionState {
 struct LuaSession {
     inner: Arc<AsyncMutex<SessionState>>,
     cancellation: Arc<SessionCancellation>,
+    /// The id `maki.session.notify` targets, see [`session_id`]. The mailbox
+    /// that keeps it resolving is `params.mailbox`, which is owned by `inner`
+    /// and so goes exactly when the handle does.
+    session_id: MakiId,
 }
 
 struct SessionCancellation {
@@ -1642,6 +1667,36 @@ async fn close(_lua: Lua, this: mlua::UserDataRef<LuaSession>) -> LuaResult<()> 
     Ok(())
 }
 
+/// The id that addresses this session, for `maki.session.notify`.
+///
+/// Use it to report something to the subagent from outside its own conversation:
+///
+/// ```lua
+/// local id = sess:session_id()
+/// maki.session.notify("the build failed", { session = id })
+/// ```
+///
+/// What reaches the subagent, and when:
+///
+/// - The message becomes an observation in its history before the subagent's
+///   next request, so it sees it between tool calls. A call that is still
+///   running is not interrupted: a subagent blocked in a long tool reads the
+///   note when that tool returns. A message delivered while it is idle waits
+///   for the next `:prompt()`, since nothing starts a subagent's turn on its own.
+/// - `wake` is read only by an interactive frontend loop. There is none here,
+///   so passing it changes nothing.
+/// - `maki.session.prompt()` does NOT work on a subagent: it is a roundtrip to
+///   the UI, and a subagent has no tab to answer it. Use `:prompt()`.
+///
+/// The id stops resolving once you close the session and drop the handle; a
+/// later notify answers `session not live`.
+///
+/// @return (string) The id, which parses as a maki session id.
+#[lua_fn]
+fn session_id(_lua: &Lua, this: &LuaSession) -> LuaResult<String> {
+    Ok(this.session_id.to_string())
+}
+
 lua_class! {
     /// A subagent session with its own conversation history.
     ///
@@ -1652,7 +1707,14 @@ lua_class! {
     /// Always call `:close()` when you are done, on error paths too. The
     /// garbage collector is a fallback that may never run while the VM sits
     /// idle, so a session you only drop can stay open for the rest of the run.
-    "maki.agent.Session" => LuaSession, SESSION_DOCS [prompt, close]
+    ///
+    /// `:session_id()` is how anything else reaches this one: hand it to
+    /// `maki.session.notify` to deliver an observation from the outside. The
+    /// observation is read before the subagent's next request, or at its next
+    /// `:prompt()` if it is idle. A subagent has no turn of
+    /// its own to be woken into, and `maki.session.prompt` is a UI roundtrip
+    /// that does not apply to it.
+    "maki.agent.Session" => LuaSession, SESSION_DOCS [session_id, prompt, close]
 }
 
 /// Weak Lua ref avoids a reference cycle when the session is stored in userdata.
@@ -1672,8 +1734,8 @@ mod tests {
     use flume::Sender;
     use futures_lite::future::poll_once;
     use maki_agent::prompt::{PromptId, ResolvedPrompts};
-    use maki_agent::tools::test_support::stub_ctx_with;
-    use maki_agent::{DoneReason, TurnCompleteEvent};
+    use maki_agent::tools::test_support::{stub_ctx_with, stub_seed};
+    use maki_agent::{DoneReason, MailboxError, TurnCompleteEvent};
     use maki_providers::provider::{BoxFuture, Provider};
     use maki_providers::{
         AgentError, ContentBlock, Message, ModelInfo, ProviderEvent, Role, StopReason,
@@ -1692,6 +1754,7 @@ mod tests {
     const PARTIAL_TEXT: &str = "partial response";
     const SESSION_TIMEOUT: Duration = Duration::from_secs(5);
     const CLOSE_SESSION: &str = "function(sess) sess:close() end";
+    const DELIVERED: &str = "delivered while it was idle";
 
     struct PendingProvider(flume::Sender<()>);
 
@@ -1981,6 +2044,170 @@ mod tests {
             smol::block_on(task.scope_future(open())).unwrap(),
             Some(not_live(session))
         );
+    }
+
+    /// The whole point of minting an id: a plugin that opened a subagent can
+    /// name it, and `maki.session.notify` finds it.
+    #[test]
+    fn a_subagent_handle_exposes_an_addressable_id() {
+        let lua = Lua::new();
+        let ctx = stub_ctx_with(&AgentMode::Build, None, Some(PARENT_ID));
+        smol::block_on(async {
+            let sess = native_session(&lua, &ctx).await;
+            let raw = session_id(&lua, &sess.borrow::<LuaSession>().unwrap()).unwrap();
+            let id: MakiId = raw.parse().expect("the id must parse as a maki id");
+            assert_eq!(id.to_string(), raw);
+            assert_eq!(notify(id).map_err(|e| e.to_string()), Ok(()));
+
+            close(lua.clone(), sess.borrow().unwrap()).await.unwrap();
+        });
+    }
+
+    /// The registry keeps a weak link, so the id stops resolving with the
+    /// handle. Without that, every subagent a plugin ever opened would go on
+    /// answering notify for the rest of the process.
+    #[test]
+    fn a_dropped_subagent_handle_stops_being_addressable() {
+        let lua = Lua::new();
+        let ctx = stub_ctx_with(&AgentMode::Build, None, Some(PARENT_ID));
+        let id = smol::block_on(async {
+            let sess = native_session(&lua, &ctx).await;
+            let id: MakiId = session_id(&lua, &sess.borrow::<LuaSession>().unwrap())
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert!(notify(id).is_ok(), "an open session must answer notify");
+            // `take` moves the value out of the userdata, so the handle's own
+            // `Drop` runs here instead of whenever the GC gets round to it.
+            drop(sess.take::<LuaSession>().unwrap());
+            id
+        });
+        assert_eq!(
+            notify(id).map_err(|e| e.to_string()),
+            Err(not_live(id)),
+            "a dropped handle must unregister its id"
+        );
+    }
+
+    /// `close` is the plugin's way to say it is done, so the id must stop
+    /// answering at once, not whenever the GC finalises the handle.
+    #[test]
+    fn a_closed_subagent_stops_being_addressable() {
+        let lua = Lua::new();
+        let ctx = stub_ctx_with(&AgentMode::Build, None, Some(PARENT_ID));
+        smol::block_on(async {
+            let sess = native_session(&lua, &ctx).await;
+            let id: MakiId = session_id(&lua, &sess.borrow::<LuaSession>().unwrap())
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert!(notify(id).is_ok());
+            close(lua.clone(), sess.borrow().unwrap()).await.unwrap();
+            assert_eq!(notify(id).map_err(|e| e.to_string()), Err(not_live(id)));
+        });
+    }
+
+    /// The id is for messaging only. `AgentParams.session_id` stays the
+    /// parent's, because that is what provider affinity (mistral's
+    /// `x-affinity`, the openrouter body) and the hooks key off, and a
+    /// subagent is a second task inside one conversation rather than a
+    /// conversation of its own.
+    #[test]
+    fn a_subagent_keeps_the_parents_session_id() {
+        let lua = Lua::new();
+        let mut ctx = stub_ctx_with(&AgentMode::Build, None, Some(PARENT_ID));
+        let parent: SessionRef = MakiId::generate().into();
+        ctx.session_id = Some(parent.clone());
+        smol::block_on(async {
+            let sess = native_session(&lua, &ctx).await;
+            let handle = sess.borrow::<LuaSession>().unwrap();
+            let state = handle.inner.lock().await;
+            assert_eq!(state.params.session_id, Some(parent.clone()));
+            assert_ne!(
+                handle.session_id,
+                parent.id(),
+                "the messaging id must be separate from the affinity one"
+            );
+            drop(state);
+            close(lua.clone(), sess.borrow().unwrap()).await.unwrap();
+        });
+    }
+
+    /// End to end: the observation a parent delivers is in the subagent's
+    /// history when it is next prompted. Nothing runs on its own, so this is
+    /// the earliest a plugin can expect it to be read.
+    #[test]
+    fn a_delivered_observation_lands_at_the_next_prompt() {
+        let lua = Lua::new();
+        let (system_tx, _system_rx) = flume::unbounded();
+        let mut ctx = stub_ctx_with(&AgentMode::Build, None, Some(PARENT_ID));
+        ctx.provider = Arc::new(PromptRecorder(system_tx));
+        smol::block_on(async {
+            let sess = native_session(&lua, &ctx).await;
+            let id: MakiId = session_id(&lua, &sess.borrow::<LuaSession>().unwrap())
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert!(notify(id).is_ok());
+
+            let (_, error) = prompt(lua.clone(), sess.borrow().unwrap(), SESSION_PROMPT.into())
+                .await
+                .unwrap();
+            assert!(error.is_none(), "{error:?}");
+            let handle = sess.borrow::<LuaSession>().unwrap();
+            let seen = handle
+                .inner
+                .lock()
+                .await
+                .history
+                .as_slice()
+                .iter()
+                .flat_map(|m| m.content.iter())
+                .filter_map(|b| match b {
+                    ContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(seen.contains(DELIVERED), "history was: {seen}");
+            drop(handle);
+            close(lua.clone(), sess.borrow().unwrap()).await.unwrap();
+        });
+    }
+
+    /// The ctx-less arm is the background session a monitor opens, and it gets
+    /// an id the same way. Minting it in one arm only would leave every
+    /// monitor's subagent unreachable.
+    #[test]
+    fn a_ctx_less_session_is_addressable_too() {
+        let lua = Lua::new();
+        lua.set_app_data(Arc::clone(ToolRegistry::global_arc()));
+        let chat = MakiId::generate();
+        let chat_mailbox = SessionMailbox::register(chat);
+        let _seed = chat_mailbox.publish_seed(stub_seed(chat));
+        let agent =
+            create_agent_table(&lua, Arc::from(PLUGIN), PluginPermissions::trusted()).unwrap();
+        lua.globals().set("agent", agent).unwrap();
+        lua.globals().set("sid", chat.to_string()).unwrap();
+        let task = TaskScope::new(&lua, TaskCell::new(CancelToken::none(), None, None));
+
+        let opened = smol::block_on(
+            task.scope_future(
+                lua.load("local s = agent.session({ session = sid }); return s and s:session_id()")
+                    .eval_async::<Option<String>>(),
+            ),
+        );
+        let id: MakiId = opened
+            .expect("a ctx-less session must open for a live chat")
+            .expect("and it must hand back an id")
+            .parse()
+            .unwrap();
+        assert_ne!(id, chat, "the subagent must not answer to the chat's id");
+        assert_eq!(notify(id).map_err(|e| e.to_string()), Ok(()));
+    }
+
+    fn notify(id: MakiId) -> Result<(), MailboxError> {
+        SessionMailbox::notify(id, DELIVERED.into(), false)
     }
 
     /// A prompt cut short leaves its run's `Done` unread. The next prompt must

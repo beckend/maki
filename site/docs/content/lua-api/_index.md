@@ -1591,6 +1591,12 @@ session, so opening one fails with "session not live". The
 
 **Returns:** ([`Session?`](#maki-agent-Session), `string?`) Session handle, or `(nil, err)` on failure.
 
+The handle carries its own id, so you can deliver a message to the subagent
+from the outside with `maki.session.notify(..., { session = sess:session_id() })`.
+The message is read before the subagent's next request, or at its next
+`:prompt()` if it is idle; see
+[maki.agent.Session](#maki-agent-session).
+
 **Example:**
 
 ```lua
@@ -1656,6 +1662,47 @@ a multi-step conversation.
 Always call `:close()` when you are done, on error paths too. The
 garbage collector is a fallback that may never run while the VM sits
 idle, so a session you only drop can stay open for the rest of the run.
+
+`:session_id()` is how anything else reaches this one: hand it to
+`maki.session.notify` to deliver an observation from the outside. The
+observation is read before the subagent's next request, or at its next
+`:prompt()` if it is idle. A subagent has no turn of
+its own to be woken into, and `maki.session.prompt` is a UI roundtrip
+that does not apply to it.
+
+---
+
+### `Session:session_id()` {#Session-session_id}
+
+```lua
+Session:session_id()
+```
+
+The id that addresses this session, for `maki.session.notify`.
+
+Use it to report something to the subagent from outside its own conversation:
+
+```lua
+local id = sess:session_id()
+maki.session.notify("the build failed", { session = id })
+```
+
+What reaches the subagent, and when:
+
+- The message becomes an observation in its history before the subagent's
+  next request, so it sees it between tool calls. A call that is still
+  running is not interrupted: a subagent blocked in a long tool reads the
+  note when that tool returns. A message delivered while it is idle waits
+  for the next `:prompt()`, since nothing starts a subagent's turn on its own.
+- `wake` is read only by an interactive frontend loop. There is none here,
+  so passing it changes nothing.
+- `maki.session.prompt()` does NOT work on a subagent: it is a roundtrip to
+  the UI, and a subagent has no tab to answer it. Use `:prompt()`.
+
+The id stops resolving once you close the session and drop the handle; a
+later notify answers `session not live`.
+
+**Returns:** (`string`) The id, which parses as a maki session id.
 
 ---
 

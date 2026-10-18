@@ -2226,12 +2226,24 @@ mod tests {
         tmp
     }
 
+    thread_local! {
+        /// The indexes a test walked, kept until the test ends.
+        ///
+        /// The host remembers a walked root in a registry bounded by
+        /// `MAX_ROOTS` and cancels the walk of any root it drops, and it drops
+        /// the roots nothing is holding. A test that let go of its index
+        /// between two queries would be answered by a fresh, still-walking one
+        /// — so by however many other tests were walking at the time.
+        static HELD: RefCell<Vec<maki_agent::file_index::FileIndex>> = const { RefCell::new(Vec::new()) };
+    }
+
     /// The walk runs on its own thread, so anything comparing two answers has
     /// to wait for it or they are answers about different corpora. Asking
     /// again on the way is how a walk the host had no room to start yet still
     /// gets started, which is what a reader does too.
     fn walked(root: &Path) {
         let index = maki_agent::file_index(root);
+        HELD.with_borrow_mut(|held| held.push(index.clone()));
         let deadline = Instant::now() + WALK_TIMEOUT;
         while !index.corpus().complete {
             assert!(Instant::now() < deadline, "{NEVER_WALKED}");

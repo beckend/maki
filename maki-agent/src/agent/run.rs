@@ -396,16 +396,22 @@ impl<'h> Agent<'h> {
         let Some(message) = message else {
             return Ok(());
         };
-        if let Some(mailbox) = &self.mailbox {
-            for message in mailbox.drain() {
-                self.history.push(message);
-            }
-        }
+        self.land_notes();
         self.tell_changes();
         if !message.content.is_empty() {
             self.history.push(message);
         }
         Ok(())
+    }
+
+    /// Notes from plugins and other sessions. Draining also takes the wake, so
+    /// an idle loop never starts a run for notes this run already read.
+    fn land_notes(&mut self) {
+        if let Some(mailbox) = &self.mailbox {
+            for message in mailbox.drain() {
+                self.history.push(message);
+            }
+        }
     }
 
     fn turns_exhausted(&self) -> bool {
@@ -521,6 +527,9 @@ impl<'h> Agent<'h> {
             .last()
             .is_some_and(|m| matches!(m.role, Role::Assistant));
         if !continues_answer {
+            // Notes that came in during the last turn. A user message after
+            // the tool results is fine, `tell_changes` does the same.
+            self.land_notes();
             self.tell_changes();
         }
         Ok(())
@@ -1230,6 +1239,7 @@ mod tests {
     struct MockProvider {
         responses: Mutex<Vec<StreamResponse>>,
         requests: Arc<Mutex<Vec<CapturedRequest>>>,
+        on_request: Option<Box<dyn Fn() + Send + Sync>>,
     }
 
     impl MockProvider {
@@ -1237,6 +1247,7 @@ mod tests {
             Self {
                 responses: Mutex::new(responses),
                 requests: Arc::default(),
+                on_request: None,
             }
         }
     }
@@ -1262,6 +1273,9 @@ mod tests {
                         .map(|m| serde_json::to_value(m).unwrap())
                         .collect(),
                 });
+                if let Some(hook) = &self.on_request {
+                    hook();
+                }
                 let mut responses = self.responses.lock().unwrap();
                 assert!(!responses.is_empty(), "MockProvider: no more responses");
                 Ok(responses.remove(0))
@@ -2621,6 +2635,99 @@ mod tests {
             smol::block_on(agent.process_tool_calls(tool_call_response("glob", "t1"))).unwrap_err();
         assert!(matches!(err, AgentError::Config { message } if message == NO_FRAME));
     }
+
+    fn user_texts(history: &History) -> Vec<&str> {
+        history
+            .as_slice()
+            .iter()
+            .filter_map(Message::user_text)
+            .collect()
+    }
+
+    /// A note sent while a tool call runs is read by the next request, behind
+    /// the tool results so the tool_use/tool_result pair stays adjacent. The
+    /// note from before the run came in with the prompt and is not repeated.
+    #[test]
+    fn note_sent_mid_run_lands_before_the_next_request() {
+        smol::block_on(async {
+            let id = maki_storage::id::MakiId::generate();
+            let mailbox = SessionMailbox::register(id);
+            SessionMailbox::notify(id, "early".into(), false).unwrap();
+            let mut mock = MockProvider::new(vec![
+                tool_call_response("glob", "t1"),
+                text_response(StopReason::EndTurn),
+            ]);
+            let sent = std::sync::atomic::AtomicBool::new(false);
+            mock.on_request = Some(Box::new(move || {
+                if !sent.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    SessionMailbox::notify(id, "late".into(), false).unwrap();
+                }
+            }));
+            let requests = Arc::clone(&mock.requests);
+            let mut history = History::new(Vec::new());
+            let (mut agent, _event_rx) = make_agent(mock, &mut history);
+            agent.mailbox = Some(mailbox);
+            agent.run(default_input()).await.unwrap();
+            drop(agent);
+
+            let requests = requests.lock().unwrap();
+            let roles: Vec<_> = requests[1]
+                .messages
+                .iter()
+                .map(|m| m["role"].as_str().unwrap().to_owned())
+                .collect();
+            assert_eq!(roles, ["user", "user", "assistant", "user", "user"]);
+            let result = &requests[1].messages[3]["content"][0];
+            assert_eq!(result["tool_use_id"], "t1");
+            assert_eq!(requests[1].messages[2]["content"][0]["id"], "t1");
+            assert_eq!(
+                user_texts(&history)
+                    .iter()
+                    .filter(|t| **t == "early")
+                    .count(),
+                1
+            );
+            assert_eq!(
+                user_texts(&history)
+                    .iter()
+                    .filter(|t| **t == "late")
+                    .count(),
+                1
+            );
+            assert_eq!(history.as_slice()[4].user_text(), Some("late"));
+        });
+    }
+
+    /// The request continues a cut-off answer, so a note there would get a
+    /// reply. It stays in the mailbox until a user turn.
+    #[test]
+    fn note_waits_while_an_answer_is_continued() {
+        let id = maki_storage::id::MakiId::generate();
+        let mailbox = SessionMailbox::register(id);
+        let mut history = History::new(Vec::new());
+        let (mut agent, _event_rx) = make_agent(MockProvider::new(Vec::new()), &mut history);
+        agent.mailbox = Some(mailbox);
+        agent.history.push(Message::user("hello".into()));
+        agent.history.push(Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Text { text: "cut".into() }],
+            ..Default::default()
+        });
+        SessionMailbox::notify(id, "note".into(), false).unwrap();
+
+        agent.prepare_request().unwrap();
+        assert!(matches!(
+            agent.history.as_slice().last().unwrap().role,
+            Role::Assistant
+        ));
+        agent.history.push(Message::user("go on".into()));
+        agent.prepare_request().unwrap();
+        assert_eq!(
+            agent.history.as_slice().last().unwrap().user_text(),
+            Some("note")
+        );
+    }
+
     /// Two responses are the whole budget: the opening turn, then the one turn
     /// that answers all three queued messages. Answering them one by one would
     /// ask the mock for a response it does not have.
