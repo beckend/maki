@@ -22,6 +22,9 @@ pub struct UnitLimits {
     pub siblings: bool,
     pub permission_timeout: Duration,
     pub unattended: UnattendedMode,
+    pub max_retained: u16,
+    pub max_idle: u16,
+    pub idle_timeout: Duration,
 }
 
 impl Default for UnitLimits {
@@ -50,6 +53,9 @@ impl From<&RunsConfig> for UnitLimits {
                 config.permission_timeout_secs.min(MAX_TIMEOUT_SECS),
             ),
             unattended: config.unattended_permissions,
+            max_retained: wide(config.max_retained),
+            max_idle: wide(config.max_idle),
+            idle_timeout: Duration::from_secs(config.idle_timeout_secs.min(MAX_TIMEOUT_SECS)),
         }
     }
 }
@@ -77,6 +83,10 @@ mod tests {
         );
         assert_eq!(l.default_timeout, Duration::from_secs(1800));
         assert_eq!(l.max_timeout, Duration::from_secs(86_400));
+        assert_eq!(
+            (l.max_retained, l.max_idle, l.idle_timeout),
+            (64, 16, Duration::from_secs(1800))
+        );
     }
 
     #[test]

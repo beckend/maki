@@ -8059,6 +8059,9 @@ fn native_run_creates_tab_keyed_by_handle() {
         handle: HANDLE.into(),
         name: "reader".into(),
         kind: "agent".into(),
+        parent: None,
+        depth: 1,
+        one_shot: false,
     }));
     let idx = *app.chat_index.get(HANDLE).expect("tab keyed by the handle");
     assert_eq!(app.chats.len(), 2);
@@ -8085,6 +8088,43 @@ fn native_run_creates_tab_keyed_by_handle() {
 }
 
 #[test]
+fn native_run_is_stored_with_its_state() {
+    const HANDLE: &str = "ag-k3x9ab";
+    let mut app = streaming_app();
+    let native = |event| {
+        subagent_msg_with_run_id(event, HANDLE, Some("reader"), maki_agent::BACKGROUND_RUN_ID)
+    };
+    app.update(native(AgentEvent::RunStarted {
+        handle: HANDLE.into(),
+        name: "reader".into(),
+        kind: "agent".into(),
+        parent: Some("ag-parent".into()),
+        depth: 2,
+        one_shot: true,
+    }));
+    app.sync_subagents();
+    let stored = |app: &App| app.state.session.subagents()[0].run.clone().unwrap();
+    let run = stored(&app);
+    assert_eq!(
+        (
+            run.handle.as_str(),
+            run.parent.as_deref(),
+            run.depth,
+            run.one_shot,
+            run.state.as_str()
+        ),
+        (HANDLE, Some("ag-parent"), 2, true, "running")
+    );
+    app.update(native(AgentEvent::RunFinished {
+        handle: HANDLE.into(),
+        reason: "completed".into(),
+        detail: None,
+    }));
+    app.sync_subagents();
+    assert_eq!(stored(&app).state, "completed");
+}
+
+#[test]
 fn esc_leaves_native_run_tab_running() {
     const HANDLE: &str = "ag-k3x9ab";
     let mut app = streaming_app();
@@ -8095,6 +8135,9 @@ fn esc_leaves_native_run_tab_running() {
         handle: HANDLE.into(),
         name: "reader".into(),
         kind: "agent".into(),
+        parent: None,
+        depth: 1,
+        one_shot: false,
     }));
     let idx = app.chat_index[HANDLE];
     app.update(Msg::Key(key(KeyCode::Esc)));
@@ -8200,6 +8243,9 @@ mod run_prompts {
                 handle: HANDLE_A.into(),
                 name: "auditor".into(),
                 kind: "agent".into(),
+                parent: None,
+                depth: 1,
+                one_shot: false,
             },
         ));
         app.update(ask(HANDLE_A, "auditor", "t1", tx));

@@ -243,7 +243,7 @@ get DEPTH_LIMIT and must do the work yourself.
 Send a message to another run in this session: your child, your parent (name "parent"),
 or "main". (Siblings only if the session enables it.) The message is queued and returns a
 message id at once. A running recipient reads it at its next step; an idle one starts a turn
-with it. Sending does not end your turn and is not an answer: the recipient's reply, if any,
+with it; a finished or evicted agent with a saved transcript is revived first. Sending does not end your turn and is not an answer: the recipient's reply, if any,
 comes as a message to you. Use mode "quiet" for FYI notes that must not start a turn. Your
 final result reaches your parent on its own: use send to a parent only for a question or
 mid-run progress.

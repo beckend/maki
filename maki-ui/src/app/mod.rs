@@ -1714,7 +1714,28 @@ impl App {
         // when the record is done. Shell runs are not stamped and stay on main.
         if chat_idx != MAIN_CHAT {
             match &envelope.event {
+                AgentEvent::RunStarted {
+                    handle,
+                    name,
+                    kind,
+                    parent,
+                    depth,
+                    one_shot,
+                } => {
+                    self.chats[chat_idx].run = Some(maki_storage::sessions::StoredRun {
+                        handle: handle.clone(),
+                        name: name.clone(),
+                        parent: parent.clone(),
+                        kind: kind.clone(),
+                        state: "running".to_owned(),
+                        depth: *depth,
+                        one_shot: *one_shot,
+                    });
+                }
                 AgentEvent::RunStateChanged { state, .. } => {
+                    if let Some(run) = &mut self.chats[chat_idx].run {
+                        run.state.clone_from(state);
+                    }
                     self.chats[chat_idx].idle = state == "idle";
                     if state == "idle" {
                         self.drop_run_prompts(subagent_id.as_deref());
@@ -1722,6 +1743,9 @@ impl App {
                     return vec![];
                 }
                 AgentEvent::RunFinished { reason, .. } => {
+                    if let Some(run) = &mut self.chats[chat_idx].run {
+                        run.state.clone_from(reason);
+                    }
                     self.drop_run_prompts(subagent_id.as_deref());
                     self.chats[chat_idx].cancel_in_progress();
                     let (outcome, text) = match reason.as_str() {

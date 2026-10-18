@@ -2182,3 +2182,390 @@ mod perm {
         assert_clean(&rig, &[ack.id]);
     }
 }
+
+/// Cold revive and eviction (design 7.4).
+mod revive {
+    use maki_storage::runs::{JournalOptions, JournalRecord, MsgRec, RunJournal, SpawnRec};
+
+    use super::*;
+    use crate::runs::transcript;
+
+    fn journaled(script: &Arc<Script>, limits: UnitLimits) -> (Rig, std::path::PathBuf) {
+        let rig = rig_with(script, limits);
+        let dir = rig.dir.path().join("journal");
+        std::fs::create_dir_all(&dir).unwrap();
+        let journal = RunJournal::open_in(dir.clone(), JournalOptions::default()).unwrap();
+        rig.hub.attach_journal(Arc::new(journal));
+        (rig, dir)
+    }
+
+    fn text_message(role: Role, text: &str) -> Message {
+        Message {
+            role,
+            content: vec![ContentBlock::Text { text: text.into() }],
+            ..Default::default()
+        }
+    }
+
+    /// What the `send` tool does for a finished agent.
+    fn revive(rig: &Rig, to: UnitId, text: &str) -> Result<SendAck, UnitError> {
+        let main = rig.hub.main();
+        let plan = rig.hub.revive_plan(main, to)?.expect("not live");
+        let transcript = rig.hub.load_transcript(plan.handle.as_str()).unwrap();
+        let launch = smol::block_on(AgentLaunch::prepare(&rig.ctx, &plan.spec)).unwrap();
+        rig.hub.revive(
+            main,
+            plan,
+            launch,
+            transcript,
+            text.to_owned(),
+            DeliveryKind::Steer,
+        )
+    }
+
+    fn stop(rig: &Rig, id: UnitId) {
+        rig.hub.stop(rig.hub.main(), &[id], StopOpts::default());
+        settle(rig, id);
+    }
+
+    #[test]
+    fn completed_agent_cold_resumes_from_transcript() {
+        let script = Script::new(vec![(
+            CHILD,
+            vec![
+                Step::Reply(reply("first answer")),
+                Step::Reply(reply("second answer")),
+            ],
+        )]);
+        let (rig, dir) = journaled(&script, UnitLimits::default());
+        let ack = spawn(&rig, CHILD, json!({}));
+        assert_eq!(settle(&rig, ack.id).state.label(), "idle");
+        stop(&rig, ack.id);
+        let path = maki_storage::runs::transcript_path(&dir, ack.handle.as_str());
+        let transcript_before = transcript::load(&path).unwrap();
+        let first_turn = transcript_before.len();
+        assert!(first_turn >= 2, "the prompt and the reply are saved");
+        let sent = revive(&rig, ack.id, "follow up please").unwrap();
+        assert_eq!(sent.state, "revived");
+        let view = settle(&rig, ack.id);
+        assert_eq!(view.state.label(), "idle");
+        assert_eq!(view.result.unwrap().summary, "second answer");
+        let second = seen_text(&script, CHILD).remove(1);
+        assert!(
+            second.contains("first answer"),
+            "history restored: {second}"
+        );
+        assert!(
+            second.contains("follow up please"),
+            "message delivered: {second}"
+        );
+        // The second turn was appended, not rewritten.
+        let saved = transcript::load(&path).unwrap();
+        assert!(saved.len() > first_turn);
+        assert_eq!(saved[..first_turn], transcript_before[..]);
+        assert_eq!(saved.len(), first_turn + 2, "the follow-up and its reply");
+        // Same identity.
+        assert_eq!(rig.hub.get(ack.id).unwrap().handle, ack.handle);
+    }
+
+    #[test]
+    fn one_shot_not_revivable() {
+        let script = Script::new(vec![(CHILD, vec![Step::Reply(reply("done"))])]);
+        let (rig, _dir) = journaled(&script, UnitLimits::default());
+        let ack = spawn(&rig, CHILD, json!({"one_shot": true}));
+        assert_eq!(done_reason(&settle(&rig, ack.id)), DoneReason::Completed);
+        let err = rig.hub.revive_plan(rig.hub.main(), ack.id).unwrap_err();
+        assert_eq!(err, UnitError::RecipientTerminal);
+    }
+
+    #[test]
+    fn missing_transcript_is_not_revivable() {
+        let script = Script::new(vec![(CHILD, vec![Step::Hang])]);
+        let (rig, dir) = journaled(&script, UnitLimits::default());
+        let ack = spawn(&rig, CHILD, json!({}));
+        await_requests(&script, CHILD, 1);
+        stop(&rig, ack.id);
+        let path = maki_storage::runs::transcript_path(&dir, ack.handle.as_str());
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(
+            rig.hub.revive_plan(rig.hub.main(), ack.id).unwrap_err(),
+            UnitError::RecipientTerminal
+        );
+    }
+
+    #[test]
+    fn spec_restored_model_tools_schema() {
+        let script = Script::new(vec![(CHILD, vec![Step::Reply(reply("ok"))])]);
+        let (rig, _dir) = journaled(&script, UnitLimits::default());
+        let schema = json!({"type": "object", "properties": {"n": {"type": "integer"}}});
+        let req = agent_req(
+            CHILD,
+            json!({
+                "subagent_type": "research",
+                "output_schema": schema,
+                "thinking": "off",
+                "timeout_secs": 90,
+                "one_shot": false,
+            }),
+        );
+        let spec = match req.clone().into_kind().unwrap() {
+            UnitKind::Agent(spec) => spec,
+            UnitKind::Shell(_) => unreachable!(),
+        };
+        let unit = Unit {
+            id: UnitId::new(),
+            handle: UnitHandle("ag-spec01".into()),
+            name: UnitName("spec".into()),
+            owner: rig.hub.main(),
+            parent: rig.hub.main(),
+            depth: 1,
+            kind: UnitKind::Agent(spec.clone()),
+            description: "d".into(),
+            origin_tool_use_id: None,
+            state: UnitState::Queued,
+            created_at: SystemTime::now(),
+            started_at: None,
+            finished_at: None,
+            last_activity: Instant::now(),
+            progress: None,
+            usage: Default::default(),
+            cost: 0.0,
+            notice_policy: NoticePolicy::Wake,
+        };
+        let rec = super::super::journal::spawn_record(&unit, Some("anthropic/some-model"));
+        assert_eq!(rec.spec["model"], "anthropic/some-model");
+        let back = super::super::journal::agent_spec_from_json(&rec.spec);
+        assert_eq!(back.subagent_type, "research");
+        assert_eq!(back.output_schema, spec.output_schema);
+        assert_eq!(back.thinking, spec.thinking);
+        assert_eq!(back.timeout_secs, 90);
+        assert_eq!(back.prompt, CHILD);
+        assert_eq!(back.model_tier, spec.model_tier);
+        // And the rebuilt launch carries the structured-output tool of the schema.
+        let launch = smol::block_on(AgentLaunch::prepare(&rig.ctx, &back)).unwrap();
+        assert!(launch.has_schema());
+        assert_eq!(launch.model_spec, rig.ctx.model.spec());
+    }
+
+    #[test]
+    fn evicted_tombstone_still_revivable() {
+        let script = Script::new(vec![
+            (
+                "OLD-TASK",
+                vec![
+                    Step::Reply(reply("old one")),
+                    Step::Reply(reply("old again")),
+                ],
+            ),
+            ("NEW-TASK", vec![Step::Reply(reply("new one"))]),
+        ]);
+        let limits = UnitLimits {
+            max_retained: 1,
+            ..UnitLimits::default()
+        };
+        let (rig, _dir) = journaled(&script, limits);
+        let old = spawn_as(
+            &rig,
+            rig.hub.main(),
+            agent_req("OLD-TASK", json!({"name": "oldie"})),
+        );
+        settle(&rig, old.id);
+        let new = spawn_as(&rig, rig.hub.main(), agent_req("NEW-TASK", json!({})));
+        settle(&rig, new.id);
+        stop(&rig, old.id);
+        stop(&rig, new.id);
+        rig.hub.sweep();
+        assert!(rig.hub.get(old.id).is_none(), "the oldest left the table");
+        assert!(rig.hub.get(new.id).is_some());
+        let tombs = rig.hub.tombstones(rig.hub.main());
+        assert_eq!(tombs.len(), 1);
+        assert_eq!(tombs[0].handle, old.handle);
+        assert!(tombs[0].revivable);
+        // By name, through the same path the send tool takes.
+        let id = rig.hub.resolve(rig.hub.main(), "oldie").unwrap();
+        assert_eq!(id, old.id);
+        revive(&rig, id, "back again").unwrap();
+        let view = settle(&rig, id);
+        assert_eq!(view.result.unwrap().summary, "old again");
+        assert!(
+            rig.hub
+                .tombstones(rig.hub.main())
+                .iter()
+                .all(|t| t.id != id)
+        );
+        // Session accounting still counts it.
+        assert!(rig.hub.session_usage().0 >= 2);
+    }
+
+    #[test]
+    fn idle_timeout_and_max_idle_evict_silently() {
+        let script = Script::new(vec![
+            ("A-TASK", vec![Step::Reply(reply("a"))]),
+            ("B-TASK", vec![Step::Reply(reply("b"))]),
+        ]);
+        let limits = UnitLimits {
+            max_idle: 1,
+            idle_timeout: Duration::from_secs(60),
+            ..UnitLimits::default()
+        };
+        let (rig, _dir) = journaled(&script, limits);
+        let a = spawn_as(&rig, rig.hub.main(), agent_req("A-TASK", json!({})));
+        settle(&rig, a.id);
+        let notices = rig.hub.pending_notices(rig.hub.main()).len();
+        rig.clock.advance(Duration::from_secs(1));
+        let b = spawn_as(&rig, rig.hub.main(), agent_req("B-TASK", json!({})));
+        settle(&rig, b.id);
+        // Two idle agents, room for one: the least recently active leaves.
+        rig.hub.sweep();
+        assert_eq!(
+            done_reason(&rig.hub.get(a.id).unwrap()),
+            DoneReason::Completed
+        );
+        assert_eq!(rig.hub.get(b.id).unwrap().state.label(), "idle");
+        // The timeout takes the other one.
+        rig.clock.advance(Duration::from_secs(61));
+        rig.hub.sweep();
+        assert_eq!(
+            done_reason(&rig.hub.get(b.id).unwrap()),
+            DoneReason::Completed
+        );
+        // Nothing was said about either leaving: only the idle notices of the turns.
+        let after = rig.hub.pending_notices(rig.hub.main());
+        assert!(
+            after.len() <= notices + 1,
+            "no settlement notice: {after:?}"
+        );
+        assert!(
+            !after.iter().any(|n| n.text.contains("completed")),
+            "{after:?}"
+        );
+        // Both come back when messaged.
+        revive_and_check(&rig, &script, a.id);
+    }
+
+    fn revive_and_check(rig: &Rig, script: &Arc<Script>, id: UnitId) {
+        // The route has no step left, so the revived run just hangs on its
+        // request: it is live again, which is all this checks.
+        revive(rig, id, "wake up").unwrap();
+        await_requests(script, "A-TASK", 2);
+        assert!(matches!(rig.hub.get(id).unwrap().state, UnitState::Running));
+        stop(rig, id);
+    }
+
+    #[test]
+    fn pending_messages_redelivered() {
+        let script = Script::new(vec![(CHILD, vec![Step::Reply(reply("caught up"))])]);
+        let rig = rig(&script);
+        let dir = rig.dir.path().join("journal");
+        std::fs::create_dir_all(&dir).unwrap();
+        // What a dead process left: a running agent with one turn saved and a
+        // message it never read.
+        let journal = RunJournal::open_in(dir.clone(), JournalOptions::default()).unwrap();
+        journal.append(JournalRecord::Spawn(SpawnRec {
+            id: UnitId::new().0.to_string(),
+            handle: "ag-lost01".into(),
+            name: "lostone".into(),
+            kind: "agent".into(),
+            owner: rig.hub.main().0.to_string(),
+            parent: rig.hub.main().0.to_string(),
+            depth: 1,
+            desc: "d".into(),
+            notify: "wake".into(),
+            spec: json!({"prompt": CHILD, "subagent_type": "general", "one_shot": false, "timeout_secs": 600}),
+            ..SpawnRec::default()
+        }));
+        journal.append(JournalRecord::Msg(MsgRec {
+            id: "9".into(),
+            from: "main".into(),
+            to: "ag-lost01".into(),
+            kind: "steer".into(),
+            stage: "accepted".into(),
+            body: Some("unread before the crash".into()),
+            ..MsgRec::default()
+        }));
+        journal.flush();
+        drop(journal);
+        transcript::append(
+            &maki_storage::runs::transcript_path(&dir, "ag-lost01"),
+            &[
+                text_message(Role::User, CHILD),
+                text_message(Role::Assistant, "earlier work"),
+            ],
+        )
+        .unwrap();
+        rig.hub.attach_journal(Arc::new(
+            RunJournal::open_in(dir.clone(), JournalOptions::default()).unwrap(),
+        ));
+        let report = rig.hub.reconcile();
+        assert_eq!(report.lost, vec!["ag-lost01".to_owned()]);
+        let id = rig.hub.resolve(rig.hub.main(), "lostone").unwrap();
+        assert_eq!(rig.hub.get(id).unwrap().state.label(), "lost");
+        revive(&rig, id, "are you there").unwrap();
+        let view = settle(&rig, id);
+        assert_eq!(view.result.unwrap().summary, "caught up");
+        let seen = seen_text(&script, CHILD).remove(0);
+        assert!(seen.contains("earlier work"), "{seen}");
+        assert!(seen.contains("unread before the crash"), "{seen}");
+        assert!(seen.contains("are you there"), "{seen}");
+        // The old record is settled and a crash now loses the run again.
+        let replay = rig.hub.journal.get().unwrap().replay();
+        let run = replay
+            .runs
+            .iter()
+            .find(|r| r.spawn.handle == "ag-lost01")
+            .unwrap();
+        assert!(run.term.is_none(), "revived runs are unfinished");
+        assert!(
+            replay
+                .messages
+                .iter()
+                .all(|m| m.rec.id != "9" || !m.pending())
+        );
+    }
+
+    #[test]
+    fn finished_runs_of_an_earlier_process_are_tombstones() {
+        let script = Script::new(vec![(CHILD, vec![Step::Reply(reply("again"))])]);
+        let rig = rig(&script);
+        let dir = rig.dir.path().join("journal");
+        std::fs::create_dir_all(&dir).unwrap();
+        let journal = RunJournal::open_in(dir.clone(), JournalOptions::default()).unwrap();
+        journal.append(JournalRecord::Spawn(SpawnRec {
+            id: UnitId::new().0.to_string(),
+            handle: "ag-done01".into(),
+            name: "doneone".into(),
+            kind: "agent".into(),
+            owner: rig.hub.main().0.to_string(),
+            parent: rig.hub.main().0.to_string(),
+            depth: 1,
+            notify: "wake".into(),
+            spec: json!({"prompt": CHILD, "subagent_type": "general", "one_shot": false, "timeout_secs": 600}),
+            ..SpawnRec::default()
+        }));
+        journal.append(JournalRecord::Term(maki_storage::runs::TermRec {
+            handle: "ag-done01".into(),
+            reason: "completed".into(),
+            ..Default::default()
+        }));
+        journal.flush();
+        drop(journal);
+        transcript::append(
+            &maki_storage::runs::transcript_path(&dir, "ag-done01"),
+            &[
+                text_message(Role::User, CHILD),
+                text_message(Role::Assistant, "ok"),
+            ],
+        )
+        .unwrap();
+        rig.hub.attach_journal(Arc::new(
+            RunJournal::open_in(dir, JournalOptions::default()).unwrap(),
+        ));
+        assert!(rig.hub.reconcile().lost.is_empty());
+        let tombs = rig.hub.tombstones(rig.hub.main());
+        assert_eq!(tombs.len(), 1);
+        assert_eq!(tombs[0].reason, "completed");
+        let id = tombs[0].id;
+        revive(&rig, id, "hello again").unwrap();
+        assert_eq!(settle(&rig, id).result.unwrap().summary, "again");
+    }
+}

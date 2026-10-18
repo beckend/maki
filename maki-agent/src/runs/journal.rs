@@ -271,6 +271,7 @@ impl UnitHub {
                 self.jot(JournalRecord::Term(term));
             }
             report.requeued_notices = self.requeue_notices(&replay);
+            self.adopt_tombstones(&replay);
         }
         if let Some((info, wake, text)) = notice {
             self.push_notice(self.main, info, text, wake);
@@ -442,10 +443,62 @@ impl UnitHub {
 
 /// The table entry for a run the journal shows as unfinished.
 fn restore_lost(run: &RunState, detail: &str) -> Option<Unit> {
+    restore_unit(
+        run,
+        UnitState::Done(Box::new(Terminal {
+            reason: DoneReason::Lost,
+            exit_code: None,
+            detail: Some(detail.to_owned()),
+            result: UnitResult::default(),
+        })),
+    )
+}
+
+/// The spec a run was started with, as `spawn_record` wrote it.
+pub(super) fn agent_spec_from_json(spec: &Value) -> AgentSpec {
+    let text = |key: &str| spec.get(key).and_then(Value::as_str).map(str::to_owned);
+    let flag = |key: &str| spec.get(key).and_then(Value::as_bool).unwrap_or(false);
+    AgentSpec {
+        prompt: text("prompt").unwrap_or_default(),
+        subagent_type: text("subagent_type").unwrap_or_else(|| "general".to_owned()),
+        model_tier: text("model_tier"),
+        thinking: text("thinking"),
+        output_schema: spec.get("output_schema").filter(|v| !v.is_null()).cloned(),
+        fork: flag("fork"),
+        one_shot: flag("one_shot"),
+        timeout_secs: spec
+            .get("timeout_secs")
+            .and_then(Value::as_u64)
+            .unwrap_or(DEFAULT_AGENT_TIMEOUT_SECS),
+    }
+}
+
+/// A finished run of an earlier process as the journal recorded it.
+pub(super) fn restore_finished(run: &RunState) -> Option<Unit> {
+    let term = run.term.as_ref()?;
+    let mut unit = restore_unit(
+        run,
+        UnitState::Done(Box::new(Terminal {
+            reason: DoneReason::parse(&term.reason).unwrap_or(DoneReason::Completed),
+            exit_code: term.exit_code,
+            detail: term.detail.clone(),
+            result: UnitResult {
+                cost: term.cost,
+                turns: term.turns,
+                elapsed_ms: term.elapsed_ms,
+                ..UnitResult::default()
+            },
+        })),
+    )?;
+    unit.cost = term.cost;
+    unit.finished_at = Some(time_of(run.term_ts));
+    Some(unit)
+}
+
+fn restore_unit(run: &RunState, state: UnitState) -> Option<Unit> {
     let spawn = &run.spawn;
     let spec = &spawn.spec;
     let text = |key: &str| spec.get(key).and_then(Value::as_str).map(str::to_owned);
-    let flag = |key: &str| spec.get(key).and_then(Value::as_bool).unwrap_or(false);
     let secs = spec
         .get("timeout_secs")
         .and_then(Value::as_u64)
@@ -458,16 +511,7 @@ fn restore_lost(run: &RunState, detail: &str) -> Option<Unit> {
             watch: text("watch"),
         })
     } else {
-        UnitKind::Agent(AgentSpec {
-            prompt: text("prompt").unwrap_or_default(),
-            subagent_type: text("subagent_type").unwrap_or_else(|| "general".to_owned()),
-            model_tier: text("model_tier"),
-            thinking: text("thinking"),
-            output_schema: spec.get("output_schema").filter(|v| !v.is_null()).cloned(),
-            fork: flag("fork"),
-            one_shot: flag("one_shot"),
-            timeout_secs: secs,
-        })
+        UnitKind::Agent(agent_spec_from_json(spec))
     };
     let id = UnitId(spawn.id.parse::<MakiId>().ok()?);
     let owner = spawn.owner.parse::<MakiId>().map_or_else(|_| id, UnitId);
@@ -491,12 +535,7 @@ fn restore_lost(run: &RunState, detail: &str) -> Option<Unit> {
         kind,
         description: spawn.desc.clone(),
         origin_tool_use_id: spawn.origin_tool_use_id.as_deref().map(Arc::from),
-        state: UnitState::Done(Box::new(Terminal {
-            reason: DoneReason::Lost,
-            exit_code: None,
-            detail: Some(detail.to_owned()),
-            result: UnitResult::default(),
-        })),
+        state,
         created_at: time_of(run.spawn_ts),
         started_at: Some(time_of(run.spawn_ts)),
         finished_at: Some(SystemTime::now()),

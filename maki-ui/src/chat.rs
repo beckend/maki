@@ -65,6 +65,8 @@ pub struct Chat {
     pub(crate) plugin: Option<Arc<str>>,
     /// A plugin task between prompts: its run ended, its session did not.
     pub(crate) idle: bool,
+    /// What a native run is, for the session record (`StoredSubagent::run`).
+    pub(crate) run: Option<maki_storage::sessions::StoredRun>,
     pub cost: Option<f64>,
     /// This chat's slice of the session's list-price reference cost; mirrors
     /// `cost`, but only ever set for subsidised models.
@@ -103,6 +105,7 @@ impl Chat {
             name,
             plugin: None,
             idle: false,
+            run: None,
             cost: None,
             list_cost: None,
             context_size: 0,

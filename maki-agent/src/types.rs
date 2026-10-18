@@ -770,6 +770,10 @@ pub enum AgentEvent {
         handle: String,
         name: String,
         kind: String,
+        /// Handle of the run that started it, `None` for `main`.
+        parent: Option<String>,
+        depth: u8,
+        one_shot: bool,
     },
     /// An agent run moved to `idle` or back to `running`.
     RunStateChanged {
