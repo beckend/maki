@@ -313,6 +313,10 @@ impl App {
         if r.width > 0 {
             overlay_rect = r;
         }
+        let r = self.log_viewer.view(frame, full);
+        if r.width > 0 {
+            overlay_rect = r;
+        }
         if self.usage_modal.is_open() {
             let ctx = UsageModalContext {
                 total: &self.state.token_usage,

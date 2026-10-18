@@ -38,6 +38,7 @@ use crate::components::file_picker::{FilePickerModal, FilePickerModalAction};
 use crate::components::help_modal::HelpModal;
 use crate::components::input::{InputAction, InputBox, Submission};
 use crate::components::keybindings::key;
+use crate::components::log_viewer::LogViewer;
 use crate::components::login_picker::{LoginPicker, LoginPickerAction};
 use crate::components::lua_float::FloatManager;
 use crate::components::mcp_picker::{McpPicker, McpPickerAction};
@@ -94,7 +95,6 @@ use session_state::SessionState;
 
 const CANCEL_MSG: &str = "Cancelled.";
 const MAIN_CHAT: usize = 0;
-const NO_SHELL_TAB: &str = "Shell runs have no tab";
 const NO_RUN_TAB: &str = "That run has no tab in this session";
 const STOP_USAGE: &str = "Usage: /stop <name|handle|all>";
 const NO_LIVE_RUNS: &str = "No run is live";
@@ -377,6 +377,7 @@ pub struct App {
     pub(super) login_picker: LoginPicker,
     pub(super) mcp_picker: McpPicker,
     pub(super) runs_picker: RunsPicker,
+    pub(super) log_viewer: LogViewer,
     pub(super) runs: runs::RunsView,
     pub(super) rewind_picker: RewindPicker,
     pub(super) alert_modal: AlertModal,
@@ -505,6 +506,7 @@ impl App {
             login_picker: LoginPicker::new(),
             mcp_picker: McpPicker::new(mcp_reader, mcp_config_errors),
             runs_picker: RunsPicker::new(),
+            log_viewer: LogViewer::new(),
             runs: runs::RunsView::default(),
             rewind_picker: RewindPicker::new(),
             alert_modal: AlertModal::new(),
@@ -618,6 +620,16 @@ impl App {
             let waiting = self.permission_prompt.waiting_runs();
             self.runs_picker.refresh(self.runs.rows(&waiting));
         }
+    }
+
+    /// Where a shell run's log lives: the hub keeps it under the session's
+    /// runs directory as `<handle>.log`. `None` when the file is not there
+    /// (the hub keeps the output in memory when it cannot write logs).
+    fn shell_log_path(&self, handle: &str) -> Option<std::path::PathBuf> {
+        let state = maki_storage::paths::state_dir().ok()?;
+        let dir = maki_storage::paths::session_runs_dir(&state, &self.state.session.id.to_string());
+        let path = dir.join(format!("{handle}.log"));
+        path.is_file().then_some(path)
     }
 
     /// `/stop <name|handle|all>`.
@@ -995,6 +1007,10 @@ impl App {
             self.help_modal.scroll(delta);
             return None;
         }
+        if self.log_viewer.is_open() {
+            self.log_viewer.scroll(delta);
+            return None;
+        }
         if self.usage_modal.is_open() {
             self.usage_modal.scroll(delta);
             return None;
@@ -1096,6 +1112,11 @@ impl App {
 
         if self.help_modal.is_open() {
             self.help_modal.handle_key(key);
+            return Some(vec![]);
+        }
+
+        if self.log_viewer.is_open() {
+            self.log_viewer.handle_key(key);
             return Some(vec![]);
         }
 
@@ -1245,12 +1266,11 @@ impl App {
             return Some(match self.runs_picker.handle_key(key) {
                 RunsPickerAction::Consumed | RunsPickerAction::Close => vec![],
                 RunsPickerAction::Focus { handle, kind } => {
-                    if self.focus_task(&handle).is_err() {
-                        self.flash(if kind == "shell" {
-                            NO_SHELL_TAB.into()
-                        } else {
-                            NO_RUN_TAB.into()
-                        });
+                    if kind == "shell" {
+                        let path = self.shell_log_path(&handle);
+                        self.log_viewer.open(&handle, path);
+                    } else if self.focus_task(&handle).is_err() {
+                        self.flash(NO_RUN_TAB.into());
                     }
                     vec![]
                 }
@@ -2406,7 +2426,7 @@ impl App {
         vec![]
     }
 
-    fn overlays(&self) -> [&dyn Overlay; 15] {
+    fn overlays(&self) -> [&dyn Overlay; 16] {
         [
             &self.alert_modal,
             &self.help_modal,
@@ -2421,12 +2441,13 @@ impl App {
             &self.login_picker,
             &self.mcp_picker,
             &self.runs_picker,
+            &self.log_viewer,
             &self.pack_review,
             &self.permission_prompt,
         ]
     }
 
-    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 15] {
+    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 16] {
         [
             &mut self.alert_modal,
             &mut self.help_modal,
@@ -2441,6 +2462,7 @@ impl App {
             &mut self.login_picker,
             &mut self.mcp_picker,
             &mut self.runs_picker,
+            &mut self.log_viewer,
             &mut self.pack_review,
             &mut self.permission_prompt,
         ]
@@ -2516,6 +2538,7 @@ impl App {
             | self.mcp_picker.refresh()
             | self.model_picker.refresh()
             | self.usage_modal.poll(&self.usage_slot)
+            | self.log_viewer.poll()
             | self.hints.poll(self.hint_reader.load_full())
             | self.tick_plan()
             | self.tick_file_picker()

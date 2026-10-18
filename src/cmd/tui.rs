@@ -424,6 +424,8 @@ pub fn run(mut cli: Cli) -> Result<()> {
             image_paths: cli.images,
             format: cli.output_format,
             verbose: cli.verbose,
+            join_timeout: cli.join_timeout,
+            quiet_runs: cli.quiet_runs,
             config: stack.config.agent,
             permissions_config: stack.config.permissions,
             timeouts,

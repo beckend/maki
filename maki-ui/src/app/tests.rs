@@ -8817,13 +8817,15 @@ fn runs_command_lists_tree_and_enter_focuses_the_tab() {
 }
 
 #[test]
-fn runs_picker_on_a_shell_row_has_no_tab_to_focus() {
+fn runs_picker_on_a_shell_row_opens_the_log_viewer() {
     let mut app = streaming_app();
     start_shell(&mut app, "sh-cccccc");
     type_and_submit(&mut app, "/runs");
     app.update(Msg::Key(key(KeyCode::Enter)));
     assert_eq!(app.active_chat, 0);
-    assert_eq!(app.status_bar.flash_text(), Some(NO_SHELL_TAB));
+    assert!(app.log_viewer.is_open());
+    app.update(Msg::Key(key(KeyCode::Esc)));
+    assert!(!app.log_viewer.is_open());
 }
 
 #[test]

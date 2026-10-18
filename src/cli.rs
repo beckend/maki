@@ -49,6 +49,15 @@ pub struct Cli {
     #[arg(long)]
     pub verbose: bool,
 
+    /// Seconds --print waits for background runs before stopping them
+    /// (default 600, or MAKI_JOIN_TIMEOUT_SECS)
+    #[arg(long, value_name = "SECS")]
+    pub join_timeout: Option<u64>,
+
+    /// Do not print run transition lines on stderr in --print mode
+    #[arg(long)]
+    pub quiet_runs: bool,
+
     /// Resume the most recent session in this directory
     #[arg(short = 'c', long = "continue")]
     pub continue_session: bool,
