@@ -287,7 +287,7 @@ mod headless {
     }
 
     /// Polls a future once, so a test can look at a state before it settles.
-    async fn poll_once<F: Future>(mut fut: Pin<&mut F>) -> Option<F::Output> {
+    async fn poll_once<F: Future + ?Sized>(mut fut: Pin<&mut F>) -> Option<F::Output> {
         let ready = std::future::poll_fn(|cx| Poll::Ready(fut.as_mut().poll(cx))).await;
         match ready {
             Poll::Ready(value) => Some(value),

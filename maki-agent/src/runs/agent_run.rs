@@ -1562,4 +1562,25 @@ mod admit {
         settle(&rig, parent.id).await;
         assert_eq!(rig.hub.slots_in_use(), 0);
     }
+
+    /// The script has no route for the first run's prompt, so its driver
+    /// panics. The run must fail and hand its slot to the queued one.
+    #[tokio::test]
+    async fn driver_panic_frees_the_slot() {
+        let script = Script::new(vec![("BBB", vec![Step::Reply(reply("b"))])]);
+        let rig = rig_with(&script, one_slot());
+        let a = spawn(&rig, "AAA", json!({})).await;
+        let b = spawn(&rig, "BBB", json!({"one_shot": true})).await;
+        let view = settle(&rig, a.id).await;
+        assert!(
+            matches!(&view.state, UnitState::Done(t) if t.reason == DoneReason::Failed),
+            "{:?}",
+            view.state
+        );
+        // The shared script is poisoned now, so `b` fails too; it did get a
+        // slot, which is the point.
+        let view = settle(&rig, b.id).await;
+        assert!(view.queue.is_none(), "{:?}", view.state);
+        assert_eq!(rig.hub.slots_in_use(), 0);
+    }
 }
