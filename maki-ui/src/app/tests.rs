@@ -8216,3 +8216,30 @@ mod run_prompts {
         assert!(!app.permission_prompt.is_open());
     }
 }
+
+mod run_prompts_after_main_turn {
+    use super::*;
+
+    #[test]
+    fn a_runs_answer_route_survives_the_main_turn_ending() {
+        let (tx, rx) = flume::unbounded();
+        let mut app = streaming_app();
+        app.update(Msg::Agent(Box::new(Envelope {
+            event: AgentEvent::PermissionRequest {
+                id: "t1".into(),
+                tool: ToolKey::native("bash"),
+                scopes: vec!["echo routed".into()],
+                reason: None,
+            },
+            subagent: Some(subagent_info_with_tx("ag-aaaaaa", "auditor", Some(tx))),
+            run_id: maki_agent::BACKGROUND_RUN_ID,
+        })));
+        app.update(agent_msg(done()));
+        app.update(Msg::Key(key(KeyCode::Char('y'))));
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            allow_once("t1"),
+            "answer must reach the run"
+        );
+    }
+}

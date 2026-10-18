@@ -1899,7 +1899,7 @@ impl App {
                     self.status_bar.clear_flash();
                     self.terminalize_turn(MISSING_TOOL_COMPLETION);
                     self.chat_index.clear();
-                    self.subagent_answers.clear();
+                    self.subagent_answers.retain(|id, _| is_run_handle(id));
                     self.status = Status::Idle;
                     if self.exit_on_done {
                         self.exit_request = ExitRequest::Success;
@@ -1912,7 +1912,7 @@ impl App {
                         DisplayRole::Error,
                         cap_error_text(&message),
                     ));
-                    self.subagent_answers.clear();
+                    self.subagent_answers.retain(|id, _| is_run_handle(id));
                     self.terminalize_turn(&message);
                     self.recoverable_queue = self.queue.text_messages();
                     self.queue.clear();
