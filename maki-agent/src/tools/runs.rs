@@ -68,7 +68,7 @@ const SEND_DESCRIPTION: &str =
     "Send a message to another run in this session: your child, your parent (name \"parent\"),
 or \"main\". (Siblings only if the session enables it.) The message is queued and returns a
 message id at once. A running recipient reads it at its next step; an idle one starts a turn
-with it. Sending does not end your turn and is not an answer: the recipient's reply, if any,
+with it; a finished or evicted agent with a saved transcript is revived first. Sending does not end your turn and is not an answer: the recipient's reply, if any,
 comes as a message to you. Use mode \"quiet\" for FYI notes that must not start a turn. Your
 final result reaches your parent on its own: use send to a parent only for a question or
 mid-run progress.";
@@ -357,7 +357,7 @@ impl ToolInvocation for RunInvocation {
                 (Call::Stop(args), Some(runs)) => {
                     stop(runs, args, &ctx.cancel, ctx.tool_use_id.as_deref()).await
                 }
-                (Call::Send(args), Some(runs)) => send(runs, args),
+                (Call::Send(args), Some(runs)) => send(runs, ctx, args).await,
             };
             ToolExecResult::from(result.map(|text| ToolOutput::Plain(text.into())))
         })
@@ -417,7 +417,7 @@ async fn spawn(runs: &RunsCtx, ctx: &ToolContext, req: SpawnRequest) -> Result<S
     ))
 }
 
-fn send(runs: &RunsCtx, args: SendArgs) -> Result<String, String> {
+async fn send(runs: &RunsCtx, ctx: &ToolContext, args: SendArgs) -> Result<String, String> {
     let kind = match args.mode.as_deref() {
         None => DeliveryKind::Steer,
         Some(mode) => DeliveryKind::parse(mode)
@@ -427,10 +427,29 @@ fn send(runs: &RunsCtx, args: SendArgs) -> Result<String, String> {
         .hub
         .resolve(runs.self_run, &args.to)
         .map_err(|e| format!("{e}: {}", args.to))?;
-    let ack = runs
+    let plan = runs
         .hub
-        .send(runs.self_run, to, args.message, kind)
+        .revive_plan(runs.self_run, to)
         .map_err(|e| e.to_string())?;
+    let ack = match plan {
+        None => runs
+            .hub
+            .send(runs.self_run, to, args.message, kind)
+            .map_err(|e| e.to_string())?,
+        Some(plan) => {
+            if ctx.mode.plan_path().is_some() && plan.spec.subagent_type != "research" {
+                return Err(PLAN_BLOCK.to_owned());
+            }
+            let (hub, handle) = (Arc::clone(&runs.hub), plan.handle.to_string());
+            let transcript = smol::unblock(move || hub.load_transcript(&handle))
+                .await
+                .ok_or_else(|| UnitError::RecipientTerminal.to_string())?;
+            let launch = AgentLaunch::prepare(ctx, &plan.spec).await?;
+            runs.hub
+                .revive(runs.self_run, plan, launch, transcript, args.message, kind)
+                .map_err(|e| e.to_string())?
+        }
+    };
     let target = if to == runs.hub.main() {
         "main".to_owned()
     } else {
@@ -588,6 +607,15 @@ fn list_or_show(
             .resolve(runs.self_run, &key)
             .map_err(|e| format!("{e}: {key}"))?;
         // A run may always read its own record.
+        if runs.hub.get(id).is_none()
+            && let Some(t) = runs
+                .hub
+                .tombstones(runs.self_run)
+                .into_iter()
+                .find(|t| t.id == id)
+        {
+            return Ok(tombstone_line(&t));
+        }
         if id != runs.self_run && !runs.hub.can_reach(runs.self_run, id) {
             // Out of reach for its record, but a sender may follow its own
             // messages to a parent or sibling.
@@ -601,10 +629,9 @@ fn list_or_show(
             }
             return Err(format!("{}: {key}", UnitError::NotReachable));
         }
-        let view = runs
-            .hub
-            .get(id)
-            .ok_or_else(|| format!("UNKNOWN_RUN: {key}"))?;
+        let Some(view) = runs.hub.get(id) else {
+            return Err(format!("UNKNOWN_RUN: {key}"));
+        };
         let mut out = record(&view);
         for ack in runs.hub.acks_to(runs.self_run, id) {
             let _ = write!(out, "\nmessage {}: {}", ack.id, ack.state);
@@ -648,14 +675,19 @@ fn list_or_show(
             seqs: notices.iter().map(|n| n.seq).collect(),
         },
     );
-    if views.is_empty() && notices.is_empty() {
+    let tombs = if include_finished {
+        runs.hub.tombstones(runs.self_run)
+    } else {
+        Vec::new()
+    };
+    if views.is_empty() && notices.is_empty() && tombs.is_empty() {
         return Ok(NO_RUNS.to_owned());
     }
     let mut out = String::new();
     for notice in &notices {
         let _ = writeln!(out, "{}\n", notice.text);
     }
-    if views.is_empty() {
+    if views.is_empty() && tombs.is_empty() {
         out.truncate(out.trim_end().len());
         return Ok(out);
     }
@@ -681,10 +713,28 @@ fn list_or_show(
             v.cost,
         );
     }
+    for t in &tombs {
+        let _ = writeln!(out, "{}", tombstone_line(t));
+    }
     let (used, max) = runs.hub.session_usage();
     let _ = write!(out, "\nsession: {used} of {max} runs started");
     out.truncate(out.trim_end().len());
     Ok(out)
+}
+
+fn tombstone_line(t: &crate::runs::TombstoneView) -> String {
+    let tail = if t.revivable {
+        "left memory; `send` to it brings it back"
+    } else {
+        "left memory"
+    };
+    format!(
+        "{} {}  {}  {}  ({tail})",
+        t.handle,
+        t.name,
+        t.kind.as_str(),
+        t.reason
+    )
 }
 
 fn render_output(slice: &OutputSlice) -> String {

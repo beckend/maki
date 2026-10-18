@@ -180,7 +180,7 @@ impl App {
                     fast: chat.opts.is_some_and(|o| o.fast),
                     plugin: chat.plugin.clone(),
                     cost: chat.cost,
-                    run: None,
+                    run: chat.run.clone(),
                 })
             })
             .collect();

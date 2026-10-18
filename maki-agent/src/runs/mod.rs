@@ -16,10 +16,12 @@ pub mod limits;
 pub mod notice;
 #[cfg(test)]
 mod notice_tests;
+mod revive;
 pub mod shell;
 #[cfg(unix)]
 mod signals;
 mod topology;
+mod transcript;
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
@@ -55,6 +57,7 @@ pub use inbox::{DeliveryKind, Inbox, InboxItem, MessageId, SendAck};
 pub use journal::ReconcileReport;
 pub use limits::UnitLimits;
 pub use notice::{Notice, NoticeInfo, NoticeKind};
+pub use revive::{RevivePlan, TombstoneView};
 use shell::ShellRun;
 pub use shell::{OutputSlice, ShellOptions};
 
@@ -256,6 +259,21 @@ impl DoneReason {
             Self::Refused => "refused",
             Self::Lost => "lost",
         }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        [
+            Self::Completed,
+            Self::Failed,
+            Self::Killed,
+            Self::TimedOut,
+            Self::MaxTurns,
+            Self::MaxTokens,
+            Self::Refused,
+            Self::Lost,
+        ]
+        .into_iter()
+        .find(|r| r.as_str() == s)
     }
 }
 
@@ -571,6 +589,8 @@ struct UnitTable {
     units: HashMap<UnitId, Unit>,
     shells: HashMap<UnitId, Arc<ShellRun>>,
     agents: HashMap<UnitId, Arc<AgentRun>>,
+    /// Finished runs that left memory (design 7.4), kept to revive by handle or name.
+    tombstones: HashMap<UnitId, Unit>,
     /// The last turn's result of each `Idle` agent.
     idle_results: HashMap<UnitId, UnitResult>,
     /// Committed history a `context=fork` spawn starts from, by the id of the
@@ -995,7 +1015,8 @@ impl UnitHub {
         }
         let live = table.live_children(caller);
         if live >= usize::from(self.limits.max_children_per_run)
-            || table.units.len() >= usize::from(self.limits.session_max_runs)
+            || table.units.len() + table.tombstones.len()
+                >= usize::from(self.limits.session_max_runs)
         {
             return Err(UnitError::SpawnLimit);
         }
@@ -1053,6 +1074,8 @@ impl UnitHub {
             UnitKind::Shell(spec) => Some(spec.clone()),
             UnitKind::Agent(_) => None,
         };
+        let parent_handle = table.units.get(&caller).map(|u| u.handle.to_string());
+        let one_shot = matches!(&kind, UnitKind::Agent(s) if s.one_shot);
         let running = !would_queue;
         let state = if running {
             UnitState::Running
@@ -1134,6 +1157,9 @@ impl UnitHub {
                 handle: handle.to_string(),
                 name: name.to_string(),
                 kind: kind.as_str().to_owned(),
+                parent: parent_handle,
+                depth: caller_depth + 1,
+                one_shot,
             },
         );
         table.outbox.push(started_event);
@@ -1158,6 +1184,7 @@ impl UnitHub {
                 Arc::clone(&self.clock),
             );
         }
+        self.sweep();
         Ok(SpawnAck {
             id,
             handle,
@@ -1193,6 +1220,7 @@ impl UnitHub {
         self.release(table);
         self.flush_notices();
         self.settled.notify(usize::MAX);
+        self.sweep();
     }
 
     fn settle_locked(
@@ -1962,6 +1990,7 @@ impl UnitHub {
     }
 
     pub fn list(&self, caller: UnitId, scope: Scope) -> Vec<UnitView> {
+        self.sweep();
         let table = self.table();
         let ids: Vec<UnitId> = match scope {
             Scope::Children => table.children.get(&caller).cloned().unwrap_or_default(),

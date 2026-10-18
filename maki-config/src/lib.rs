@@ -102,6 +102,9 @@ pub const MIN_RUNS_MAX_DEPTH: u32 = 1;
 pub const MIN_RUNS_LIMIT: u32 = 1;
 pub const MIN_RUNS_TIMEOUT_SECS: u64 = 1;
 pub const DEFAULT_RUNS_PERMISSION_TIMEOUT_SECS: u64 = 120;
+pub const DEFAULT_RUNS_MAX_RETAINED: u32 = 64;
+pub const DEFAULT_RUNS_MAX_IDLE: u32 = 16;
+pub const DEFAULT_RUNS_IDLE_TIMEOUT_SECS: u64 = 1800;
 
 pub const MIN_RETRY_BASE_MS: u64 = 1;
 pub const MIN_RETRY_MAX_MS: u64 = 1;
@@ -866,6 +869,9 @@ pub struct RunsFileConfig {
     pub max_timeout_secs: Option<u64>,
     pub permission_timeout_secs: Option<u64>,
     pub unattended_permissions: Option<UnattendedMode>,
+    pub max_retained: Option<u32>,
+    pub max_idle: Option<u32>,
+    pub idle_timeout_secs: Option<u64>,
 }
 
 /// What a background run's permission prompt gets when nobody can answer it
@@ -898,7 +904,10 @@ impl RunsFileConfig {
             default_timeout_secs,
             max_timeout_secs,
             permission_timeout_secs,
-            unattended_permissions
+            unattended_permissions,
+            max_retained,
+            max_idle,
+            idle_timeout_secs
         );
     }
 }
@@ -1669,6 +1678,15 @@ pub struct RunsConfig {
         desc = "A run's permission prompt when nobody can answer (`maki -p`): `deny`, or `inherit_yolo` to allow it under `--yolo`"
     )]
     pub unattended_permissions: UnattendedMode,
+
+    #[config(default = DEFAULT_RUNS_MAX_RETAINED, min = MIN_RUNS_LIMIT, desc = "Finished runs kept in memory; older ones leave a tombstone and can still be revived by `send` while their transcript exists")]
+    pub max_retained: u32,
+
+    #[config(default = DEFAULT_RUNS_MAX_IDLE, min = MIN_RUNS_LIMIT, desc = "Idle agents kept in memory; the least recently active leaves silently and is revived by `send`")]
+    pub max_idle: u32,
+
+    #[config(default = DEFAULT_RUNS_IDLE_TIMEOUT_SECS, min = MIN_RUNS_TIMEOUT_SECS, desc = "How long an agent may stay idle in memory (seconds) before it leaves silently; `send` revives it")]
+    pub idle_timeout_secs: u64,
 }
 
 impl RunsConfig {
@@ -1700,6 +1718,11 @@ impl RunsConfig {
                 .permission_timeout_secs
                 .unwrap_or(DEFAULT_RUNS_PERMISSION_TIMEOUT_SECS),
             unattended_permissions: file.unattended_permissions.unwrap_or_default(),
+            max_retained: file.max_retained.unwrap_or(DEFAULT_RUNS_MAX_RETAINED),
+            max_idle: file.max_idle.unwrap_or(DEFAULT_RUNS_MAX_IDLE),
+            idle_timeout_secs: file
+                .idle_timeout_secs
+                .unwrap_or(DEFAULT_RUNS_IDLE_TIMEOUT_SECS),
         }
     }
 }
@@ -3118,6 +3141,9 @@ mod tests {
     #[test_case("default_timeout_secs" ; "default_timeout_secs")]
     #[test_case("max_timeout_secs" ; "max_timeout_secs")]
     #[test_case("permission_timeout_secs" ; "permission_timeout_secs")]
+    #[test_case("max_retained" ; "max_retained")]
+    #[test_case("max_idle" ; "max_idle")]
+    #[test_case("idle_timeout_secs" ; "idle_timeout_secs")]
     fn zero_rejected(key: &str) {
         let raw: RawConfig = toml::from_str(&format!("[agent.runs]\n{key} = 0\n")).unwrap();
         assert!(raw.into_config(&[]).unwrap().validate().is_err());
