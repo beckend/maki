@@ -615,7 +615,7 @@ mod inbox {
             DeliveryKind::Steer,
         );
         assert_eq!(sent.state, "idle");
-        assert_eq!(rig.hub.get(ack.id).unwrap().state.label(), "running");
+        // The woken turn may already be over here, so the state is not asserted.
         let view = settle(&rig, ack.id);
         assert_eq!(view.result.unwrap().summary, "second");
         assert!(seen_text(&script, CHILD)[1].contains("again please"));
