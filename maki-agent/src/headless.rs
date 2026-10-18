@@ -71,15 +71,26 @@ async fn follow_up(
     let deadline = hub.deadline_after(join_timeout);
     hub.main_turn_ends();
     loop {
-        let step = futures_lite::future::or(
-            async {
-                let _ = wake_rx.recv_async().await;
-                Step::Wake
-            },
-            async { Step::Joined(hub.join_until(deadline).await) },
-        )
-        .await;
+        // Past the bound a wake no longer wins: a model that starts a run in
+        // every turn would otherwise keep the process alive for good.
+        let step = if hub.deadline_passed(deadline) {
+            Step::Joined(hub.join_until(deadline).await)
+        } else {
+            futures_lite::future::or(
+                async {
+                    let _ = wake_rx.recv_async().await;
+                    Step::Wake
+                },
+                async { Step::Joined(hub.join_until(deadline).await) },
+            )
+            .await
+        };
         match step {
+            Step::Wake if !hub.main_has_unread() => {
+                // A closing turn already read what this wake was for.
+                hub.main_turn_ends();
+                continue;
+            }
             Step::Wake => closing = 0,
             Step::Joined(Joined::Quiet) => return last,
             Step::Joined(Joined::Pending) if closing < MAX_CLOSING_TURNS => {
