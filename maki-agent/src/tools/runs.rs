@@ -586,6 +586,16 @@ fn list_or_show(
             .map_err(|e| format!("{e}: {key}"))?;
         // A run may always read its own record.
         if id != runs.self_run && !runs.hub.can_reach(runs.self_run, id) {
+            // Out of reach for its record, but a sender may follow its own
+            // messages to a parent or sibling.
+            let acks = runs.hub.acks_to(runs.self_run, id);
+            if !acks.is_empty() {
+                let mut out = format!("run {key}: record not reachable; your messages to it:");
+                for ack in acks {
+                    let _ = write!(out, "\nmessage {}: {}", ack.id, ack.state);
+                }
+                return Ok(out);
+            }
             return Err(format!("{}: {key}", UnitError::NotReachable));
         }
         let view = runs
@@ -884,6 +894,15 @@ mod tests {
             err.starts_with("NOT_REACHABLE") || err.starts_with("UNKNOWN_RUN"),
             "{err}"
         );
+
+        // What the child sent upward is still followable, without the record.
+        let sent = runs
+            .hub
+            .send(child, runs.hub.main(), "up".into(), DeliveryKind::Quiet)
+            .unwrap();
+        let up = call(Which::Runs, &own, json!({"id": "main"})).unwrap();
+        assert!(up.contains(&format!("message {}: ", sent.id)), "{up}");
+        assert!(up.contains("record not reachable"), "{up}");
     }
 
     #[test]

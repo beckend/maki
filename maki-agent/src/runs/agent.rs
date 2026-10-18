@@ -395,6 +395,7 @@ pub(super) fn start(
         clock,
         started: Instant::now(),
         turns: AtomicU32::new(0),
+        staged: Mutex::default(),
     };
     let task = smol::spawn(driver.drive(spec, launch));
     *lock(&run.task) = Some(task);
@@ -407,6 +408,8 @@ struct Driver {
     clock: Arc<dyn Clock>,
     started: Instant,
     turns: AtomicU32,
+    /// Taken from the inbox to start or restart a turn, not yet in history.
+    staged: Mutex<Vec<InboxItem>>,
 }
 
 /// How one `Agent::run` ended, with what the model said.
@@ -450,13 +453,23 @@ impl Driver {
     }
 
     async fn drive(self, spec: AgentSpec, launch: AgentLaunch) {
-        let deadline = self.clock.now() + Duration::from_secs(spec.timeout_secs);
         let mut history = History::new(
             launch
                 .fork
                 .as_ref()
                 .map_or_else(Vec::new, |snapshot| snapshot.as_ref().clone()),
         );
+        self.drive_loop(spec, launch, &mut history).await;
+        // Taken into a transcript that no request will ever carry now.
+        let mut left: Vec<InboxItem> = std::mem::take(&mut *lock(&self.staged));
+        left.extend(history.take_landed().into_iter().map(|(item, _)| item));
+        if let Some(hub) = self.hub() {
+            hub.messages_dropped(&left, "recipient_stopped");
+        }
+    }
+
+    async fn drive_loop(&self, spec: AgentSpec, launch: AgentLaunch, history: &mut History) {
+        let deadline = self.clock.now() + Duration::from_secs(spec.timeout_secs);
         let mut gauge = ContextGauge::default();
         let (tx, rx) = flume::unbounded::<Envelope>();
         let events = EventSender::new(tx, 0);
@@ -476,13 +489,7 @@ impl Driver {
             let (verdict, mut result) = loop {
                 let end = self
                     .turn(
-                        &launch,
-                        &mut history,
-                        &mut gauge,
-                        &events,
-                        &rx,
-                        message,
-                        deadline,
+                        &launch, history, &mut gauge, &events, &rx, message, deadline,
                     )
                     .await;
                 let (judged, result) = self.judge(&launch, end);
@@ -507,7 +514,7 @@ impl Driver {
 
             // Before the state change, so whoever sees the state also finds the
             // transcript.
-            self.send_history(&history);
+            self.send_history(history);
             let ledger = launch.params.ledger.totals();
             result.turns = self.turns.load(Ordering::Relaxed);
             result.elapsed_ms = elapsed_ms(self.started);
@@ -578,12 +585,11 @@ impl Driver {
         }
     }
 
-    /// Items that become the next turn's user message. The turn sends it at
-    /// once, so they count as delivered here; the step is unknown.
+    /// Items that become the next turn's user message. They are delivered
+    /// once that turn's first request returned (the step is unknown), so they
+    /// wait in `staged` and move into the history's landed list.
     fn delivered(&self, items: &[InboxItem]) {
-        if let Some(hub) = self.hub() {
-            hub.message_delivered(items, None);
-        }
+        lock(&self.staged).extend(items.iter().cloned());
     }
 
     async fn idle_until_woken(&self) -> Option<String> {
@@ -657,6 +663,7 @@ impl Driver {
         deadline: Instant,
     ) -> TurnEnd {
         history.close_dangling_tool_calls(UNAVAILABLE_RESULT);
+        history.note_landed(&std::mem::take(&mut *lock(&self.staged)), None);
         let before = history.len();
         let token = self.run.begin_turn();
         let input = AgentInput {

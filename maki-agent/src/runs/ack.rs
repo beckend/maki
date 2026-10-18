@@ -62,7 +62,9 @@ impl Acks {
     pub(super) fn insert(&mut self, from: UnitId, record: AckRecord) {
         let list = self.by_sender.entry(from).or_default();
         if list.len() >= MAX_ACKS_PER_SENDER {
-            list.pop_front();
+            // A message still in flight is worth more than a finished one.
+            let at = list.iter().position(|r| !r.state.pending()).unwrap_or(0);
+            list.remove(at);
         }
         list.push_back(record);
     }
@@ -90,6 +92,18 @@ impl Acks {
         Some(record.to)
     }
 
+    /// A guard release put a held message into the inbox.
+    pub(super) fn released(&mut self, from: UnitId, id: MessageId) {
+        if let Some(r) = self
+            .by_sender
+            .get_mut(&from)
+            .and_then(|l| l.iter_mut().find(|r| r.id == id))
+            && r.state == AckState::Held
+        {
+            r.state = AckState::Accepted;
+        }
+    }
+
     pub(super) fn is_pending(&self, from: UnitId, id: MessageId) -> bool {
         self.by_sender
             .get(&from)
@@ -113,5 +127,27 @@ impl Acks {
             })
             .map(|(_, r)| *r)
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn eviction_spares_pending_records() {
+        let (from, to) = (UnitId::new(), UnitId::new());
+        let mut acks = Acks::default();
+        let record = |n: u64, state| AckRecord {
+            id: MessageId(n),
+            to,
+            state,
+        };
+        acks.insert(from, record(1, AckState::Accepted));
+        for n in 2..(MAX_ACKS_PER_SENDER as u64 + 10) {
+            acks.insert(from, record(n, AckState::Delivered { step: None }));
+        }
+        assert!(acks.is_pending(from, MessageId(1)));
+        assert_eq!(acks.by_sender[&from].len(), MAX_ACKS_PER_SENDER);
     }
 }
