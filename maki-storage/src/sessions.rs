@@ -676,6 +676,28 @@ pub struct StoredSubagent {
     pub plugin: Option<Arc<str>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost: Option<f64>,
+    /// Set for a native run (`spawn`); absent on sessions written before that
+    /// and ignored by older binaries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<StoredRun>,
+}
+
+/// What a native run is, so a resumed session can list it and a later phase
+/// can revive it from its transcript, which is keyed by `handle`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StoredRun {
+    pub handle: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    /// `agent` or `shell`.
+    pub kind: String,
+    /// Last state seen: `running`, `idle`, `completed`, `lost`, ...
+    pub state: String,
+    #[serde(default)]
+    pub depth: u8,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub one_shot: bool,
 }
 
 #[derive(Deserialize)]
@@ -2299,7 +2321,9 @@ where
 
     pub fn delete(claim: &SessionClaim, dir: &StateDir) -> Result<(), SessionError> {
         let sessions_dir = dir.ensure_subdir(SESSIONS_DIR)?;
-        Self::delete_from(claim, &sessions_dir)
+        let deleted = Self::delete_from(claim, &sessions_dir);
+        crate::paths::remove_session_runs(dir.path(), &claim.id().to_string());
+        deleted
     }
 
     pub fn delete_from(claim: &SessionClaim, dir: &Path) -> Result<(), SessionError> {
@@ -2448,6 +2472,7 @@ mod tests {
                 fast: false,
                 plugin: plugin.map(Arc::from),
                 cost: None,
+                run: None,
             }
         }
 
@@ -3504,6 +3529,54 @@ mod tests {
         let index = load_cwd_index(dir);
         assert!(!index.values().any(|v| *v == s1.id.to_string()));
         assert_eq!(index.get("/other"), Some(&s2.id.to_string()));
+    }
+
+    #[test]
+    fn delete_removes_runs_dir() {
+        let tmp = TempDir::new().unwrap();
+        let state = StateDir::from_path(tmp.path().to_path_buf());
+        let sessions = tmp.path().join(SESSIONS_DIR);
+        let mut s: TestSession = Session::new("m", "/project");
+        fs::create_dir_all(&sessions).unwrap();
+        s.save_to(&claim_for(&sessions, &s), &sessions).unwrap();
+        let runs = crate::paths::session_runs_dir(tmp.path(), &s.id.to_string());
+        fs::create_dir_all(&runs).unwrap();
+        fs::write(runs.join("journal.ndjson"), "{}\n").unwrap();
+        fs::write(runs.join("sh-1.log"), "out").unwrap();
+        TestSession::delete(&claim_id(&sessions, s.id), &state).unwrap();
+        assert!(!runs.exists());
+    }
+
+    #[test]
+    fn stored_run_roundtrip_and_old_session_loads() {
+        let run = super::StoredRun {
+            handle: "ag-k3x9ab".into(),
+            name: "auditor".into(),
+            parent: None,
+            kind: "agent".into(),
+            state: "lost".into(),
+            depth: 1,
+            one_shot: false,
+        };
+        let sub = StoredSubagent {
+            tool_use_id: "ag-k3x9ab".into(),
+            name: "auditor".into(),
+            model: None,
+            thinking: None,
+            fast: false,
+            plugin: None,
+            cost: None,
+            run: Some(run),
+        };
+        let json = serde_json::to_string(&sub).unwrap();
+        assert_eq!(serde_json::from_str::<StoredSubagent>(&json).unwrap(), sub);
+        let old = r#"{"tool_use_id":"t1","name":"sub"}"#;
+        assert_eq!(
+            serde_json::from_str::<StoredSubagent>(old).unwrap().run,
+            None
+        );
+        let plain = StoredSubagent { run: None, ..sub };
+        assert!(!serde_json::to_string(&plain).unwrap().contains("run"));
     }
 
     /// Clones share one lock, so a snapshot still queued keeps its session

@@ -294,14 +294,29 @@ pub fn state_dir() -> Result<PathBuf, std::io::Error> {
 /// Where one session's background shell logs live (`0700`). Creating it also
 /// prunes old logs, so retention needs no separate hook.
 pub fn runs_dir(session: &str) -> Result<PathBuf, std::io::Error> {
-    let root = state_dir()?.join(RUNS_DIR);
-    let dir = root.join(session);
+    let state = state_dir()?;
+    let root = state.join(RUNS_DIR);
+    let dir = session_runs_dir(&state, session);
     create_private_dir(&dir)?;
     prune_run_logs(&root, &dir, RUN_LOG_MAX_AGE, RUN_LOG_SESSION_BUDGET);
     Ok(dir)
 }
 
-fn create_private_dir(dir: &Path) -> Result<(), std::io::Error> {
+/// `<state>/runs/<session>`, whether or not it exists yet.
+pub fn session_runs_dir(state: &Path, session: &str) -> PathBuf {
+    state.join(RUNS_DIR).join(session)
+}
+
+/// Removes a session's journal, message bodies and shell logs.
+pub fn remove_session_runs(state: &Path, session: &str) {
+    if let Err(e) = fs::remove_dir_all(session_runs_dir(state, session))
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(%e, session, "session run files remain after delete");
+    }
+}
+
+pub(crate) fn create_private_dir(dir: &Path) -> Result<(), std::io::Error> {
     let mut builder = fs::DirBuilder::new();
     builder.recursive(true);
     #[cfg(unix)]
@@ -442,7 +457,7 @@ mod tests {
     const STATE_SUBDIR: &str = "state";
 
     #[test]
-    fn prune_drops_stale_logs_and_trims_own_session_to_budget() {
+    fn retention_by_size_and_age() {
         let root = tempfile::tempdir().unwrap();
         let own = root.path().join("own");
         let other = root.path().join("other");
