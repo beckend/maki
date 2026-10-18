@@ -320,6 +320,9 @@ pub fn run(params: PrintParams) -> Result<()> {
             | AgentEvent::Notice { .. }
             | AgentEvent::ObservationLine { .. }
             | AgentEvent::PromptProgress { .. }
+            | AgentEvent::RunStarted { .. }
+            | AgentEvent::RunStateChanged { .. }
+            | AgentEvent::RunFinished { .. }
             | AgentEvent::StreamClosed => {}
             AgentEvent::Steered { .. } => {
                 if let Some(reason) = dropped_prompt(event, parent_tool_use_id) {

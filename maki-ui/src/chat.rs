@@ -284,7 +284,11 @@ impl Chat {
                 self.messages_panel
                     .push(DisplayMessage::new(DisplayRole::Notice, text));
             }
-            AgentEvent::SubagentHistory { .. } | AgentEvent::StreamClosed => {}
+            AgentEvent::SubagentHistory { .. }
+            | AgentEvent::StreamClosed
+            | AgentEvent::RunStarted { .. }
+            | AgentEvent::RunStateChanged { .. }
+            | AgentEvent::RunFinished { .. } => {}
             AgentEvent::LiveToolBuf { id, body } => {
                 self.messages_panel.register_live_buf(id, body);
             }

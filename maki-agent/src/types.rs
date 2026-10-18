@@ -765,6 +765,24 @@ pub enum AgentEvent {
         total: u32,
         cache: u32,
     },
+    /// A native run exists. Stamped with [`SubagentInfo`] for an agent run
+    /// (whose `parent_tool_use_id` is the handle), which is what opens its tab.
+    RunStarted {
+        handle: String,
+        name: String,
+        kind: String,
+    },
+    /// An agent run moved to `idle` or back to `running`.
+    RunStateChanged {
+        handle: String,
+        state: String,
+    },
+    /// The run reached `Done`; `reason` is the `DoneReason` spelling.
+    RunFinished {
+        handle: String,
+        reason: String,
+        detail: Option<String>,
+    },
     /// End of a session's event stream. Emitted only by
     /// [`EventStreamGuard::drop`] and swallowed by [`SessionEvents::next`], so
     /// a consumer sees `None` and never this variant.

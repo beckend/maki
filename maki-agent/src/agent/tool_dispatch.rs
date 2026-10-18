@@ -1094,6 +1094,24 @@ pub(super) async fn process_tool_calls(
         .map(|(id, name, input)| (id.to_owned(), name.to_owned(), input.clone()))
         .collect();
 
+    // A `context=fork` spawn copies the history as it stands now: everything
+    // before this assistant turn, which ends on a complete user or tool result
+    // boundary. The turn in flight is pushed only after the copy.
+    if let Some(runs) = &ctx.runs {
+        let forks: Vec<String> = tool_uses
+            .iter()
+            .filter(|(_, name, input)| {
+                name == crate::tools::runs::SPAWN_TOOL_NAME
+                    && input.get("context").and_then(Value::as_str) == Some("fork")
+            })
+            .map(|(id, ..)| id.clone())
+            .collect();
+        if !forks.is_empty() {
+            runs.hub
+                .publish_fork_snapshot(&forks, history.as_slice().to_vec());
+        }
+    }
+
     history.push(response.message);
 
     let mut immediate_errors: Vec<ToolDoneEvent> = Vec::new();

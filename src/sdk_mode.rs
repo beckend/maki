@@ -1068,6 +1068,9 @@ impl EventPump {
             | AgentEvent::Nudge
             | AgentEvent::Notice { .. }
             | AgentEvent::PromptProgress { .. }
+            | AgentEvent::RunStarted { .. }
+            | AgentEvent::RunStateChanged { .. }
+            | AgentEvent::RunFinished { .. }
             | AgentEvent::StreamClosed => {}
             // A later kept message overwrites this with its own answer, so the
             // reason is the result only when every message was dropped.
