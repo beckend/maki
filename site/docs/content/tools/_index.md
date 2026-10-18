@@ -7,7 +7,7 @@ group = "Reference"
 
 # Tools
 
-Maki ships with 21 built-in tools in this reference (20 on by default, 1 opt-in via plugin options). Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
+Maki ships with 26 built-in tools in this reference (20 on by default, 6 opt-in via plugin options or `agent.runs.enabled`). Tools marked **opt-in** are off until you enable them under `plugins` or `agent.runs` in [Configuration](/docs/configuration/).
 
 ## File Operations
 
@@ -204,6 +204,100 @@ Load a skill that provides instructions and workflows for specific tasks.
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `name` | string | yes | Name of the skill to load |
+
+## Background Runs
+
+### `spawn` <span class="badge badge-optin">opt-in</span> {#spawn}
+
+Start background work and return immediately with its id. kind "agent" starts a
+subagent: a separate agent with its own context that works on a self-contained task and
+reports back. kind "shell" starts a command that keeps running while you continue. You
+are notified when a run finishes; do not poll or sleep. Start independent runs together
+in one message. Use `wait` only when you are blocked on a result, `send` to talk to a
+run, `stop` to end it, `runs` to look. Not available to agents at the maximum depth: you
+get DEPTH_LIMIT and must do the work yourself.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `command` | string | no |  | shell only. Command line run with the user's shell. |
+| `context` | string | no | fresh | agent only. fork seeds the run with your completed turns, excluding the turn in flight. |
+| `cwd` | string | no |  |  |
+| `description` | string | yes |  | 3-8 word label for display and for default naming. |
+| `kind` | string | yes |  |  |
+| `model_tier` | string | no |  | agent only. Clamped to your tier. |
+| `name` | string | no |  | Optional unique name others can address this run by. `main` and `parent` are reserved. |
+| `notify` | string | no |  | On finish: wake starts a turn if you are idle (default), quiet waits for your next turn, never sends nothing (read with runs). |
+| `one_shot` | boolean | no |  | agent only. Complete after the first result instead of staying available. Default false. |
+| `output_schema` | object | no |  | agent only. JSON Schema the final result must satisfy. |
+| `prompt` | string | no |  | agent only. The complete, self-contained task. |
+| `subagent_type` | string | no |  | agent only. research is read-only; general can edit. Default general. |
+| `thinking` | string | no |  |  |
+| `timeout_secs` | integer | no |  | Wall clock limit. Default: 1800 for agents, 3600 for shell. Expiry ends the run as timed_out. |
+| `watch` | string | no |  | shell only. Regex; each matching output line becomes a notice (max 1 per second, then batched). |
+
+### `send` <span class="badge badge-optin">opt-in</span> {#send}
+
+Send a message to another run in this session: your child, your parent (name "parent"),
+or "main". (Siblings only if the session enables it.) The message is queued and returns a
+message id at once. A running recipient reads it at its next step; an idle one starts a turn
+with it. Sending does not end your turn and is not an answer: the recipient's reply, if any,
+comes as a message to you. Use mode "quiet" for FYI notes that must not start a turn. Your
+final result reaches your parent on its own: use send to a parent only for a question or
+mid-run progress.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `message` | string | yes | Up to 16 KiB. Be self-contained. |
+| `mode` | string | no | steer (default): next step of a running recipient, wakes an idle one. followup: after the recipient's current turn ends, as its own turn. quiet: delivered at the recipient's next model request, never wakes. |
+| `to` | string | yes | Run id or name, or "parent" / "main". |
+
+### `runs` <span class="badge badge-optin">opt-in</span> {#runs}
+
+List your runs and everything below you, or inspect one. Without id: a tree of runs with id,
+name, kind, state, age, last activity, cost and a one-line progress, plus unread quiet
+notices. With id: the full record, the result (full=true for untruncated), and for shell runs
+output since your last read (tail=N lines, from_offset=B to page; output is read from the log
+file). Reading a finished run's result marks it received, so its notice is dropped.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `from_offset` | integer | no | shell: byte offset in the log; the reply gives next_offset. |
+| `full` | boolean | no |  |
+| `id` | string | no |  |
+| `include_finished` | boolean | no | List only. Default true, finished runs retained for the session. |
+| `scope` | string | no | No id only. Default children. all includes siblings and ancestors. |
+| `tail` | integer | no | shell: last N lines. Default 40. |
+
+### `wait` <span class="badge badge-optin">opt-in</span> {#wait}
+
+Block until runs have finished their work or a timeout expires. Use only when you cannot
+proceed without the result; otherwise keep working, you will be notified. mode "all" (default)
+returns when every listed run is done or idle (finished its turn), "any" when the first is.
+A timeout is not an error: you get the current states and the runs keep going. Results you
+receive here are not repeated as notices.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `ids` | array | yes |  |
+| `mode` | string | no |  |
+| `timeout_secs` | integer | no | Default 60. |
+
+### `stop` <span class="badge badge-optin">opt-in</span> {#stop}
+
+Stop runs. Agents are cancelled at their next safe point and their children are stopped
+too (detach=true leaves children running). With soft=true an agent only abandons its current
+turn: it stays idle, keeps its transcript and inbox, and can be messaged again. Shells get
+SIGTERM, then SIGKILL after 5 seconds. Returns once the runs have settled or after wait_secs.
+A stopped agent keeps its transcript and is read with runs; you will not get a notice for
+runs you stopped.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `detach` | boolean | no |  |
+| `ids` | array | yes |  |
+| `reason` | string | no | Forwarded to the run as its last message. |
+| `soft` | boolean | no | Agents only. Cancel the current turn, stay idle, keep the inbox. |
+| `wait_secs` | integer | no | Default 10. |
 
 ## Web
 

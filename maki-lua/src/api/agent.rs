@@ -472,6 +472,8 @@ async fn tools(
         .collect();
     let filter = base
         .excluding(&disabled)
+        // A Lua subagent has no identity in the hub, so it could only be refused.
+        .excluding(&maki_agent::tools::runs::RUN_TOOL_NAMES)
         .excluding(maki_agent::tools::capability_exclusions(model));
 
     let vars = maki_agent::template::env_vars();
@@ -996,6 +998,7 @@ async fn session(
             registry: Arc::clone(maki_agent::tools::ToolRegistry::global_arc()),
             audience,
             model_policy: Arc::clone(&agent_ctx.model_policy),
+            runs: None,
         },
         context,
         opts,

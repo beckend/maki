@@ -4,8 +4,8 @@ use std::sync::Arc;
 use maki_agent::tools::ToolRegistry;
 use maki_config::{
     AgentConfig, ConfigField, DEFAULT_MAX_LOG_FILES, DEFAULT_MAX_OUTPUT_LINES,
-    DEFAULT_MOUSE_SCROLL_LINES, MIN_TOOL_OUTPUT_LINES, NetConfig, ProviderConfig, StorageConfig,
-    TOP_LEVEL_FIELDS, TelemetryConfig, ToolOutputLines, UiConfig,
+    DEFAULT_MOUSE_SCROLL_LINES, MIN_TOOL_OUTPUT_LINES, NetConfig, ProviderConfig, RunsConfig,
+    StorageConfig, TOP_LEVEL_FIELDS, TelemetryConfig, ToolOutputLines, UiConfig,
 };
 use maki_lua::{PluginHost, PluginOptionSpecs};
 
@@ -345,6 +345,7 @@ All fields are optional. Typos in field names cause an error right away.
     write_theme_section(&mut out);
     write_tool_output_section(&mut out);
     write_section(&mut out, "[agent]", AgentConfig::FIELDS);
+    write_section(&mut out, "[agent.runs]", RunsConfig::FIELDS);
     write_section(&mut out, "[provider]", ProviderConfig::FIELDS);
     write_section(&mut out, "[storage]", StorageConfig::FIELDS);
     write_net_section(&mut out);

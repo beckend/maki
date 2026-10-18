@@ -186,6 +186,7 @@ pub fn spawn(params: HeadlessParams) -> (HeadlessHandle, SessionEvents) {
     let (guard, events) = event_stream();
     let event_tx = guard.sender(0);
 
+    let runs = crate::runs::start_session(&params.config.runs, event_tx.clone());
     let session_ref = params.resumed.id.clone();
     let mailbox = SessionMailbox::register(session_ref.id());
     let run_session_ref = session_ref.clone();
@@ -232,6 +233,7 @@ pub fn spawn(params: HeadlessParams) -> (HeadlessHandle, SessionEvents) {
                 registry: Arc::clone(ToolRegistry::global_arc()),
                 audience: ToolAudience::MAIN,
                 model_policy: Arc::clone(&params.model_policy),
+                runs,
             },
             turn.run_params(event_tx, context),
         )
@@ -335,6 +337,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
     let (cancel_tx, cancel_rx) = flume::bounded::<()>(1);
     let (model_tx, model_rx) = flume::unbounded::<Model>();
 
+    let runs = crate::runs::start_session(&params.config.runs, base_tx.clone());
     let session_ref = params.resumed.id.clone();
     let mailbox = SessionMailbox::register(session_ref.id());
 
@@ -422,6 +425,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
                     registry: Arc::clone(ToolRegistry::global_arc()),
                     audience: ToolAudience::MAIN,
                     model_policy: Arc::clone(&params.model_policy),
+                    runs: runs.clone(),
                 },
                 turn.run_params(event_tx, Arc::clone(&context)),
             )

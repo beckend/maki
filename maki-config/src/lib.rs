@@ -88,6 +88,12 @@ pub const MIN_CONNECT_TIMEOUT_SECS: u64 = 1;
 pub const MIN_LOW_SPEED_TIMEOUT_SECS: u64 = 1;
 pub const MIN_STREAM_TIMEOUT_SECS: u64 = 10;
 
+pub const DEFAULT_RUNS_MAX_DEPTH: u32 = 2;
+pub const DEFAULT_RUNS_MAX_CHILDREN: u32 = 8;
+pub const DEFAULT_RUNS_SESSION_MAX: u32 = 64;
+pub const MIN_RUNS_MAX_DEPTH: u32 = 1;
+pub const MIN_RUNS_LIMIT: u32 = 1;
+
 pub const MIN_RETRY_BASE_MS: u64 = 1;
 pub const MIN_RETRY_MAX_MS: u64 = 1;
 
@@ -816,6 +822,29 @@ pub struct AgentFileConfig {
     pub stale_read_check: Option<bool>,
     pub rtk: Option<bool>,
     pub shell: Option<ShellPreference>,
+    pub runs: RunsFileConfig,
+}
+
+#[derive(Deserialize, Default, Debug)]
+#[serde(default, deny_unknown_fields)]
+pub struct RunsFileConfig {
+    pub enabled: Option<bool>,
+    pub max_depth: Option<u32>,
+    pub max_children_per_run: Option<u32>,
+    pub session_max_runs: Option<u32>,
+}
+
+impl RunsFileConfig {
+    fn merge(&mut self, overlay: RunsFileConfig) {
+        merge_option!(
+            self,
+            overlay,
+            enabled,
+            max_depth,
+            max_children_per_run,
+            session_max_runs
+        );
+    }
 }
 
 impl AgentFileConfig {
@@ -834,6 +863,7 @@ impl AgentFileConfig {
             rtk,
             shell
         );
+        self.runs.merge(overlay.runs);
     }
 }
 
@@ -1489,6 +1519,9 @@ pub struct AgentConfig {
     )]
     pub shell: ShellPreference,
 
+    #[config(skip, default = "RunsConfig::default()")]
+    pub runs: RunsConfig,
+
     #[config(skip, default = "None")]
     pub max_turns: Option<u32>,
 
@@ -1516,9 +1549,43 @@ impl AgentConfig {
             stale_read_check: file.stale_read_check.unwrap_or(true),
             rtk: file.rtk.unwrap_or(true),
             shell: file.shell.unwrap_or_default(),
+            runs: RunsConfig::from_file(file.runs),
             max_turns: None,
             allowed_tools: Vec::new(),
             disabled_tools: Vec::new(),
+        }
+    }
+}
+
+/// Background runs (`spawn`, `send`, `runs`, `wait`, `stop`). Off by default.
+#[derive(Debug, Clone, ConfigSection, Serialize)]
+#[config(section = "agent.runs")]
+pub struct RunsConfig {
+    #[config(
+        default = false,
+        desc = "Register the `spawn`, `send`, `runs`, `wait` and `stop` tools for background agents and shell jobs"
+    )]
+    pub enabled: bool,
+
+    #[config(default = DEFAULT_RUNS_MAX_DEPTH, min = MIN_RUNS_MAX_DEPTH, desc = "Deepest agent nesting (the main agent is 0); an agent at this depth cannot spawn agents")]
+    pub max_depth: u32,
+
+    #[config(default = DEFAULT_RUNS_MAX_CHILDREN, min = MIN_RUNS_LIMIT, desc = "Most unfinished runs one run may have started")]
+    pub max_children_per_run: u32,
+
+    #[config(default = DEFAULT_RUNS_SESSION_MAX, min = MIN_RUNS_LIMIT, desc = "Most runs one session may start in total")]
+    pub session_max_runs: u32,
+}
+
+impl RunsConfig {
+    fn from_file(file: RunsFileConfig) -> Self {
+        Self {
+            enabled: file.enabled.unwrap_or(false),
+            max_depth: file.max_depth.unwrap_or(DEFAULT_RUNS_MAX_DEPTH),
+            max_children_per_run: file
+                .max_children_per_run
+                .unwrap_or(DEFAULT_RUNS_MAX_CHILDREN),
+            session_max_runs: file.session_max_runs.unwrap_or(DEFAULT_RUNS_SESSION_MAX),
         }
     }
 }
@@ -2100,6 +2167,7 @@ impl Config {
     pub fn validate(&self) -> Result<(), ConfigError> {
         self.ui.validate_all()?;
         self.agent.validate()?;
+        self.agent.runs.validate()?;
         self.provider.validate()?;
         self.storage.validate()?;
         Ok(())
@@ -2911,6 +2979,26 @@ mod tests {
             config.storage.max_log_bytes,
             DEFAULT_MAX_LOG_BYTES_MB * 1024 * 1024
         );
+    }
+
+    #[test]
+    fn runs_are_off_by_default_and_merge_per_key() {
+        let defaults = RawConfig::default().into_config(&[]).unwrap().agent.runs;
+        assert!(!defaults.enabled);
+        assert_eq!(defaults.max_depth, DEFAULT_RUNS_MAX_DEPTH);
+
+        let mut base: RawConfig =
+            toml::from_str("[agent.runs]\nenabled = true\nmax_depth = 3\n").unwrap();
+        base.merge(toml::from_str("[agent.runs]\nmax_depth = 1\n").unwrap());
+        let runs = base.into_config(&[]).unwrap().agent.runs;
+        assert!(runs.enabled);
+        assert_eq!(runs.max_depth, 1);
+    }
+
+    #[test]
+    fn runs_limits_below_their_minimum_are_rejected() {
+        let raw: RawConfig = toml::from_str("[agent.runs]\nsession_max_runs = 0\n").unwrap();
+        assert!(raw.into_config(&[]).unwrap().validate().is_err());
     }
 
     #[test_case("auto", NotificationMethod::Auto ; "auto")]
