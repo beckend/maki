@@ -141,6 +141,13 @@ How many lines of output to show per tool in the UI. All values are `usize` with
 | `max_children_per_run` | u32 | `8` | 1 | Most unfinished runs one run may have started |
 | `session_max_runs` | u32 | `64` | 1 | Most runs one session may start in total |
 | `siblings` | bool | `false` | - | Let runs with the same parent message each other with `send`. Off: a run reaches only its parent, its children and `main` |
+| `max_agents` | u32 | `4` | 1 | Agent runs that may work at once; more start queued, first come first served. A run waiting in `wait` does not count |
+| `max_shells` | u32 | `8` | 1 | Shell runs that may be running at once in the session |
+| `max_shells_per_owner` | u32 | `4` | 1 | Shell runs one run may have running at once |
+| `max_queue` | u32 | `16` | 1 | Agent runs that may wait for a free slot; a further `spawn` fails with QUEUE_FULL |
+| `spawn_per_minute` | u32 | `10` | 1 | Runs one run may start per rolling minute |
+| `default_timeout_secs` | u64 | `1800` | 1 | Wall clock limit of an agent run (seconds) unless `spawn` sets `timeout_secs`; counted from when it starts working |
+| `max_timeout_secs` | u64 | `86400` | 1 | Largest `timeout_secs` a `spawn` may ask for (seconds); larger values are lowered to it |
 
 ### `provider`
 

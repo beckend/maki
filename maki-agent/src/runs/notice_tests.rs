@@ -19,7 +19,11 @@ fn rig() -> Rig {
     let (tx, events) = flume::unbounded::<Envelope>();
     let clock = Arc::new(ManualClock::default());
     let hub = UnitHub::new(
-        UnitLimits::default(),
+        UnitLimits {
+            max_agents: u8::MAX,
+            spawn_per_minute: u8::MAX,
+            ..UnitLimits::default()
+        },
         EventSender::new(tx, 0),
         clock.clone(),
     );
