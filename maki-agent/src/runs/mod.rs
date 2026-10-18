@@ -1568,14 +1568,24 @@ impl UnitHub {
     fn watch_for_force_settle(self: &Arc<Self>, id: UnitId) {
         let hub = Arc::downgrade(self);
         let clock = Arc::clone(&self.clock);
-        tokio::spawn(async move {
-            clock
-                .sleep_until(clock.now() + agent::FORCE_SETTLE_AFTER)
-                .await;
-            if let Some(hub) = hub.upgrade() {
-                hub.force_settle(id);
-            }
-        });
+        // A dedicated thread, not the shared smol executor: a runner that
+        // blocks its thread must not be able to starve the very timer that
+        // exists to cut it loose.
+        let spawned = std::thread::Builder::new()
+            .name("maki-force-settle".to_owned())
+            .spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("the runtime starts")
+                    .block_on(clock.sleep_until(clock.now() + agent::FORCE_SETTLE_AFTER));
+                if let Some(hub) = hub.upgrade() {
+                    hub.force_settle(id);
+                }
+            });
+        if let Err(e) = spawned {
+            tracing::warn!(%e, "could not start the force-settle timer");
+        }
     }
 
     fn force_settle(&self, id: UnitId) {
