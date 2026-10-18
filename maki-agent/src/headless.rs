@@ -498,7 +498,8 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
     let (model_tx, model_rx) = flume::unbounded::<Model>();
     let (mode_tx, mode_rx) = flume::unbounded::<AgentMode>();
 
-    let runs = crate::runs::start_session(&params.config.runs, base_tx.clone());
+    let runs =
+        crate::runs::start_session(&params.config.runs, base_tx.clone(), params.resumed.id.id());
     let session_ref = params.resumed.id.clone();
     let mailbox = open_mailbox(&params.resumed);
 
