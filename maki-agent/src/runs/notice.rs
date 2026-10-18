@@ -69,10 +69,11 @@ fn result_tail(text: &mut String, handle: &UnitHandle, result: &super::UnitResul
     if !result.summary.is_empty() {
         let _ = write!(text, "\nResult:\n{}", result.summary);
     }
-    if let Some(structured) = &result.structured
-        && result.summary != *structured
-    {
-        let _ = write!(text, "\nStructured: {structured}");
+    if let Some(structured) = &result.structured {
+        let rendered = structured.to_string();
+        if result.summary != rendered {
+            let _ = write!(text, "\nStructured: {rendered}");
+        }
     }
     if result.truncated {
         let _ = write!(text, "\nFull result: runs(id=\"{handle}\", full=true)");
