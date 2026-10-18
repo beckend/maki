@@ -127,6 +127,62 @@ impl Lines {
     }
 }
 
+/// Removes terminal escape sequences (CSI colours and cursor moves, OSC
+/// titles and links, two-byte escapes) so `^ERROR` still matches coloured
+/// output. Lines without an escape are returned untouched.
+pub(super) fn strip_ansi(line: String) -> String {
+    if !line.contains('\x1b') {
+        return line;
+    }
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\x1b' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            // CSI: parameters and intermediates, then one final byte.
+            Some('[') => {
+                for c in chars.by_ref() {
+                    if ('\u{40}'..='\u{7e}').contains(&c) {
+                        break;
+                    }
+                }
+            }
+            // OSC: up to BEL or ST (ESC \).
+            Some(']') => {
+                while let Some(c) = chars.next() {
+                    if c == '\x07' {
+                        break;
+                    }
+                    if c == '\x1b' {
+                        chars.next_if_eq(&'\\');
+                        break;
+                    }
+                }
+            }
+            // Charset and similar: intermediates, then one final byte.
+            Some('\u{20}'..='\u{2f}') => {
+                while chars
+                    .next_if(|c| ('\u{20}'..='\u{2f}').contains(c))
+                    .is_some()
+                {}
+                chars.next();
+            }
+            // Any other escape takes one following character.
+            _ => {}
+        }
+    }
+    out
+}
+
+/// The line without escapes if the pattern matches it.
+fn matched(re: &Regex, line: String) -> Option<String> {
+    let line = strip_ansi(line);
+    re.is_match(&line).then_some(line)
+}
+
 pub(super) struct Watch {
     re: Regex,
     hub: Weak<UnitHub>,
@@ -167,7 +223,7 @@ impl Watch {
     }
 
     fn line(&mut self, line: String) {
-        if self.re.is_match(&line) {
+        if let Some(line) = matched(&self.re, line) {
             let out = self.limiter.offer(line, self.clock.now());
             self.send(out);
         }
@@ -273,6 +329,33 @@ mod tests {
         assert_eq!(l.feed(b"c\r\nde\nf"), ["abc", "de"]);
         assert_eq!(l.rest().as_deref(), Some("f"));
         assert_eq!(l.rest(), None);
+    }
+
+    #[test]
+    fn ansi_escapes_are_stripped() {
+        assert_eq!(strip_ansi("plain".into()), "plain");
+        assert_eq!(
+            strip_ansi("\x1b[1;31mERROR\x1b[0m: boom".into()),
+            "ERROR: boom"
+        );
+        assert_eq!(strip_ansi("\x1b]0;title\x07ok".into()), "ok");
+        assert_eq!(
+            strip_ansi("\x1b]8;;http://x\x1b\\link\x1b]8;;\x1b\\".into()),
+            "link"
+        );
+        assert_eq!(strip_ansi("a\x1b(Bb\x1b[".into()), "ab");
+    }
+
+    #[test]
+    fn anchored_pattern_matches_coloured_output() {
+        let re = Regex::new("^ERROR").unwrap();
+        let mut l = Lines::default();
+        let got: Vec<String> = l
+            .feed(b"\x1b[31mERROR\x1b[0m bad\nINFO fine\n\x1b[32mINFO\x1b[0m ERROR\n")
+            .into_iter()
+            .filter_map(|line| matched(&re, line))
+            .collect();
+        assert_eq!(got, ["ERROR bad"]);
     }
 
     #[test]
