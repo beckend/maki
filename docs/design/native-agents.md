@@ -14,7 +14,7 @@ Goals:
    `maki-ui/src/event_loop.rs:1189` `start_mailbox_runs`).
 2. Free two-way messaging: parent to child, child to parent, sibling to sibling, under a
    known topology the model can see and the runtime enforces.
-3. One concept (`Run`), one id scheme, one state machine, one notice path, one small tool
+3. One concept (a run, `Unit` in Rust), one id scheme, one state machine, one notice path, one small tool
    family, for agents and shell jobs alike.
 4. Bounded everything: notices, inboxes, outputs, wake storms. Full bodies are pulled by id.
 5. Cache-safe: topology reaches the model through `tell_changes`/`LiveFacts`, never by
@@ -31,7 +31,7 @@ changing the UI tab model beyond consuming new events.
 
 | Aspect | dsh | maki today | This design |
 |---|---|---|---|
-| Subsystems | Two (subagent manager, jobs registry) with different ids, states, notices | Three: Lua `task`, Lua `maki.fn.job*` (`maki-lua/src/api/fn.rs:820`), user `maki-monitor` plugin | One `UnitHub`, one `Run` |
+| Subsystems | Two (subagent manager, jobs registry) with different ids, states, notices | Three: Lua `task`, Lua `maki.fn.job*` (`maki-lua/src/api/fn.rs:820`), user `maki-monitor` plugin | One `UnitHub`, one `Unit` |
 | Ids | session uuid vs `bash-<16hex>` | task_id (tool_use_id), session_id, mailbox MakiId all differ | One `MakiId` per run, short handle `ag-k3x9ab`/`sh-4m2q7z` plus unique name |
 | States | agents `running\|inactive`, jobs 5 states | ad hoc per UI tab | `Queued Running Idle Stopping Done(reason)`, reason one of completed failed killed timed_out lost max_turns max_tokens refused |
 | Tools | 7+ (`subagent`, `send_message`, `interrupt_agent`, `list_agents`, `job_output/list/kill`) | `task`, bash, plugin tools | 5: `spawn send runs wait stop` |
@@ -997,7 +997,7 @@ shell is rejected (`NOT_AGENT`). Hard `stop` keeps the cascade semantics above.
 | Esc in a run's tab | `hub.stop(run, cascade)`; agent tab only; Esc again = hard `forced` settle immediately |
 | `/stop <name\|all>` (new command, 8.1) | `hub.stop`; `all` stops every run owned by the session root |
 | `/new` | the old session's hub does `shutdown()` (cascade stop, 5 s deadline), then a fresh hub with a fresh root token. Runs do not migrate sessions. |
-| session switch (`/resume`, session picker) | same as `/new` for the session being left; its runs settle `killed` (reason `session_closed`) so the journal is clean and a resume shows them stopped, not lost |
+| session switch (`/resume`, session picker) | same as `/new` for the session being left; its runs settle `Done(Killed)` (detail `session_closed`) so the journal is clean and a resume shows them stopped, not lost |
 | `/reload` (Lua plugins reload) | no effect on native runs; they are not owned by the Lua host. This is a main reason shells are native (today `JobStore` Drop kills them on reload). Lua-owned `maki.fn.job*` still die as before. |
 | `/compact` | no effect on runs; the main agent compacts its own history |
 | config reload | new limits apply to future admissions only |
@@ -1115,7 +1115,7 @@ prompt and tool frame are rebuilt for the audience (one possible cache miss, acc
 
 * Tabs: unchanged model. `RunStarted` with `SubagentInfo` creates a chat tab through
   `deliver`/`resolve_or_create_chat` (`maki-ui/src/app/mod.rs:1636`), keyed by the run
-  handle carried in `SubagentInfo.parent_tool_use_id` (3, phase 3). The tab title is the run name. Shell runs get no
+  handle carried in `SubagentInfo.parent_tool_use_id` (5.4, phase 3). The tab title is the run name. Shell runs get no
   chat tab; they appear in `/runs` and the status line only, with a log viewer
   (below).
 * `/runs` (picker, named `/runs` so it does not clash with the Lua `/tasks`): implemented in Rust in `maki-ui` over a `RunsView` kept in
@@ -1144,7 +1144,7 @@ prompt and tool frame are rebuilt for the audience (one possible cache miss, acc
   (4.4, phase 4c). Run transitions print on stderr as one line each
   (`[run ag-k3x9ab auditor completed 2m10s]`) unless `--quiet-runs`; JSON output (`print.rs`)
   adds `run_*` objects; `join` per 4.4; unattended permissions follow 6.2 (phase 7b).
-* ACP (`maki-acp`): permission requests carry the run name (5b). Mapping run state to
+* ACP (`maki-acp`): permission requests carry the run name (phase 5b). Mapping run state to
   `tool_call_update` is post-v1 (appendix B); ACP exposes no run tree in v1.
 * SDK (`sdk_mode.rs`): events serialised with the existing envelope plus the new variants;
   additive to the wire format.
@@ -1178,7 +1178,7 @@ are merged); no sleeps in tests (injected `Clock`, flume channels, `smol::block_
 AGENTS.md style (no trivial comments, constants at top, `test_case`, deps only through
 the workspace `Cargo.toml`); one commit per phase, conventional prefix (`feat:`, 2-5
 sentences, plain prose, no em-dashes), no push. Regression gates after each phase (see
-appendix for the toolchain):
+Appendix A for the toolchain):
 
 ```
 cargo fmt --all -- --check
@@ -1216,7 +1216,7 @@ setting one false removes that capability without touching the others):
 | 7a, 7b | `ui` | no `/runs`, status segment, log viewer, run stderr lines |
 
 Naming: the new concept is `Unit` in Rust (`UnitHub`, `UnitId`, `UnitHandle`, `UnitName`,
-`UnitState`, `UnitLimits`...), because `Run`/`UnitHandle` collide with the per-turn `run_id`
+`UnitState`, `UnitLimits`...), because `Run*` names collide with the per-turn `run_id`
 (`Envelope.run_id`, `types.rs:1195`), `RunContext` and `RunLedger`. Model-facing text, the
 tool names, `[agent.runs]` and the `runs/` module keep the word "run"; this doc says run.
 
@@ -1385,8 +1385,8 @@ initial prompt; (4) `structured_output` local tool; (5) result capture with 4 Ki
 spill; (6) `Idle` after the first result unless `one_shot`; (7) port
 `relay_session_events` (`maki-lua/src/api/agent.rs:270`) stamping `SubagentInfo`; (8) UI tab
 creation on `RunStarted`; (9) permission broker with auto-deny only (5b adds routing);
-(10) `wait` Idle semantics (3.3), default `timeout_secs` 1800 applied; (12) stop cascade child-first with
-notice suppression (7.1, 4.8; test `agent_run::stop_cascades_children_first`); (11) `context=fork`
+(10) `wait` Idle semantics (3.3), default `timeout_secs` 1800 applied; (11) stop cascade child-first with
+notice suppression (7.1, 4.8; test `agent_run::stop_cascades_children_first`); (12) `context=fork`
 per 3.1 or cut it if the history snapshot cannot exclude the in-flight turn.
 
 Tests: `agent_run::completes_with_result_and_goes_idle`, `agent_run::one_shot_completes`,
@@ -1508,6 +1508,9 @@ Commit: `feat: run limits and queue`.
 
 ### Phase 5b: background permission routing
 
+Goal: a background agent's permission prompts reach the user (or are denied when unattended)
+without pinning a slot.
+Interfaces: `PermissionBroker` (receiver end for `enforce`), `unattended_permissions` config.
 Files: `maki-agent/src/permissions.rs` (`PermissionBroker`; `enforce` `:755`, `:830` unchanged),
 `types.rs` (request attribution), `maki-ui` prompt component, `maki-acp/src/permissions.rs`.
 Steps: (1) broker per agent run; (2) attributed prompt in the TUI queue; (3) ACP title;
@@ -1542,6 +1545,9 @@ Commit: `feat: run journal and lost reconciliation`.
 
 ### Phase 6b: cold revive
 
+Goal: `send` to a finished, lost or evicted agent revives it from its transcript.
+Files: `runs/mod.rs` (`revive`), `runs/journal.rs`, `maki-storage/src/sessions.rs`.
+Interfaces: `UnitHub::revive(id, first: InboxItem) -> Result<(), UnitError>`.
 Steps: persist full `AgentSpec` in the `spawn` record; `revive(id, first)` rebuilds the runner
 (7.4); tombstones for evicted runs; unread messages from the message file are redelivered.
 Tests: `revive::completed_agent_cold_resumes_from_transcript`, `revive::one_shot_not_revivable`,
@@ -1552,6 +1558,8 @@ Commit: `feat: cold revive of runs`.
 
 ### Phase 7a: /runs and status line
 
+Goal: the user sees and stops runs from the TUI.
+Interfaces: `RunsView` in `App`, `/stop <name|all>` command.
 Files: `maki-ui/src/app/{tasks.rs,mod.rs,session.rs}` (`RunsView`, `diff_task_states`
 `tasks.rs:184` logic ported), `components/runs_picker.rs`, `components/status_bar.rs`,
 `commands.rs` (`/stop`), `chat.rs` (notice row collapse), keybindings, docgen outputs
@@ -1565,6 +1573,8 @@ Commit: `feat: runs view and status line`.
 
 ### Phase 7b: log viewer, headless output, docs page
 
+Goal: shell logs viewable, headless run output, user docs.
+Interfaces: CLI flags `--join-timeout`, `--quiet-runs`.
 Files: transient log viewer panel, `src/print.rs` (`--join-timeout`, `--quiet-runs`, stderr
 transition lines, JSON `run_*` events), `maki-agent/src/headless.rs`, `site/docs/content/`
 page for agents (content root `maki-docgen/src/main.rs:17`; the page is hand-written).
@@ -1611,7 +1621,7 @@ Not in v1; each needs its own decision and design pass:
    per agent with an async mutex; never two runs concurrently.
 3. Deadlock through slot exhaustion (parents waiting on queued children): a run blocked in
    `wait` or a permission prompt releases its slot and re-acquires on resume (6.1);
-   tested by `admit::wait_releases_slot`.
+   tested by `admit::wait_releases_slot_and_reacquires_first`.
 4. Notice injection correctness against provider rules (tool_use/tool_result pairing):
    hard invariant with a dedicated test over both Anthropic and OpenAI shapes.
 5. Two registries (legacy Lua `task` plus hub) for the whole v1. Mitigation: the flag
@@ -1652,7 +1662,7 @@ Not in v1; each needs its own decision and design pass:
   asserted by tool-call names and states, never by exact prose.
 * Property soak in phase 8 with deterministic seeds printed on failure.
 
-## Appendix: toolchain recipe
+## Appendix A: toolchain recipe
 
 `cargo` is not on PATH and maki needs rustc 1.99. Per memory note
 `maki-fork-toolchain-and-ci.md`:
