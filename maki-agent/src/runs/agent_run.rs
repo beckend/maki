@@ -29,6 +29,10 @@ enum Step {
     Reply(StreamResponse),
     Gate(flume::Receiver<()>, StreamResponse),
     Hang,
+    /// The provider fails; the run must settle `failed`.
+    Fail(&'static str),
+    /// Blocks the executor thread until released, so a cancel cannot reach it.
+    Block(std::sync::mpsc::Receiver<()>),
 }
 
 /// Answers by the first user message: each route has its own queue, so two
@@ -144,6 +148,13 @@ impl Provider for Script {
                     Ok(r)
                 }
                 Step::Hang => std::future::pending().await,
+                Step::Fail(message) => Err(AgentError::Config {
+                    message: message.to_owned(),
+                }),
+                Step::Block(release) => {
+                    let _ = release.recv();
+                    Ok(reply("late"))
+                }
             }
         })
     }
@@ -2643,5 +2654,396 @@ mod revive {
         let id = tombs[0].id;
         revive(&rig, id, "hello again").await.unwrap();
         assert_eq!(settle(&rig, id).await.result.unwrap().summary, "again");
+    }
+}
+
+/// Random operations and fault injection over real agent runs. Nothing is
+/// scripted per run: a seeded provider answers, hangs, yields or fails, and
+/// the tests only check what must hold whatever happened.
+mod chaos {
+    use std::collections::{HashMap, HashSet};
+    use std::time::Instant;
+
+    use maki_storage::runs::{JournalOptions, RunJournal};
+
+    use super::*;
+
+    const SEEDS: u64 = 12;
+    const OPS: usize = 150;
+    const MAX_AGENTS: u8 = 3;
+    const WATCHDOG: Duration = Duration::from_secs(180);
+
+    struct Chaos {
+        state: Mutex<u64>,
+        requests: Mutex<usize>,
+    }
+
+    impl Chaos {
+        fn new(seed: u64) -> Arc<Self> {
+            Arc::new(Self {
+                state: Mutex::new(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1),
+                requests: Mutex::new(0),
+            })
+        }
+    }
+
+    fn next(state: &Mutex<u64>) -> u64 {
+        let mut s = state.lock().unwrap();
+        *s ^= *s << 13;
+        *s ^= *s >> 7;
+        *s ^= *s << 17;
+        *s
+    }
+
+    impl Provider for Chaos {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            _: &'a [Message],
+            _: &'a str,
+            _: &'a Value,
+            _: &'a flume::Sender<ProviderEvent>,
+            _: RequestOptions,
+            _: Option<&'a SessionRef>,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            let roll = next(&self.state) % 100;
+            *self.requests.lock().unwrap() += 1;
+            Box::pin(async move {
+                match roll {
+                    0..=49 => Ok(reply("done")),
+                    50..=69 => {
+                        tokio::task::yield_now().await;
+                        Ok(reply("done after a yield"))
+                    }
+                    70..=89 => std::future::pending().await,
+                    _ => Err(AgentError::Config {
+                        message: "injected".into(),
+                    }),
+                }
+            })
+        }
+
+        fn list_models(&self) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, AgentError>> {
+            Box::pin(async { unimplemented!() })
+        }
+    }
+
+    fn limits() -> UnitLimits {
+        UnitLimits {
+            max_agents: MAX_AGENTS,
+            max_children_per_run: 2,
+            max_depth: 2,
+            max_queue: 4,
+            spawn_per_minute: u8::MAX,
+            session_max_runs: u16::MAX,
+            ..UnitLimits::default()
+        }
+    }
+
+    async fn revive_by_hand(rig: &Rig, to: UnitId) -> bool {
+        let main = rig.hub.main();
+        let Ok(Some(plan)) = rig.hub.revive_plan(main, to) else {
+            return false;
+        };
+        let Some(history) = rig.hub.load_transcript(plan.handle.as_str()) else {
+            return false;
+        };
+        let Ok(launch) = AgentLaunch::prepare(&rig.ctx, &plan.spec).await else {
+            return false;
+        };
+        rig.hub
+            .revive(
+                main,
+                plan,
+                launch,
+                history,
+                "again".into(),
+                DeliveryKind::Steer,
+            )
+            .is_ok()
+    }
+
+    /// Fails loudly instead of hanging the suite when the hub deadlocks.
+    struct Watchdog(flume::Sender<()>);
+
+    fn watchdog(what: String) -> Watchdog {
+        let (tx, rx) = flume::bounded::<()>(1);
+        std::thread::spawn(move || {
+            if matches!(
+                rx.recv_timeout(WATCHDOG),
+                Err(flume::RecvTimeoutError::Timeout)
+            ) {
+                eprintln!("deadlock: {what}");
+                std::process::abort();
+            }
+        });
+        Watchdog(tx)
+    }
+
+    impl Drop for Watchdog {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
+
+    /// Every observation of the table must be reachable from the last one:
+    /// a settled run stays settled unless it was revived, and a run that has
+    /// started never goes back to the queue.
+    fn check_transitions(
+        seen: &mut HashMap<UnitId, &'static str>,
+        revived: &HashSet<UnitId>,
+        rig: &Rig,
+        seed: u64,
+    ) {
+        for view in rig.hub.list(rig.hub.main(), Scope::All) {
+            let now = view.state.label();
+            let done_now = view.state.is_done();
+            if let Some(&before) = seen.get(&view.id) {
+                let was_done = !matches!(before, "queued" | "running" | "idle" | "stopping");
+                if was_done && !done_now {
+                    assert!(
+                        revived.contains(&view.id),
+                        "seed {seed}: {} went from {before} to {now} without a revive",
+                        view.handle
+                    );
+                }
+            }
+            seen.insert(view.id, now);
+        }
+    }
+
+    async fn one_sequence(seed: u64) {
+        let chaos = Chaos::new(seed);
+        let mut ctx_rig = {
+            let script = Script::new(vec![]);
+            rig_with(&script, limits())
+        };
+        ctx_rig.ctx.provider = chaos.clone();
+        let rig = ctx_rig;
+        let dir = rig.dir.path().join("journal");
+        std::fs::create_dir_all(&dir).unwrap();
+        rig.hub.attach_journal(Arc::new(
+            RunJournal::open_in(dir, JournalOptions::default()).unwrap(),
+        ));
+        let _guard = watchdog(format!("seed {seed}"));
+        let rng = Mutex::new(seed.wrapping_add(7).wrapping_mul(0xD1B5_4A32_D192_ED03) | 1);
+        let pick = |n: usize| (next(&rng) % n.max(1) as u64) as usize;
+        let mut seen = HashMap::new();
+        let mut revived = HashSet::new();
+        let mut ids: Vec<UnitId> = Vec::new();
+        for n in 0..OPS {
+            let live: Vec<UnitId> = rig
+                .hub
+                .list(rig.hub.main(), Scope::All)
+                .into_iter()
+                .filter(|u| !u.state.is_done() && u.kind == RunKind::Agent)
+                .map(|u| u.id)
+                .collect();
+            match pick(10) {
+                0..=3 => {
+                    // Under main, or under a random live agent to hit the depth
+                    // and fan-out caps.
+                    let caller = match live.is_empty() || pick(2) == 0 {
+                        true => rig.hub.main(),
+                        false => live[pick(live.len())],
+                    };
+                    let req = agent_req(&format!("op {n}"), json!({}));
+                    let UnitKind::Agent(spec) = req.clone().into_kind().unwrap() else {
+                        unreachable!()
+                    };
+                    if let Ok(launch) = AgentLaunch::prepare(&rig.ctx, &spec).await
+                        && let Ok(ack) = rig.hub.spawn_agent(caller, req, launch)
+                    {
+                        ids.push(ack.id);
+                    }
+                }
+                4 | 5 if !ids.is_empty() => {
+                    let to = ids[pick(ids.len())];
+                    let kind = match pick(2) {
+                        0 => DeliveryKind::Steer,
+                        _ => DeliveryKind::Followup,
+                    };
+                    let _ = rig.hub.send(rig.hub.main(), to, format!("m{n}"), kind);
+                }
+                6 if !ids.is_empty() => {
+                    let opts = StopOpts {
+                        soft: pick(2) == 0,
+                        detach: false,
+                    };
+                    rig.hub.stop(rig.hub.main(), &[ids[pick(ids.len())]], opts);
+                }
+                7 if !ids.is_empty() => {
+                    // A bounded wait: the manual clock never fires it, so cancel does.
+                    let (trigger, cancel) = CancelToken::new();
+                    let targets = [ids[pick(ids.len())]];
+                    let waiter = rig.hub.wait(
+                        rig.hub.main(),
+                        &targets,
+                        WaitMode::Any,
+                        Duration::from_secs(60),
+                        &cancel,
+                    );
+                    tokio::select! {
+                        biased;
+                        _ = waiter => {}
+                        _ = async {
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                            trigger.cancel();
+                            std::future::pending::<()>().await
+                        } => {}
+                    }
+                }
+                8 if !ids.is_empty() => {
+                    let id = ids[pick(ids.len())];
+                    if revive_by_hand(&rig, id).await {
+                        revived.insert(id);
+                    }
+                }
+                _ => std::thread::yield_now(),
+            }
+            assert!(
+                rig.hub.slots_in_use() <= usize::from(MAX_AGENTS),
+                "seed {seed}: {} slots in use",
+                rig.hub.slots_in_use()
+            );
+            check_transitions(&mut seen, &revived, &rig, seed);
+        }
+        // Everything stops, everything settles, nothing holds a slot.
+        let all: Vec<UnitId> = rig
+            .hub
+            .list(rig.hub.main(), Scope::All)
+            .into_iter()
+            .map(|u| u.id)
+            .collect();
+        for _ in 0..4 {
+            rig.hub.stop(rig.hub.main(), &all, StopOpts::default());
+            let views = rig
+                .hub
+                .wait(
+                    rig.hub.main(),
+                    &all,
+                    WaitMode::All,
+                    Duration::from_secs(10_000_000),
+                    &CancelToken::none(),
+                )
+                .await;
+            if views
+                .iter()
+                .all(|v| v.state.is_done() || v.state.label() == "idle")
+            {
+                break;
+            }
+        }
+        let tail: Vec<UnitId> = rig
+            .hub
+            .list(rig.hub.main(), Scope::All)
+            .into_iter()
+            .filter(|u| !u.state.is_done())
+            .map(|u| u.id)
+            .collect();
+        rig.hub.stop(rig.hub.main(), &tail, StopOpts::default());
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while rig
+            .hub
+            .list(rig.hub.main(), Scope::All)
+            .iter()
+            .any(|u| !u.state.is_done())
+        {
+            assert!(Instant::now() < deadline, "seed {seed}: runs never settled");
+            rig.clock.advance(Duration::from_secs(6));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        check_transitions(&mut seen, &revived, &rig, seed);
+        assert_eq!(rig.hub.slots_in_use(), 0, "seed {seed}: leaked slots");
+        let mut finished: HashMap<String, usize> = HashMap::new();
+        for e in rig.events.try_iter() {
+            if let AgentEvent::RunFinished { handle, .. } = e.event {
+                *finished.entry(handle).or_default() += 1;
+            }
+        }
+        for view in rig.hub.list(rig.hub.main(), Scope::All) {
+            let revives = usize::from(revived.contains(&view.id));
+            let n = finished.get(view.handle.as_str()).copied().unwrap_or(0);
+            // A revive can settle again, so the bound is per revive in the worst case.
+            assert!(
+                n <= 1 + revives * OPS,
+                "seed {seed}: {} finished {n} times",
+                view.handle
+            );
+        }
+        // Dropping the rig drops the hub; any task still holding it leaks it.
+        let weak = Arc::downgrade(&rig.hub);
+        rig.hub.shutdown();
+        drop(rig);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while weak.strong_count() > 0 {
+            assert!(
+                Instant::now() < deadline,
+                "seed {seed}: a task keeps the hub alive"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[tokio::test]
+    async fn invariants_hold_over_random_ops() {
+        for seed in 1..=SEEDS {
+            one_sequence(seed).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_error_mid_run_settles_failed_and_frees_the_slot() {
+        let script = Script::new(vec![
+            (
+                CHILD,
+                vec![
+                    Step::Reply(tool_use("t1", "runs", json!({}))),
+                    Step::Fail("boom"),
+                ],
+            ),
+            ("AFTER-TASK", vec![Step::Reply(reply("fine"))]),
+        ]);
+        let rig = rig(&script);
+        let ack = spawn(&rig, CHILD, json!({})).await;
+        let view = settle(&rig, ack.id).await;
+        let UnitState::Done(term) = &view.state else {
+            panic!("not done: {}", view.state.label());
+        };
+        assert_eq!(term.reason, DoneReason::Failed);
+        assert!(term.detail.as_deref().unwrap_or("").contains("boom"));
+        assert_eq!(rig.hub.slots_in_use(), 0);
+        // The hub keeps working after a failed run.
+        let next = spawn(&rig, "AFTER-TASK", json!({})).await;
+        assert_eq!(settle(&rig, next.id).await.result.unwrap().summary, "fine");
+    }
+
+    #[tokio::test]
+    async fn runner_ignoring_cancel_is_force_settled_once() {
+        let (release, blocked) = std::sync::mpsc::channel::<()>();
+        let script = Script::new(vec![(CHILD, vec![Step::Block(blocked)])]);
+        let rig = rig(&script);
+        let ack = spawn(&rig, CHILD, json!({})).await;
+        await_requests(&script, CHILD, 1).await;
+        rig.hub.stop(rig.hub.main(), &[ack.id], StopOpts::default());
+        // The runner is stuck inside the provider call, so the stop leaves the
+        // run `stopping`. smol's global executor has one thread by default and
+        // the stuck runner holds it, so the watch timer cannot run here; call
+        // the force settle it would call (the timer wiring is `stop`'s one line).
+        assert_eq!(rig.hub.get(ack.id).unwrap().state.label(), "stopping");
+        rig.hub.force_settle(ack.id);
+        let view = rig.hub.get(ack.id).unwrap();
+        let UnitState::Done(term) = &view.state else {
+            unreachable!()
+        };
+        assert_eq!(term.reason, DoneReason::Killed);
+        assert_eq!(term.detail.as_deref(), Some("forced"));
+        assert_eq!(rig.hub.slots_in_use(), 0);
+        // Releasing the runner afterwards must not settle it a second time.
+        release.send(()).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(finished_order(&rig).len(), 1);
+        let after = rig.hub.get(ack.id).unwrap();
+        assert_eq!(after.state.label(), "killed");
     }
 }
