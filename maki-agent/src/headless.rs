@@ -4,9 +4,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
-use maki_providers::Timeouts;
 use maki_providers::model::Model;
 use maki_providers::provider::{self, Provider};
+use maki_providers::{AgentError, Message, Timeouts};
 use maki_storage::StateDir;
 use maki_storage::id::SessionRef;
 use maki_storage::sessions::SessionClaim;
@@ -18,15 +18,92 @@ use crate::agent::{self, RunContext, RunContextBuilder};
 use crate::cancel::{CancelMap, CancelToken};
 use crate::permissions::{PermissionManager, PluginRuleStore};
 use crate::prompt::ResolvedPrompts;
+use crate::runs::{Joined, UnitHub, WakeSink};
 use crate::session::{Resumed, SessionTrack};
 use crate::template;
 use crate::tools::{FileAccess, LocalTools, RequestTools, ToolAudience, ToolRegistry};
 use crate::types::EventSender;
 use crate::{
-    Agent, AgentConfig, AgentEvent, AgentInput, AgentMode, AgentParams, EventStreamGuard,
-    ImageSource, InputSource, McpHandle, McpSession, PermissionsConfig, RunLedger, SessionEvents,
-    SessionMailbox, ToolDeferral, ToolOutputLines, event_stream,
+    Agent, AgentConfig, AgentEvent, AgentInput, AgentMode, AgentParams, DoneReason,
+    EventStreamGuard, ImageSource, InputSource, McpHandle, McpSession, PermissionsConfig,
+    RunLedger, SessionEvents, SessionMailbox, ToolDeferral, ToolOutputLines, event_stream,
 };
+
+/// Closing turns in a row that may be needed to drain quiet items.
+const MAX_CLOSING_TURNS: u32 = 3;
+
+/// Hands wakes from `drive_main` to the task that owns the agent.
+struct ChannelWake(flume::Sender<()>);
+
+impl WakeSink for ChannelWake {
+    fn start_main_run(&self, _preamble: Vec<Message>) {
+        let _ = self.0.send(());
+    }
+}
+
+fn blank_turn(defaults: SessionDefaults, mode: AgentMode) -> AgentInput {
+    AgentInput::from_defaults(
+        String::new(),
+        mode,
+        Vec::new(),
+        defaults,
+        InputSource::Headless,
+    )
+}
+
+/// Runs the turns that come after the first one: a turn for every wake
+/// `drive_main` hands over, and a closing turn that delivers what the wake
+/// budget kept quiet. Returns the result of the last turn, once no run is
+/// left or the join bound passed (then everything still running is stopped).
+async fn follow_up(
+    agent: &mut Agent<'_>,
+    hub: &Arc<UnitHub>,
+    wake_rx: &flume::Receiver<()>,
+    defaults: SessionDefaults,
+    join_timeout: Duration,
+) -> Result<DoneReason, AgentError> {
+    enum Step {
+        Wake,
+        Joined(Joined),
+    }
+    let mut last = Ok(DoneReason::EndTurn);
+    let mut closing = 0;
+    let deadline = hub.deadline_after(join_timeout);
+    hub.main_turn_ends();
+    loop {
+        let step = futures_lite::future::or(
+            async {
+                let _ = wake_rx.recv_async().await;
+                Step::Wake
+            },
+            async { Step::Joined(hub.join_until(deadline).await) },
+        )
+        .await;
+        match step {
+            Step::Wake => closing = 0,
+            Step::Joined(Joined::Quiet) => return last,
+            Step::Joined(Joined::Pending) if closing < MAX_CLOSING_TURNS => {
+                closing += 1;
+                hub.main_turn_begins();
+            }
+            Step::Joined(Joined::Pending) => return last,
+            Step::Joined(Joined::TimedOut { stopped }) => {
+                eprintln!(
+                    "maki: join timeout of {}s reached, stopped {} run(s): {}",
+                    join_timeout.as_secs(),
+                    stopped.len(),
+                    stopped.join(", ")
+                );
+                return last;
+            }
+        }
+        last = agent.run(blank_turn(defaults, AgentMode::Build)).await;
+        hub.main_turn_ends();
+        if !matches!(last, Ok(reason) if reason != DoneReason::Cancelled) {
+            return last;
+        }
+    }
+}
 
 const SESSION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -73,6 +150,9 @@ pub struct HeadlessParams {
     pub model_policy: Arc<ModelPolicy>,
     pub plugin_rules: Arc<PluginRuleStore>,
     pub project_config: ProjectConfig,
+    /// How long the process waits for background runs after the last turn
+    /// before it stops them. Only used when runs are enabled.
+    pub join_timeout: Duration,
 }
 
 pub struct HeadlessHandle {
@@ -197,6 +277,7 @@ pub fn spawn(params: HeadlessParams) -> (HeadlessHandle, SessionEvents) {
     let defaults = params.defaults;
     let working_dir_path = params.initial_wd.clone();
     let task_working_dir = working_dir.clone();
+    let join_timeout = params.join_timeout;
     let task = smol::spawn(run_session(guard, params.mcp_handle.clone(), async move {
         let mut model = params.model;
         let Some(provider) = connect(&mut model, params.timeouts, &event_tx).await else {
@@ -237,14 +318,22 @@ pub fn spawn(params: HeadlessParams) -> (HeadlessHandle, SessionEvents) {
                 registry: Arc::clone(ToolRegistry::global_arc()),
                 audience: ToolAudience::MAIN,
                 model_policy: Arc::clone(&params.model_policy),
-                runs,
+                runs: runs.clone(),
             },
             turn.run_params(event_tx, context),
         )
         .with_loaded_instructions(instructions.loaded)
         .with_mcp(mcp);
 
-        let result = agent
+        let follow = runs.as_ref().map(|ctx| {
+            let (wake_tx, wake_rx) = flume::unbounded();
+            let hub = Arc::clone(&ctx.hub);
+            // The first turn is the caller's; nothing wakes `main` before it ends.
+            hub.main_turn_begins();
+            let driver = smol::spawn(Arc::clone(&hub).drive_main(ChannelWake(wake_tx)));
+            (hub, wake_rx, driver)
+        });
+        let mut result = agent
             .run(AgentInput::from_defaults(
                 params.prompt,
                 mode,
@@ -253,6 +342,13 @@ pub fn spawn(params: HeadlessParams) -> (HeadlessHandle, SessionEvents) {
                 InputSource::Headless,
             ))
             .await;
+        if let Some((hub, wake_rx, driver)) = follow {
+            if matches!(result, Ok(reason) if reason != DoneReason::Cancelled) {
+                result = follow_up(&mut agent, &hub, &wake_rx, defaults, join_timeout).await;
+            }
+            driver.cancel().await;
+            hub.shutdown();
+        }
         drop(agent);
 
         if let Err(e) = result {
@@ -297,6 +393,11 @@ pub struct InteractiveParams {
     /// Host-side overrides that shadow a registered tool's execution while
     /// keeping its advertised schema (e.g. ACP answers `question` via elicitation).
     pub local_tools: LocalTools,
+    /// Start a turn of `main` when a waking run notice arrives while it is
+    /// idle. The turn ends with its own `Done`, which a client that pairs
+    /// `Done` with its own prompt (ACP) would take for the answer to a prompt
+    /// it sent meanwhile, so such hosts leave this off.
+    pub wake_main: bool,
 }
 
 pub struct InteractiveHandle {
@@ -370,7 +471,49 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
             SessionTrack::open(params.resumed, params.claim, params.storage, &working_dir);
         let mut run_id: u64 = 0;
 
-        while let Ok(input) = input_rx.recv_async().await {
+        let waker = runs.as_ref().filter(|_| params.wake_main).map(|ctx| {
+            let (wake_tx, wake_rx) = flume::unbounded();
+            let hub = Arc::clone(&ctx.hub);
+            let driver = smol::spawn(Arc::clone(&hub).drive_main(ChannelWake(wake_tx)));
+            (hub, wake_rx, driver)
+        });
+        let mut last_mode = AgentMode::Build;
+        loop {
+            enum Next {
+                Input(AgentInput),
+                Wake,
+            }
+            let next = match &waker {
+                Some((_, wake_rx, _)) => {
+                    futures_lite::future::or(
+                        async { input_rx.recv_async().await.ok().map(Next::Input) },
+                        async { wake_rx.recv_async().await.ok().map(|()| Next::Wake) },
+                    )
+                    .await
+                }
+                None => input_rx.recv_async().await.ok().map(Next::Input),
+            };
+            let input = match next {
+                None => break,
+                Some(Next::Input(input)) => {
+                    last_mode = input.mode.clone();
+                    input
+                }
+                Some(Next::Wake) => {
+                    // A user turn that ran first may have drained what the
+                    // wake was for.
+                    if let Some((hub, ..)) = &waker
+                        && !hub.main_has_unread()
+                    {
+                        hub.main_turn_ends();
+                        continue;
+                    }
+                    blank_turn(params.defaults, last_mode.clone())
+                }
+            };
+            if let Some((hub, ..)) = &waker {
+                hub.main_turn_begins();
+            }
             let (trigger, cancel) = CancelToken::new();
             let cancel_task = smol::spawn({
                 let cancel_rx = cancel_rx.clone();
@@ -399,6 +542,9 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
             {
                 let Some(switched) = connect(&mut new_model, params.timeouts, &error_tx).await
                 else {
+                    if let Some((hub, ..)) = &waker {
+                        hub.main_turn_ends();
+                    }
                     run_id += 1;
                     continue;
                 };
@@ -449,7 +595,14 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
                 let _ = error_tx.send(AgentEvent::error(e));
             }
 
+            if let Some((hub, ..)) = &waker {
+                hub.main_turn_ends();
+            }
             run_id += 1;
+        }
+        if let Some((hub, _, driver)) = waker {
+            driver.cancel().await;
+            hub.shutdown();
         }
     }));
 

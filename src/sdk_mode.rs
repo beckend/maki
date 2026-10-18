@@ -591,6 +591,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         plugin_rules,
         project_config,
         local_tools: Default::default(),
+        wake_main: true,
     });
 
     let (out_tx, out_rx) = flume::unbounded::<String>();

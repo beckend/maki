@@ -6,6 +6,7 @@ pub mod agent;
 #[cfg(test)]
 mod agent_run;
 pub mod clock;
+mod drive;
 pub mod inbox;
 pub mod limits;
 pub mod notice;
@@ -19,7 +20,7 @@ mod topology;
 use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -40,6 +41,7 @@ use crate::{AgentEvent, Envelope, SubagentInfo};
 use agent::AgentRun;
 pub use agent::{AgentLaunch, resolve_model};
 pub use clock::{Clock, ManualClock, SystemClock};
+pub use drive::{Joined, WakeSink};
 use inbox::{Accepted, Phase};
 pub use inbox::{DeliveryKind, Inbox, InboxItem, MessageId, SendAck};
 pub use limits::UnitLimits;
@@ -739,6 +741,10 @@ pub struct UnitHub {
     /// is started by its frontend once [`UnitHub::claim_main_wake`] says so.
     main_inbox: Arc<Inbox>,
     wake: Mutex<WakeBudget>,
+    /// A turn of `main` is running or about to; see `drive.rs`.
+    main_busy: AtomicBool,
+    /// Notices taken out of the pending list and not yet in an inbox.
+    notices_in_flight: AtomicUsize,
     /// The reserved sender of text the user types into a run's tab.
     user: UnitId,
     message_seq: AtomicU64,
@@ -779,6 +785,8 @@ impl UnitHub {
             cancel_root: Mutex::new(Some(trigger)),
             main_inbox: Arc::new(Inbox::new(Phase::Idle)),
             wake: Mutex::new(WakeBudget::default()),
+            main_busy: AtomicBool::new(false),
+            notices_in_flight: AtomicUsize::new(0),
             user: UnitId::new(),
             message_seq: AtomicU64::new(0),
         })
@@ -1464,9 +1472,21 @@ impl UnitHub {
     /// Moves what settling queued under the hub lock into the owners' inboxes.
     /// Called with no lock held.
     fn flush_notices(&self) {
-        let batch = std::mem::take(&mut self.table().pending_notices);
+        let batch = {
+            let mut table = self.table();
+            let batch = std::mem::take(&mut table.pending_notices);
+            // Counted under the lock, so `join` never sees a notice in neither place.
+            self.notices_in_flight
+                .fetch_add(batch.len(), Ordering::SeqCst);
+            batch
+        };
+        let any = !batch.is_empty();
         for pending in batch {
             self.enqueue_notice(pending);
+            self.notices_in_flight.fetch_sub(1, Ordering::SeqCst);
+        }
+        if any {
+            self.settled.notify(usize::MAX);
         }
     }
 

@@ -435,6 +435,7 @@ fn start_session(
         plugin_rules: Arc::clone(&params.plugin_rules),
         project_config,
         local_tools,
+        wake_main: false,
     });
     let session_ref = handle.session_id.clone();
     start_event_pump(

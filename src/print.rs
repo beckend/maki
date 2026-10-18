@@ -10,7 +10,7 @@
 use std::io::{self, Read};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use clap::ValueEnum;
 use color_eyre::Result;
@@ -32,6 +32,18 @@ use maki_storage::id::SessionRef;
 use maki_storage::sessions::SessionClaim;
 use serde::Serialize;
 use serde_json::Value;
+
+/// Environment override of the join timeout in seconds, until `--join-timeout`
+/// lands (design phase 7b).
+const JOIN_TIMEOUT_ENV: &str = "MAKI_JOIN_TIMEOUT_SECS";
+const DEFAULT_JOIN_TIMEOUT: Duration = Duration::from_secs(600);
+
+fn join_timeout() -> Duration {
+    std::env::var(JOIN_TIMEOUT_ENV)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map_or(DEFAULT_JOIN_TIMEOUT, Duration::from_secs)
+}
 
 const SESSION_LINE_PREFIX: &str = "session: ";
 
@@ -207,6 +219,7 @@ pub fn run(params: PrintParams) -> Result<()> {
         eprintln!("MCP config error: {mcp_config_errors}");
     }
 
+    let runs_enabled = config.runs.enabled;
     let (handle, mut events) = maki_agent::headless::spawn(HeadlessParams {
         model: model.clone(),
         config,
@@ -225,6 +238,7 @@ pub fn run(params: PrintParams) -> Result<()> {
         model_policy,
         plugin_rules,
         project_config,
+        join_timeout: join_timeout(),
     });
 
     let HeadlessHandle {
@@ -263,6 +277,7 @@ pub fn run(params: PrintParams) -> Result<()> {
     // rate it paid.
     let mut cost = None;
     let mut stop_reason: Option<DoneReason> = None;
+    let mut turn_done = false;
 
     let snapshot = HeadlessSnapshot::default();
     snapshot.install(
@@ -297,6 +312,12 @@ pub fn run(params: PrintParams) -> Result<()> {
         match event {
             AgentEvent::TextDelta { text } => {
                 if parent_tool_use_id.is_none() {
+                    // A turn that follows a finished one (a run notice woke
+                    // the agent) replaces the earlier answer: stdout carries
+                    // the final one.
+                    if std::mem::take(&mut turn_done) {
+                        result_text.clear();
+                    }
                     result_text.push_str(text);
                 }
             }
@@ -390,7 +411,12 @@ pub fn run(params: PrintParams) -> Result<()> {
                 // summing the turns misses.
                 cost = (*dcost).or(cost);
                 stop_reason = Some(*reason);
-                break;
+                // With runs on, later turns can follow (wakes, the closing
+                // turn); the stream ends when the last one is over.
+                if !runs_enabled {
+                    break;
+                }
+                turn_done = true;
             }
             AgentEvent::Error { message, .. } => {
                 is_error = true;
