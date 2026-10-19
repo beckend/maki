@@ -60,3 +60,7 @@ With `--output-format stream-json` or `--verbose`, the output also holds one obj
 ```
 
 `--quiet-runs` silences the stderr lines only; the JSON objects stay. ACP does not print run lines: its notices arrive with the next prompt.
+
+## Plugins
+
+Lua plugins reach the same runs through [`maki.run`](/docs/lua-api/#maki-run) (`spawn`, `send`, `runs`, `wait`, `stop`, and `enabled` to check). With runs enabled, the bundled `task` tool starts a native one-shot agent instead of a Lua session, so its subagents count against `max_agents`, queue like any other agent, and show in `/runs`. With runs off, `task` works as before.

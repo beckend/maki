@@ -141,6 +141,14 @@ declare maki: {
       clear: @checked (slug: string) -> (boolean?, string?),
     },
   },
+  run: {
+    enabled: @checked (ctx: any) -> (boolean),
+    spawn: @checked (ctx: any, opts: any) -> (any, string?),
+    send: @checked (ctx: any, opts: any) -> (string?, string?),
+    runs: @checked (ctx: any, opts: any) -> (string?, string?),
+    wait: @checked (ctx: any, opts: any) -> (any, string?),
+    stop: @checked (ctx: any, opts: any) -> (string?, string?),
+  },
   session: {
     list: @checked () -> (any, string?),
     live: @checked () -> (any, string?),

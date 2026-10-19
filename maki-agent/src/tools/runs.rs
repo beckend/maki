@@ -40,6 +40,69 @@ pub const RUN_TOOL_NAMES: [&str; 5] = [
     STOP_TOOL_NAME,
 ];
 
+/// A run just started on behalf of a host (the Lua `maki.run.spawn`).
+pub struct HostSpawn {
+    pub handle: String,
+    pub name: String,
+    pub kind: &'static str,
+    pub state: String,
+    pub text: String,
+}
+
+fn host_runs(ctx: &ToolContext) -> Result<&RunsCtx, String> {
+    ctx.runs.as_ref().ok_or_else(|| NO_RUNTIME.to_owned())
+}
+
+fn host_input(which: Which, input: Value) -> Result<Value, String> {
+    validate(which.validator(), input).map_err(|e| e.to_string())
+}
+
+/// Whether native runs are available to this caller.
+pub fn host_enabled(ctx: &ToolContext) -> bool {
+    ctx.runs.is_some()
+}
+
+/// `spawn` for a host: the same validation and the same hub path as the tool.
+pub async fn host_spawn(ctx: &ToolContext, input: Value) -> Result<HostSpawn, String> {
+    let runs = host_runs(ctx)?;
+    let value = host_input(Which::Spawn, input)?;
+    let mut req: SpawnRequest = serde_json::from_value(value).map_err(|e| e.to_string())?;
+    req.origin_tool_use_id = ctx.tool_use_id.as_deref().map(Arc::from);
+    let ack = spawn_ack(runs, ctx, req).await?;
+    Ok(HostSpawn {
+        text: started_text(&ack),
+        handle: ack.handle.to_string(),
+        name: ack.name.to_string(),
+        kind: ack.kind.as_str(),
+        state: ack.state.label().to_owned(),
+    })
+}
+
+/// `wait` for a host: the settled views and whether the wait was satisfied.
+pub async fn host_wait(ctx: &ToolContext, input: Value) -> Result<(Vec<UnitView>, bool), String> {
+    let runs = host_runs(ctx)?;
+    let value = host_input(Which::Wait, input)?;
+    let args: WaitArgs = serde_json::from_value(value).map_err(|e| e.to_string())?;
+    engaged(runs);
+    wait_views(runs, &args, &ctx.cancel, ctx.tool_use_id.as_deref()).await
+}
+
+/// `send`, `runs` and `stop` for a host, answered with the text a model gets.
+pub async fn host_call(ctx: &ToolContext, name: &str, input: Value) -> Result<String, String> {
+    if !matches!(name, SEND_TOOL_NAME | RUNS_TOOL_NAME | STOP_TOOL_NAME) {
+        return Err(format!("not a run call: {name}"));
+    }
+    let tool = all()
+        .into_iter()
+        .find(|t| t.name() == name)
+        .ok_or_else(|| format!("unknown run call: {name}"))?;
+    let invocation = tool.parse(&input).map_err(|e| e.to_string())?;
+    match invocation.execute(ctx).await.output? {
+        ToolOutput::Plain(t) => Ok(t.text),
+        other => Err(format!("unexpected output: {other:?}")),
+    }
+}
+
 const PLAN_BLOCK: &str = "PLAN_MODE: only research agents may be spawned in plan mode";
 const NO_RUNS: &str = "no runs";
 const DEFAULT_WAIT_SECS: u64 = 60;
@@ -380,7 +443,11 @@ fn claim_of(views: &[&UnitView]) -> Claim {
     }
 }
 
-async fn spawn(runs: &RunsCtx, ctx: &ToolContext, req: SpawnRequest) -> Result<String, String> {
+async fn spawn_ack(
+    runs: &RunsCtx,
+    ctx: &ToolContext,
+    req: SpawnRequest,
+) -> Result<crate::runs::SpawnAck, String> {
     let agent_spec = if req.kind == RunKind::Agent {
         match req.clone().into_kind().map_err(|e| e.to_string())? {
             UnitKind::Agent(spec) => Some(spec),
@@ -405,16 +472,26 @@ async fn spawn(runs: &RunsCtx, ctx: &ToolContext, req: SpawnRequest) -> Result<S
         }
     }
     .map_err(|e| e.to_string())?;
+    Ok(ack)
+}
+
+fn started_text(ack: &crate::runs::SpawnAck) -> String {
     let mut state = ack.state.label().to_owned();
     if let Some((at, of)) = ack.queue_position {
         let _ = write!(state, ", position {at} of {of}");
     }
-    Ok(format!(
+    format!(
         "started {} \"{}\" ({}, {state})",
         ack.handle,
         ack.name,
         ack.kind.as_str()
-    ))
+    )
+}
+
+async fn spawn(runs: &RunsCtx, ctx: &ToolContext, req: SpawnRequest) -> Result<String, String> {
+    spawn_ack(runs, ctx, req)
+        .await
+        .map(|ack| started_text(&ack))
 }
 
 async fn send(runs: &RunsCtx, ctx: &ToolContext, args: SendArgs) -> Result<String, String> {
@@ -481,12 +558,12 @@ fn resolve_all(runs: &RunsCtx, keys: &[String]) -> Result<Vec<UnitId>, String> {
         .collect()
 }
 
-async fn wait(
+async fn wait_views(
     runs: &RunsCtx,
-    args: WaitArgs,
+    args: &WaitArgs,
     cancel: &CancelToken,
     tool_use_id: Option<&str>,
-) -> Result<String, String> {
+) -> Result<(Vec<UnitView>, bool), String> {
     let ids = resolve_all(runs, &args.ids)?;
     let mode = match args.mode.as_deref() {
         Some("any") => WaitMode::Any,
@@ -508,6 +585,17 @@ async fn wait(
     let reported: Vec<&UnitView> = views.iter().filter(|v| settled(v)).collect();
     runs.hub
         .claim(runs.self_run, tool_use_id, claim_of(&reported));
+    Ok((views, satisfied))
+}
+
+async fn wait(
+    runs: &RunsCtx,
+    args: WaitArgs,
+    cancel: &CancelToken,
+    tool_use_id: Option<&str>,
+) -> Result<String, String> {
+    let (views, satisfied) = wait_views(runs, &args, cancel, tool_use_id).await?;
+    let settled = |v: &UnitView| matches!(v.state, UnitState::Done(_) | UnitState::Idle);
     let mut out = String::new();
     for view in &views {
         if !out.is_empty() {
