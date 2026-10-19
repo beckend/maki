@@ -3027,6 +3027,81 @@ mod chaos {
         assert_eq!(settle(&rig, next.id).result.unwrap().summary, "fine");
     }
 
+    /// Twenty agents against `max_agents` 4: the rest queue, the pool never
+    /// holds more than four, every queued agent starts as a slot frees, and all
+    /// twenty complete.
+    #[test]
+    fn twenty_agent_fan_out_with_four_slots_queues_and_completes() {
+        const N: usize = 20;
+        const SLOTS: usize = 4;
+        let names: Vec<&'static str> = (0..N)
+            .map(|i| &*Box::leak(format!("FAN-{i:02}").into_boxed_str()))
+            .collect();
+        let mut gates = Vec::new();
+        let mut routes = Vec::new();
+        for name in &names {
+            let (tx, rx) = flume::unbounded::<()>();
+            gates.push(tx);
+            routes.push((*name, vec![Step::Gate(rx, reply(&format!("done {name}")))]));
+        }
+        let script = Script::new(routes);
+        let rig = rig_with(
+            &script,
+            UnitLimits {
+                max_agents: SLOTS as u8,
+                max_children_per_run: 30,
+                max_queue: 50,
+                spawn_per_minute: 100,
+                session_max_runs: 64,
+                ..UnitLimits::default()
+            },
+        );
+        let mut ids = Vec::new();
+        for name in &names {
+            let ack = spawn(&rig, name, json!({"one_shot": true}));
+            script.watch(name, &rig.hub, ack.id);
+            ids.push(ack.id);
+        }
+        let started = |n: usize| {
+            for _ in 0..50_000_000u64 {
+                if script.order().len() >= n {
+                    return;
+                }
+                std::thread::yield_now();
+            }
+            panic!("only {} of {n} agents started", script.order().len());
+        };
+        started(SLOTS);
+        // Give any wrongly admitted fifth agent a chance to show up.
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(script.order().len(), SLOTS, "queued agents ran early");
+        assert_eq!(rig.hub.slots_in_use(), SLOTS);
+        assert_eq!(rig.hub.table().pool.queued_len(), N - SLOTS);
+        let index_of = |route: &str| names.iter().position(|n| *n == route).unwrap();
+        // Finish them one at a time; each finish promotes exactly one.
+        for step in 0..N - SLOTS {
+            let route = script.order()[step].clone();
+            gates[index_of(&route)].send(()).unwrap();
+            started(SLOTS + step + 1);
+            assert!(rig.hub.slots_in_use() <= SLOTS);
+        }
+        for gate in &gates {
+            let _ = gate.send(());
+        }
+        for (id, name) in ids.iter().zip(&names) {
+            let view = settle(&rig, *id);
+            let UnitState::Done(term) = &view.state else {
+                panic!("{name} not done: {}", view.state.label());
+            };
+            assert_eq!(term.reason, DoneReason::Completed, "{name}");
+            assert_eq!(term.result.summary, format!("done {name}"));
+        }
+        assert_eq!(script.order().len(), N);
+        assert_eq!(rig.hub.slots_in_use(), 0);
+        assert_eq!(rig.hub.table().pool.queued_len(), 0);
+        script.assert_slots_held();
+    }
+
     #[test]
     fn runner_ignoring_cancel_is_force_settled_once() {
         let (release, blocked) = std::sync::mpsc::channel::<()>();
