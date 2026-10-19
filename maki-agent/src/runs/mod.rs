@@ -73,6 +73,9 @@ const NAME_MAX_LEN: usize = 32;
 const RESERVED_NAMES: [&str; 2] = ["main", "parent"];
 const FALLBACK_NAME: &str = "run";
 pub const DEFAULT_AGENT_TIMEOUT_SECS: u64 = 1800;
+/// How long `shutdown` waits for cancelled agents to write their end.
+const AGENT_SHUTDOWN_GRACE: Duration = Duration::from_millis(1500);
+
 pub const DEFAULT_SHELL_TIMEOUT_SECS: u64 = 3600;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -2592,7 +2595,37 @@ impl UnitHub {
         // The shells are dead and this process is about to be: say so, or the
         // next start would report them lost.
         self.journal_shells_killed(&open);
+        // Agents were cancelled above; let them write their own end before the
+        // mark, since any record after it voids it. A runner that does not
+        // react in time is settled `killed` here.
+        self.settle_agents_for_shutdown();
         self.journal_mark("clean_shutdown");
+    }
+
+    fn settle_agents_for_shutdown(&self) {
+        let open_agents = || -> Vec<UnitId> {
+            let table = self.units.lock().unwrap_or_else(|e| e.into_inner());
+            table
+                .agents
+                .keys()
+                .filter(|id| {
+                    table
+                        .units
+                        .get(id)
+                        .is_some_and(|u| !matches!(u.state, UnitState::Done(_)))
+                })
+                .copied()
+                .collect()
+        };
+        let deadline = std::time::Instant::now() + AGENT_SHUTDOWN_GRACE;
+        let mut open = open_agents();
+        while !open.is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+            open = open_agents();
+        }
+        for id in open {
+            self.force_settle(id);
+        }
     }
 }
 
