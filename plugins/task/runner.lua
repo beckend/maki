@@ -87,8 +87,16 @@ if opts.allow_background then
 end
 
 Runner.allow_background = opts.allow_background
+Runner.allow_model = opts.allow_model
 Runner.schema = schema
 Runner.semaphore = maki.async.semaphore(opts.max_concurrent)
+-- The native path in `init.lua` answers with the same wording, so the text
+-- lives in one place.
+Runner.errors = {
+  schema_root = SCHEMA_ROOT_ERROR,
+  structured_missing = STRUCTURED_MISSING_ERROR,
+  summary_missing = SUMMARY_MISSING_ERROR,
+}
 
 local function bounded_errors(errors)
   local out = {}

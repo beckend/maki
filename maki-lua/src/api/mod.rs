@@ -16,6 +16,7 @@ pub(crate) mod options;
 pub(crate) mod pack;
 pub(crate) mod plan;
 pub(crate) mod provider;
+pub(crate) mod run;
 pub(crate) mod session;
 pub(crate) mod slot;
 pub(crate) mod split;
@@ -136,6 +137,7 @@ pub(crate) fn create_maki_global(
         "task",
         task::create_task_table(lua, ui_action_tx.clone(), permissions)?,
     )?;
+    maki.set("run", run::create_run_table(lua, permissions)?)?;
     maki.set(
         "ui",
         ui::create_ui_table(lua, ui_action_tx.clone(), Arc::clone(&plugin), permissions)?,

@@ -140,6 +140,7 @@ The rules:
 | [`maki.session`](#maki-session) | Host session primitives. |
 | [`maki.Timer`](#maki-Timer) | Handle returned by `maki.defer_fn`. |
 | [`maki.task`](#maki-task) | The subagents of the focused session and their transcripts. |
+| [`maki.run`](#maki-run) | The native run hub: background agents and shell commands that outlive a |
 | [`maki.text`](#maki-text) | Text utilities: format conversion and the fuzzy matcher the built-in |
 | [`maki.treesitter`](#maki-treesitter) | Tree-sitter parsing and query API. |
 | [`maki.treesitter.language`](#maki-treesitter-language) | Language registry for tree-sitter grammars. |
@@ -5321,6 +5322,196 @@ plugin could stop work that is not its own.
 
 ```lua
 local _, err = maki.task.stop(task.id, { session = task.session })
+```
+
+
+## maki.run {#maki-run}
+
+The native run hub: background agents and shell commands that outlive a
+turn, the same runs the model's `spawn`, `send`, `runs`, `wait` and
+`stop` tools work on. Every function takes the tool handler's ctx and
+answers `(value, err)`. Runs are available when `[agent.runs] enabled`
+is true; without it every function but `enabled` returns an error.
+
+---
+
+### `maki.run.enabled()` {#maki-run-enabled}
+
+```lua
+maki.run.enabled({ctx})
+```
+
+Whether native runs are available to this tool call. They are when
+`[agent.runs] enabled` is true; a plugin that wants to fall back to its own
+way of running work (the bundled `task` plugin does) asks this first. True
+means `spawn`, `wait` and the rest can be used.
+
+**Parameters:**
+
+- `{ctx}` (`LuaCtx`) Agent context.
+
+**Returns:** boolean
+
+**Example:**
+
+```lua
+if maki.run.enabled(ctx) then
+  local run = maki.run.spawn(ctx, { kind = "shell", description = "tests", command = "make test" })
+end
+```
+
+---
+
+### `maki.run.spawn()` {#maki-run-spawn}
+
+```lua
+maki.run.spawn({ctx}, {opts})
+```
+
+Starts background work and returns at once, like the `spawn` tool. The
+fields are the tool's: `kind` (`"agent"` or `"shell"`) and `description` are
+required; `name`, `prompt`, `subagent_type`, `model_tier`, `thinking`,
+`output_schema`, `context`, `one_shot`, `command`, `cwd`, `timeout_secs`,
+`watch` and `notify` are optional. A run that cannot start now queues.
+Needs the `run` permission.
+
+Requires the `run` [plugin permission](#plugin-permissions).
+
+**Parameters:**
+
+- `{ctx}` (`LuaCtx`) Agent context.
+- `{opts}` (`table`) The spawn input.
+
+**Returns:** (`table?`, `string?`) `{ handle, name, kind, state, text }` for the new run, or
+  `(nil, err)` (limits, bad input, runs not enabled).
+
+**Example:**
+
+```lua
+local run, err = maki.run.spawn(ctx, {
+  kind = "agent",
+  description = "Find auth middleware",
+  prompt = "Search the codebase for auth middleware.",
+  subagent_type = "research",
+  one_shot = true,
+})
+if err then error(err) end
+print(run.handle, run.state)
+```
+
+---
+
+### `maki.run.send()` {#maki-run-send}
+
+```lua
+maki.run.send({ctx}, {opts})
+```
+
+Sends a message to a run (or `"parent"` / `"main"`), like the `send` tool.
+Fields: `to` and `message` (required), `mode` (`"steer"`, `"followup"` or
+`"quiet"`). Reaching a finished agent revives it. Needs the `agent` permission.
+
+Requires the `agent` [plugin permission](#plugin-permissions).
+
+**Parameters:**
+
+- `{ctx}` (`LuaCtx`) Agent context.
+- `{opts}` (`table`) The send input.
+
+**Returns:** (`string?`, `string?`) The delivery report, or `(nil, err)`.
+
+**Example:**
+
+```lua
+local out, err = maki.run.send(ctx, { to = "worker", message = "also check the tests" })
+```
+
+---
+
+### `maki.run.runs()` {#maki-run-runs}
+
+```lua
+maki.run.runs({ctx}, {opts?})
+```
+
+Lists runs or shows one, like the `runs` tool. Fields (all optional): `id`,
+`scope` (`"children"`, `"descendants"`, `"all"`), `full`, `tail`,
+`from_offset`, `include_finished`. Needs the `agent` permission.
+
+Requires the `agent` [plugin permission](#plugin-permissions).
+
+**Parameters:**
+
+- `{ctx}` (`LuaCtx`) Agent context.
+- `{opts?}` (`table?`) The runs input.
+
+**Returns:** (`string?`, `string?`) The listing as the tool prints it, or `(nil, err)`.
+
+**Example:**
+
+```lua
+print(maki.run.runs(ctx, { scope = "descendants" }))
+```
+
+---
+
+### `maki.run.wait()` {#maki-run-wait}
+
+```lua
+maki.run.wait({ctx}, {opts})
+```
+
+Waits for runs to settle, like the `wait` tool, and returns one table per
+run: `{ handle, name, kind, state, description, settled, done, reason?,
+detail?, exit_code?, summary?, truncated?, structured?, full_text_path? }`.
+`summary` is an agent's result or a shell's last output. Fields: `ids`
+(required), `mode` (`"all"` or `"any"`), `timeout_secs` (1 to 600). A wait
+that times out returns the runs as they stand (`settled` is false for those
+still going); a cancel of the calling task returns `(nil, err)` and leaves
+the runs running. Needs the `agent` permission.
+
+Requires the `agent` [plugin permission](#plugin-permissions).
+
+**Parameters:**
+
+- `{ctx}` (`LuaCtx`) Agent context.
+- `{opts}` (`table`) The wait input.
+
+**Returns:** (`table?`, `string?`) Array of run tables, or `(nil, err)`.
+
+**Example:**
+
+```lua
+local runs, err = maki.run.wait(ctx, { ids = { run.handle }, timeout_secs = 120 })
+if err then error(err) end
+print(runs[1].reason, runs[1].summary)
+```
+
+---
+
+### `maki.run.stop()` {#maki-run-stop}
+
+```lua
+maki.run.stop({ctx}, {opts})
+```
+
+Stops runs and what they started, like the `stop` tool. Fields: `ids`
+(required), `reason`, `detach`, `soft`, `wait_secs`. Needs the `agent`
+permission.
+
+Requires the `agent` [plugin permission](#plugin-permissions).
+
+**Parameters:**
+
+- `{ctx}` (`LuaCtx`) Agent context.
+- `{opts}` (`table`) The stop input.
+
+**Returns:** (`string?`, `string?`) The outcome per run, or `(nil, err)`.
+
+**Example:**
+
+```lua
+maki.run.stop(ctx, { ids = { run.handle } })
 ```
 
 
