@@ -3102,6 +3102,31 @@ mod chaos {
         script.assert_slots_held();
     }
 
+    /// Any journal record after the clean mark voids it, so a running agent
+    /// must have written its end before `shutdown` writes the mark.
+    #[test]
+    fn shutdown_writes_the_clean_mark_after_a_running_agent_ends() {
+        use maki_storage::runs::{JournalOptions, Replay, RunJournal};
+        let script = Script::new(vec![(CHILD, vec![Step::Hang])]);
+        let rig = rig(&script);
+        let dir = rig.dir.path().join("journal");
+        std::fs::create_dir_all(&dir).unwrap();
+        rig.hub.attach_journal(Arc::new(
+            RunJournal::open_in(dir.clone(), JournalOptions::default()).unwrap(),
+        ));
+        let ack = spawn(&rig, CHILD, json!({}));
+        await_requests(&script, CHILD, 1);
+        rig.hub.shutdown();
+        let replay = Replay::read(&dir);
+        assert!(replay.clean_mark, "a record followed the mark");
+        let run = replay
+            .runs
+            .iter()
+            .find(|r| r.spawn.handle == ack.handle.to_string())
+            .expect("the agent is in the journal");
+        assert_eq!(run.term.as_ref().unwrap().reason, "killed");
+    }
+
     #[test]
     fn runner_ignoring_cancel_is_force_settled_once() {
         let (release, blocked) = std::sync::mpsc::channel::<()>();
