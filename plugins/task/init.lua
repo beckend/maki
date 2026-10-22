@@ -47,6 +47,8 @@ Notes:
 2. The agent's result is not visible to the user. Summarize it in your response.
 3. Each invocation starts fresh - inline any needed context into the prompt.
 4. Tell it to return concise summaries with file:line refs, not full file contents.
+5. A subagent runs until it is done; it is stopped at its time limit and then reports
+   only partial output. The limit is the session maximum unless you set timeout_secs.
 ]]
 
 local opts = maki.api.register_options({
@@ -84,6 +86,11 @@ local schema = {
     output_schema = {
       type = "object",
       description = "JSON Schema (object) the subagent's final result must match. When set, the result is returned as a validated JSON string.",
+    },
+    timeout_secs = {
+      type = "integer",
+      minimum = 0,
+      description = "Wall clock limit for the subagent, in seconds. 0 (the default) asks for the session maximum, so a long task is not cut off. A subagent that hits its limit is stopped and reports only partial output.",
     },
   },
 }
@@ -133,6 +140,18 @@ local function delegate(input, ctx, subagent_type)
   if thinking ~= nil and type(thinking) ~= "string" then
     thinking = tostring(thinking)
   end
+  -- 0 asks the hub for the session maximum. The default agent timeout is
+  -- 30 minutes, and a subagent that hits it stops with only partial output,
+  -- so a task the model knows to be long must not inherit that cap silently.
+  local timeout_secs = input.timeout_secs
+  if timeout_secs ~= nil then
+    timeout_secs = math.floor(tonumber(timeout_secs) or 0)
+    if timeout_secs < 0 then
+      timeout_secs = 0
+    end
+  else
+    timeout_secs = 0
+  end
   local run, err = maki.run.spawn(ctx, {
     kind = "agent",
     description = input.description,
@@ -143,6 +162,7 @@ local function delegate(input, ctx, subagent_type)
     output_schema = output_schema,
     one_shot = true,
     notify = "never",
+    timeout_secs = timeout_secs,
   })
   if err then
     return { llm_output = "sub-agent error: " .. err, is_error = true }

@@ -135,8 +135,8 @@
         "type": "string"
       },
       "timeout_secs": {
-        "description": "Wall clock limit. Default: 1800 for agents, 3600 for shell. Expiry ends the run as timed_out.",
-        "minimum": 1,
+        "description": "Wall clock limit. Default: 1800 for agents, 3600 for shell. 0 asks for the session maximum, so a long task is not cut off at the default. Expiry ends the run as timed_out.",
+        "minimum": 0,
         "type": "integer"
       },
       "watch": {
