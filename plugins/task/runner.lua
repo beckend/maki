@@ -67,6 +67,11 @@ local schema = {
       type = "object",
       description = "JSON Schema (object) the subagent's final result must match. When set, the result is returned as a validated JSON string.",
     },
+    timeout_secs = {
+      type = "integer",
+      minimum = 0,
+      description = "Wall clock limit for the subagent, in seconds. 0 (the default) asks for the session maximum, so a long task is not cut off. A subagent that hits its limit is stopped and reports only partial output.",
+    },
   },
 }
 

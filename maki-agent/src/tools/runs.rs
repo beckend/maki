@@ -120,7 +120,8 @@ in one message. Use `wait` only when you are blocked on a result, `send` to talk
 run, `stop` to end it, `runs` to look. Only a limited number of agents work at once;
 the rest show as queued with a position and start in order. A full queue returns
 QUEUE_FULL: wait for runs to finish. A timeout_secs above the session maximum is
-lowered to it, and an agent's clock starts when it starts working. Not available to agents at the maximum depth: you
+lowered to it, and timeout_secs 0 asks for that maximum outright, so a long task is
+not cut off at the default. An agent's clock starts when it starts working. Not available to agents at the maximum depth: you
 get DEPTH_LIMIT and must do the work yourself.
 
 Agent runs do not see this conversation, so the prompt must contain everything they
@@ -250,7 +251,7 @@ impl Which {
                     "one_shot": {"type": "boolean", "description": "agent only. Complete after the first result instead of staying available. Default false."},
                     "command": {"type": "string", "description": "shell only. Command line run with the user's shell."},
                     "cwd": {"type": "string"},
-                    "timeout_secs": {"type": "integer", "minimum": 1, "description": "Wall clock limit. Default: 1800 for agents, 3600 for shell. Expiry ends the run as timed_out."},
+                    "timeout_secs": {"type": "integer", "minimum": 0, "description": "Wall clock limit. Default: 1800 for agents, 3600 for shell. 0 asks for the session maximum, so a long task is not cut off at the default. Expiry ends the run as timed_out."},
                     "watch": {"type": "string", "description": "shell only. Regex (Rust syntax) matched against each stdout/stderr line; matches become notices, at most 1 per second (lines in between are batched) and 20 per minute, then one overflow notice. Wakes you only with notify=wake. A bad regex is rejected."},
                     "notify": {"type": "string", "enum": ["wake", "quiet", "never"], "description": "On finish: wake starts a turn if you are idle (default), quiet waits for your next turn, never sends nothing (read with runs)."}
                 }

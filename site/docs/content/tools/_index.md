@@ -177,6 +177,7 @@ Launch an autonomous subagent to perform tasks independently. Best combined with
 | `prompt` | string | yes | Detailed task prompt for the agent |
 | `subagent_type` | string | no | Subagent type: "research" (read-only, default) or "general" (can modify files) |
 | `thinking` | any | no | Thinking: off\|adaptive\|minimal\|low\|medium\|high\|xhigh\|max\|int budget. Omit to inherit parent; capped at parent. |
+| `timeout_secs` | integer | no | Wall clock limit for the subagent, in seconds. 0 (the default) asks for the session maximum, so a long task is not cut off. A subagent that hits its limit is stopped and reports only partial output. |
 
 ### `todo_write` {#todo_write}
 
@@ -217,7 +218,8 @@ in one message. Use `wait` only when you are blocked on a result, `send` to talk
 run, `stop` to end it, `runs` to look. Only a limited number of agents work at once;
 the rest show as queued with a position and start in order. A full queue returns
 QUEUE_FULL: wait for runs to finish. A timeout_secs above the session maximum is
-lowered to it, and an agent's clock starts when it starts working. Not available to agents at the maximum depth: you
+lowered to it, and timeout_secs 0 asks for that maximum outright, so a long task is
+not cut off at the default. An agent's clock starts when it starts working. Not available to agents at the maximum depth: you
 get DEPTH_LIMIT and must do the work yourself.
 
 | Parameter | Type | Required | Default | Description |
@@ -235,7 +237,7 @@ get DEPTH_LIMIT and must do the work yourself.
 | `prompt` | string | no |  | agent only. The complete, self-contained task. |
 | `subagent_type` | string | no |  | agent only. research is read-only; general can edit. Default general. |
 | `thinking` | string | no |  |  |
-| `timeout_secs` | integer | no |  | Wall clock limit. Default: 1800 for agents, 3600 for shell. Expiry ends the run as timed_out. |
+| `timeout_secs` | integer | no |  | Wall clock limit. Default: 1800 for agents, 3600 for shell. 0 asks for the session maximum, so a long task is not cut off at the default. Expiry ends the run as timed_out. |
 | `watch` | string | no |  | shell only. Regex (Rust syntax) matched against each stdout/stderr line; matches become notices, at most 1 per second (lines in between are batched) and 20 per minute, then one overflow notice. Wakes you only with notify=wake. A bad regex is rejected. |
 
 ### `send` <span class="badge badge-optin">opt-in</span> {#send}

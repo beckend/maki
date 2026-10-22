@@ -1026,6 +1026,10 @@ mod delegated {
     }
 
     fn setup_with(provider: MockProvider) -> Setup {
+        setup_with_limits(provider, UnitLimits::default())
+    }
+
+    fn setup_with_limits(provider: MockProvider, limits: UnitLimits) -> Setup {
         let dir = tempfile::tempdir().unwrap();
         let reg = Arc::new(ToolRegistry::new());
         let host = PluginHost::new(Arc::clone(&reg)).unwrap();
@@ -1042,7 +1046,7 @@ mod delegated {
         .unwrap();
         let (tx, _rx) = flume::unbounded();
         let hub = UnitHub::with_shell_options(
-            UnitLimits::default(),
+            limits,
             EventSender::new(tx, 0),
             Arc::new(SystemClock),
             ShellOptions {
@@ -1111,6 +1115,50 @@ mod delegated {
                 "{needed}"
             );
         }
+    }
+
+    /// The delegated subagent must not inherit the hub's default agent
+    /// timeout: the task tool asks for the session maximum, so a task the
+    /// model knows to be long keeps running instead of being cut off with
+    /// partial output.
+    #[test]
+    fn the_delegated_task_asks_for_the_session_maximum() {
+        let s = setup_with_limits(
+            MockProvider::new(vec![reply(ANSWER)]),
+            UnitLimits {
+                default_timeout: std::time::Duration::from_secs(1800),
+                max_timeout: std::time::Duration::from_secs(7200),
+                ..UnitLimits::default()
+            },
+        );
+        run_task(&s, json!({"description": "x", "prompt": "y"})).unwrap();
+        let views = s.hub.list(s.hub.main(), maki_agent::runs::Scope::All);
+        assert_eq!(views.len(), 1);
+        assert_eq!(
+            views[0].timeout_secs, 7200,
+            "the subagent must get the session maximum, not the 1800s default"
+        );
+    }
+
+    /// The model can still cap a subagent it expects to overrun.
+    #[test]
+    fn the_delegated_task_takes_a_timeout_from_the_caller() {
+        let s = setup_with_limits(
+            MockProvider::new(vec![reply(ANSWER)]),
+            UnitLimits {
+                default_timeout: std::time::Duration::from_secs(1800),
+                max_timeout: std::time::Duration::from_secs(7200),
+                ..UnitLimits::default()
+            },
+        );
+        run_task(
+            &s,
+            json!({"description": "x", "prompt": "y", "timeout_secs": 600}),
+        )
+        .unwrap();
+        let views = s.hub.list(s.hub.main(), maki_agent::runs::Scope::All);
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].timeout_secs, 600);
     }
 
     #[test]

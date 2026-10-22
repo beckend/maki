@@ -556,6 +556,9 @@ pub struct UnitView {
     pub settle_gen: u64,
     /// 1-based position and queue length while waiting for an agent slot.
     pub queue: Option<(usize, usize)>,
+    /// The wall clock limit this run got, in seconds. It starts counting
+    /// when the run starts working, not while it queues.
+    pub timeout_secs: u64,
 }
 
 impl UnitView {
@@ -822,6 +825,10 @@ impl UnitTable {
             },
             settle_gen: self.settle_gen.get(&id).copied().unwrap_or(0),
             queue: self.pool.position(id),
+            timeout_secs: match &unit.kind {
+                UnitKind::Agent(s) => s.timeout_secs,
+                UnitKind::Shell(s) => s.timeout_secs,
+            },
         }
     }
 }
@@ -1007,11 +1014,16 @@ impl UnitHub {
         } else {
             DEFAULT_SHELL_TIMEOUT_SECS
         };
-        req.timeout_secs = Some(
-            req.timeout_secs
-                .unwrap_or(default_timeout)
-                .clamp(1, self.limits.max_timeout.as_secs().max(1)),
-        );
+        // `0` asks for the longest run the session allows: the ceiling itself,
+        // not the default. A caller that knows its task is long says so
+        // instead of being cut off at `default_timeout` with its work lost.
+        let ceiling = self.limits.max_timeout.as_secs().max(1);
+        let asked = match req.timeout_secs {
+            Some(0) => ceiling,
+            Some(secs) => secs.clamp(1, ceiling),
+            None => default_timeout.clamp(1, ceiling),
+        };
+        req.timeout_secs = Some(asked);
         let kind = req.into_kind()?;
         let mut table = self.table();
         let caller_depth = self.depth_of(&table, caller)?;
@@ -2906,6 +2918,55 @@ mod tests {
         assert_eq!(hub.resolve(main, &child.id.id().to_string()), Ok(child.id));
         assert_eq!(hub.resolve(main, "parent"), Err(UnitError::UnknownRun));
         assert_eq!(hub.resolve(main, "nope"), Err(UnitError::UnknownRun));
+    }
+
+    /// The timeout a run gets. `0` asks for the session maximum, so a caller
+    /// that knows its task is long is not cut off at `default_timeout`.
+    fn timeout_of(hub: &UnitHub, id: UnitId) -> u64 {
+        let table = hub.table();
+        let unit = table.units.get(&id).expect("the unit is in the table");
+        match &unit.kind {
+            UnitKind::Agent(spec) => spec.timeout_secs,
+            UnitKind::Shell(spec) => spec.timeout_secs,
+        }
+    }
+
+    #[test]
+    fn a_zero_timeout_asks_for_the_session_maximum() {
+        let hub = hub_with(UnitLimits {
+            default_timeout: Duration::from_secs(1800),
+            max_timeout: Duration::from_secs(3600),
+            ..UnitLimits::default()
+        });
+        let main = hub.main();
+
+        let mut zero = request(RunKind::Agent, "long");
+        zero.timeout_secs = Some(0);
+        let ack = hub.spawn(main, zero).unwrap();
+        assert_eq!(timeout_of(&hub, ack.id), 3600);
+
+        // A number is still honoured, and one above the ceiling is lowered.
+        let mut asked = request(RunKind::Agent, "shorter");
+        asked.timeout_secs = Some(600);
+        let ack = hub.spawn(main, asked).unwrap();
+        assert_eq!(timeout_of(&hub, ack.id), 600);
+
+        let mut over = request(RunKind::Agent, "too long");
+        over.timeout_secs = Some(99_999);
+        let ack = hub.spawn(main, over).unwrap();
+        assert_eq!(timeout_of(&hub, ack.id), 3600);
+    }
+
+    #[test]
+    fn an_agent_without_a_timeout_gets_the_default() {
+        let hub = hub_with(UnitLimits {
+            default_timeout: Duration::from_secs(1800),
+            max_timeout: Duration::from_secs(3600),
+            ..UnitLimits::default()
+        });
+        let main = hub.main();
+        let ack = hub.spawn(main, request(RunKind::Agent, "plain")).unwrap();
+        assert_eq!(timeout_of(&hub, ack.id), 1800);
     }
 
     #[test]
