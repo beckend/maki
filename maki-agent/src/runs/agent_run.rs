@@ -116,13 +116,14 @@ impl Provider for Script {
                 .iter()
                 .map(|m| serde_json::to_value(m).unwrap())
                 .collect();
-            // The prompt, not a context update the host put ahead of it.
+            // The prompt, not a context update the host put ahead of it. The
+            // tag is a bare string now; older logs nested it.
             let first = values
                 .iter()
-                .find(|m| {
-                    m.get("kind")
-                        .and_then(|k| k.get("context_update"))
-                        .is_none()
+                .find(|m| match m.get("kind") {
+                    Some(Value::String(tag)) => tag != "context_update",
+                    Some(other) => other.get("context_update").is_none(),
+                    None => true,
                 })
                 .map(Value::to_string)
                 .unwrap_or_default();

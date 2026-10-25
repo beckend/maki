@@ -13,7 +13,7 @@ use mlua::{LuaSerdeExt, MultiValue, UserData, UserDataMethods, Value as LuaValue
 
 use crate::api::tool::ToolCallReply;
 use crate::api::ui::buf::BufHandle;
-use crate::api::util::convert::json_to_lua;
+use crate::api::util::convert::{TableExt, json_to_lua};
 use crate::api::util::pair::Pair;
 use crate::runtime::{RestoreReason, active_task, lock_cell};
 
@@ -392,7 +392,7 @@ impl UserData for LuaCtx {
                     return Ok((None, Some("runs are not enabled".to_owned())));
                 };
                 let command: String = opts.get("command")?;
-                let output: String = opts.get::<Option<String>>("output")?.unwrap_or_default();
+                let output: String = opts.opt::<String>("output")?.unwrap_or_default();
                 let label: String = command
                     .lines()
                     .next()

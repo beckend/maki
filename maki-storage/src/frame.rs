@@ -351,9 +351,10 @@ mod tests {
     #[test]
     fn facts_at_start_plan_none() {
         let frame = StoredFrame {
-            system: "s".into(),
+            system: Some("s".into()),
             fingerprint: "f".into(),
             facts: Some(prompt()),
+            inherited: FactsUpdate::default(),
             mcp_tools: Vec::new(),
         };
         let start = frame.facts_at_start();

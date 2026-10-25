@@ -853,7 +853,7 @@ mod tests {
     /// or acts on the process. A new builtin lands outside this list, so
     /// opening one is a decision someone writes down here, never a default.
     const OPEN_TO_PLUGINS: &[&str] = &[
-        "/help", "/usage", "/queue", "/theme", "/mcp", "/login", "/exit", "/reload",
+        "/help", "/usage", "/queue", "/theme", "/mcp", "/runs", "/stop", "/login", "/exit", "/reload",
     ];
 
     #[test]

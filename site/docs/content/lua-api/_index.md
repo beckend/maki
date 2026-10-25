@@ -1789,6 +1789,20 @@ later notify answers `session not live`.
 
 ---
 
+### `Session:id()` {#Session-id}
+
+```lua
+Session:id()
+```
+
+The task id of this session. A session opened by chat session id goes by
+this id in `maki.task.list()` and the `"TaskStopped"` event, so a plugin
+can tell which of those are its own.
+
+**Returns:** (`string`) Session task id.
+
+---
+
 ### `Session:prompt()` {#Session-prompt}
 
 ```lua
@@ -1841,20 +1855,6 @@ the VM sits idle, and the subagent's event relay stays alive until it does.
 
 Close cancels a running prompt before waiting to flush its history. That
 prompt returns a cancelled error and any partial text.
-
----
-
-### `Session:id()` {#Session-id}
-
-```lua
-Session:id()
-```
-
-The task id of this session. A session opened by chat session id goes by
-this id in `maki.task.list()` and the `"TaskStopped"` event, so a plugin
-can tell which of those are its own.
-
-**Returns:** (`string`) Session task id.
 
 
 ## maki.async {#maki-async}

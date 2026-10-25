@@ -2296,7 +2296,7 @@ mod tests {
     }
 
     fn notify(id: MakiId) -> Result<(), MailboxError> {
-        SessionMailbox::notify(id, DELIVERED.into(), false)
+        SessionMailbox::notify(id, DELIVERED.into(), None, false)
     }
 
     /// A prompt cut short leaves its run's `Done` unread. The next prompt must

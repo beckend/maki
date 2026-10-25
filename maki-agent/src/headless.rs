@@ -26,7 +26,7 @@ use crate::types::EventSender;
 use crate::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentMode, AgentParams, DoneReason,
     EventStreamGuard, ImageSource, InputSource, McpHandle, McpSession, PermissionsConfig,
-    RunLedger, SessionEvents, SessionMailbox, ToolDeferral, ToolOutputLines, event_stream,
+    SessionEvents, SessionMailbox, ToolDeferral, ToolOutputLines, event_stream,
 };
 
 /// Closing turns in a row that may be needed to drain quiet items.

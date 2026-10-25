@@ -31,7 +31,6 @@ function M.cut(view, out, reason, timeout_secs)
   }
 end
 
-
 local PROMOTED_FMT = "[timed out after %ds; still running as %s, use wait or runs to follow it; %s]"
 
 --- Like `cut` for a timed-out command that was handed to the run hub instead
