@@ -615,7 +615,7 @@ impl UserData for LuaCtx {
                     return Ok((None, Some("runs are not enabled".to_owned())));
                 };
                 let command: String = opts.get("command")?;
-                let output: String = opts.get::<Option<String>>("output")?.unwrap_or_default();
+                let output: String = opts.opt::<String>("output")?.unwrap_or_default();
                 let label: String = command
                     .lines()
                     .next()

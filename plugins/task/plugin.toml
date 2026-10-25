@@ -3,7 +3,6 @@ fs_read = true
 fs_write = true
 net = true
 run = true
-agent = true
 env = true
 agent = true
 session_read = true

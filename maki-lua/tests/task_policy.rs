@@ -76,6 +76,37 @@ const SCENARIO_PARKED_SECOND: &str = "parked_second";
 const SCENARIO_SESSION_ERROR: &str = "session_error";
 const SCENARIO_OPEN_PARKED: &str = "open_parked";
 
+/// The stub tool the background path waits on. The native run tools reserve
+/// the name, so the suite that loads both leaves it out.
+const WAIT_STUB: &str = r#"
+maki.api.register_tool({
+  name = "wait",
+  description = "wait until a step is parked and enough acquires and notices happened",
+  schema = {
+    type = "object",
+    properties = {
+      parked = { type = "string" },
+      acquires = { type = "integer" },
+      notices = { type = "integer" },
+    },
+  },
+  audiences = { "main" },
+  handler = function(input)
+    local function ready()
+      return (not input.parked or parked[input.parked] ~= nil)
+        and recorder.acquire_attempts >= (input.acquires or 0)
+        and #recorder.notices >= (input.notices or 0)
+    end
+    while not ready() do
+      maki.async.await(1, function(done)
+        waiters[#waiters + 1] = done
+      end)
+    end
+    return "ready"
+  end,
+})
+"#;
+
 /// Stubs keyed by `opts.name` (the task's `description`). `maki.json` and
 /// `maki.async` stay real so schema validation and semaphore behavior are tested.
 const STUB_PRELUDE: &str = r#"
@@ -255,32 +286,7 @@ maki.session.notify = function(text, opts)
   return true
 end
 
-maki.api.register_tool({
-  name = "wait",
-  description = "wait until a step is parked and enough acquires and notices happened",
-  schema = {
-    type = "object",
-    properties = {
-      parked = { type = "string" },
-      acquires = { type = "integer" },
-      notices = { type = "integer" },
-    },
-  },
-  audiences = { "main" },
-  handler = function(input)
-    local function ready()
-      return (not input.parked or parked[input.parked] ~= nil)
-        and recorder.acquire_attempts >= (input.acquires or 0)
-        and #recorder.notices >= (input.notices or 0)
-    end
-    while not ready() do
-      maki.async.await(1, function(done)
-        waiters[#waiters + 1] = done
-      end)
-    end
-    return "ready"
-  end,
-})
+@WAIT_STUB@
 
 maki.api.register_tool({
   name = "release",
@@ -354,6 +360,7 @@ fn load_task_host_in(
 ) -> (Arc<ToolRegistry>, PluginHost) {
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     let prelude = STUB_PRELUDE
+        .replace("@WAIT_STUB@", "")
         .replace("@PLAIN_TEXT@", PLAIN_TEXT)
         .replace("@RECOVERED_TEXT@", RECOVERED_TEXT)
         .replace("@PROMPT_ERR@", PROMPT_ERR_MSG)
