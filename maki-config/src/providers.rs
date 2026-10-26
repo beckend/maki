@@ -466,8 +466,12 @@ impl ProvidersConfig {
 /// this path so `save` cannot leave a second copy behind in the other dir.
 fn providers_file_path() -> PathBuf {
     paths::find_config_path(PROVIDERS_FILE).unwrap_or_else(|| {
-        paths::config_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
+        // The dir follows the environment, not the path the process cached at
+        // startup: a test that moves `XDG_CONFIG_HOME` must not write into
+        // the config it was moved away from.
+        paths::xdg_config_dir_live()
+            .or_else(|| paths::config_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("."))
             .join(PROVIDERS_FILE)
     })
 }

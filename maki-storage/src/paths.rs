@@ -404,6 +404,17 @@ pub fn home() -> Option<PathBuf> {
     etcetera::home_dir().ok()
 }
 
+/// The config dir as the environment says now, not as it said when the
+/// process started. A session never moves it; a test does, and a config
+/// write that ignored that would land in the user's own config.
+pub fn xdg_config_dir_live() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| home().map(|home| home.join(".config")))?;
+    Some(base.join(APP_NAME))
+}
+
 /// `path` as a user would type it, with the home directory as `~`.
 pub fn tilde(path: &Path) -> String {
     match home().and_then(|home| path.strip_prefix(home).ok().map(Path::to_path_buf)) {
@@ -426,7 +437,7 @@ pub fn legacy_home_dir() -> Option<PathBuf> {
 /// that directory exists, so anything that reads it alone goes blind to
 /// `~/.config/maki`, which is where the docs tell people to put their files.
 pub fn config_search_dirs() -> Vec<PathBuf> {
-    config_search_dirs_from(home().as_deref(), xdg_config_dir().ok().as_deref())
+    config_search_dirs_from(home().as_deref(), xdg_config_dir_live().as_deref())
 }
 
 pub fn find_config_path(name: &str) -> Option<PathBuf> {
