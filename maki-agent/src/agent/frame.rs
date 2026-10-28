@@ -128,13 +128,20 @@ fn hint_facts(slots: &ResolvedPrompts) -> BTreeMap<String, String> {
 }
 
 /// Hashes what no update can describe: the base tools, the MCP deferral mode
-/// (it shapes every MCP entry) and the host's own prompt text. The hash is the
-/// same in every process, so a resumed session can tell if its frame still fits.
+/// (it shapes every MCP entry), the host's own prompt text and the build the
+/// prompt states. The hash is the same in every process, so a resumed session
+/// can tell if its frame still fits.
 pub(crate) fn fingerprint(context: &RunContext, mcp: Option<&McpSession>, model: &Model) -> String {
     let mut hasher = Sha256::new();
     hasher.update(context.tools.definitions().to_string());
     hasher.update([0]);
     hasher.update(&context.authored);
+    // The prompt states the build, and no update corrects it: a session
+    // resumed after an upgrade must not keep a frame that names the old one.
+    if let Some(version) = stated_version(&context.system) {
+        hasher.update([0]);
+        hasher.update(version);
+    }
     if mcp.is_some() {
         hasher.update([0]);
         hasher.update(format!("{:?}", ToolDeferral::for_model(model)));
@@ -143,6 +150,14 @@ pub(crate) fn fingerprint(context: &RunContext, mcp: Option<&McpSession>, model:
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect()
+}
+
+/// The build the prompt states, if it states one. A prompt the host wrote
+/// itself is hashed whole, so it needs no separate look.
+fn stated_version(system: &str) -> Option<&str> {
+    system
+        .lines()
+        .find_map(|line| line.strip_prefix("- Maki version: "))
 }
 
 /// The in-memory half of a frame. The first run of a process rebuilds it from
@@ -484,6 +499,28 @@ mod tests {
             fingerprint(&context("a", ""), Some(&mcp), &native),
             fingerprint(&context("a", ""), Some(&mcp), &model(CLIENT_MODEL)),
             "a model without tool search shapes the MCP entries another way"
+        );
+    }
+
+    /// The prompt states the build, and nothing corrects it, so a frame that
+    /// names another build does not fit the one running it.
+    #[test]
+    fn fingerprint_tracks_the_stated_build() {
+        let native = model(NATIVE_MODEL);
+        let base = context("a", "");
+        let mut other = context("a", "");
+        other.system = "Environment:\n- Maki version: 9.9.9-fork\n".to_owned();
+        assert_ne!(
+            fingerprint(&base, None, &native),
+            fingerprint(&other, None, &native),
+            "a session resumed after an upgrade must not keep the frame of the old build"
+        );
+        let mut dated = context("a", "");
+        dated.system = "Environment:\n- Maki version: 9.9.9-fork\n- Date: 2026-01-01\n".to_owned();
+        assert_ne!(
+            fingerprint(&base, None, &native),
+            fingerprint(&dated, None, &native),
+            "the date is a fact an update carries, but the build is not"
         );
     }
 
