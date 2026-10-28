@@ -87,6 +87,108 @@ local examples = {
 
 --- Input normalization (pure) ---------------------------------------------
 
+-- The names a model uses for the child's arguments when it does not use the
+-- documented one. The description's flat form calls them "params", so a
+-- model that reads it that way nests them under that name.
+local WRAPPER_NAMES = {
+  params = true,
+  arguments = true,
+  input = true,
+}
+
+-- The child's own schema says which keys it takes. A model that puts the
+-- arguments under a name the child does not declare wrote a wrapper, not a
+-- parameter. A child that declares the key owns it, so its own parameter is
+-- never a wrapper.
+local function declared_params(tool)
+  local t = maki.api.get_tool(tool)
+  local schema = t and t.schema
+  local props = schema and schema.properties
+  if type(props) ~= "table" then
+    return nil
+  end
+  return props
+end
+
+-- A table holds arguments, not a list of them: an array is a flat
+-- parameter's value, and an empty table is an empty argument set.
+local function holds_arguments(value)
+  if type(value) ~= "table" then
+    return false
+  end
+  local count = 0
+  for k in pairs(value) do
+    count = count + 1
+    if type(k) == "string" then
+      return true
+    end
+  end
+  return count == 0
+end
+
+-- The one key that carries the child's arguments, if there is exactly one.
+-- A child whose schema is unknown keeps its own shape: without the list of
+-- its parameters there is nothing to tell a wrapper from a parameter.
+local function nested_candidate(tool, rest)
+  local declared = declared_params(tool)
+  local candidate, candidate_key
+  for k, v in pairs(rest) do
+    local wrapper = false
+    if holds_arguments(v) then
+      if declared == nil then
+        wrapper = WRAPPER_NAMES[k] == true
+      elseif declared[k] == nil then
+        wrapper = true
+      end
+    end
+    if wrapper then
+      if candidate then
+        return nil
+      end
+      candidate, candidate_key = v, k
+    end
+  end
+  return candidate, candidate_key
+end
+
+-- A table holds a list when every key is a number, and an object otherwise.
+local function is_list(value)
+  local count = 0
+  for k in pairs(value) do
+    if type(k) ~= "number" then
+      return false
+    end
+    count = count + 1
+  end
+  return count > 0
+end
+
+-- A provider that cannot type a nested value sends an array as a one-item
+-- wrapper: many elements as {"item": [...]}, one element as {"item": x}. The
+-- wrapper stands for the array, so a lone element becomes a one-element
+-- array. The tool's own schema unwraps it too, but a tool that takes an
+-- open object keeps whatever it is handed, so it is unwrapped here.
+local function unwrap_one_item(value)
+  if type(value) ~= "table" then
+    return value
+  end
+  local key, inner, count = nil, nil, 0
+  for k, v in pairs(value) do
+    count = count + 1
+    if count > 1 then
+      return value
+    end
+    key, inner = k, v
+  end
+  if key ~= "item" then
+    return value
+  end
+  if type(inner) == "table" and (is_list(inner) or next(inner) == nil) then
+    return inner
+  end
+  return { inner }
+end
+
 -- Models send entries in two shapes, { tool, parameters } and flat
 -- { tool, ...params }, so accept either, or even both merged, as long
 -- as no key appears twice.
@@ -110,6 +212,14 @@ local function normalize_entry(entry)
     end
   end
   local nested = entry.parameters
+  if nested == nil then
+    local candidate, candidate_key = nested_candidate(tool, rest)
+    if candidate then
+      nested = candidate
+      rest[candidate_key] = nil
+      has_rest = next(rest) ~= nil
+    end
+  end
   local params
   if nested == nil then
     if not has_rest then
@@ -121,7 +231,10 @@ local function normalize_entry(entry)
   elseif type(nested) ~= "table" then
     return nil, "'parameters' must be an object when flat fields are also present"
   else
-    params = rest
+    params = {}
+    for k, v in pairs(rest) do
+      params[k] = v
+    end
     for k, v in pairs(nested) do
       if params[k] ~= nil then
         return nil, "duplicate parameter '" .. k .. "' in both 'parameters' and flat fields"
@@ -129,7 +242,11 @@ local function normalize_entry(entry)
       params[k] = v
     end
   end
-  return { tool = tool, params = params }
+  local unwrapped = {}
+  for k, v in pairs(params) do
+    unwrapped[k] = unwrap_one_item(v)
+  end
+  return { tool = tool, params = unwrapped }
 end
 
 --- Child presentation ------------------------------------------------------

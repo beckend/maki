@@ -105,6 +105,8 @@ maki.agent.call_tool = function(ctx, name, input, opts)
     return "released_done"
   elseif name == "boom" then
     return nil, "@BOOM_ERR@"
+  elseif name == "withparams" then
+    return "withparams:" .. tostring((input.params or {}).x or "?")
   elseif name:find("^parkjob") then
     -- Parks in an await that ignores the token, like a real child tool
     -- waiting on a request. Any `parkjob*` name parks, so a test can give
@@ -130,6 +132,14 @@ maki.api.register_tool({
   handler = function(input, ctx)
     return (maki.json.encode(recorder))
   end,
+})
+
+maki.api.register_tool({
+  name = "withparams",
+  description = "child that takes a parameter named params",
+  schema = { type = "object", properties = { params = { type = "object" } }, additionalProperties = false },
+  audiences = { "main" },
+  handler = function() return "unused" end,
 })
 
 maki.api.register_tool({
@@ -489,6 +499,76 @@ fn flat_nested_and_merged_params_normalize_identically() {
     assert_eq!(calls[0]["params"], json!({ "tag": "flat", "n": 1 }));
     assert_eq!(calls[1]["params"], json!({ "tag": "merged", "n": 1 }));
     assert_eq!(calls[2]["params"], json!({ "tag": "nested", "n": 1 }));
+}
+
+/// The model nests a child's arguments under a name the child does not
+/// declare: the documented name is "parameters", but the description's flat
+/// form calls them "params", and a model may invent another name. The child
+/// must still get its arguments.
+#[test]
+fn a_child_nested_under_another_name_gets_its_arguments() {
+    let (reg, _host) = load_batch_host();
+    let out = run_batch(
+        &reg,
+        json!([
+            { "tool": "ok", "params": { "tag": "a" } },
+            { "tool": "ok", "arguments": { "tag": "b" } },
+        ]),
+    )
+    .expect("batch failed");
+    let expected = format!(
+        "{}{}{}",
+        section("ok", "ok:a"),
+        section("ok", "ok:b"),
+        summary_all_ok(2)
+    );
+    assert_eq!(out, expected);
+    let calls = recorded_calls(&reg);
+    assert_eq!(calls[0]["params"], json!({ "tag": "a" }));
+    assert_eq!(calls[1]["params"], json!({ "tag": "b" }));
+}
+
+/// A child that declares a parameter of that name owns the key: it is a
+/// parameter, not a wrapper around the arguments.
+#[test]
+fn a_child_that_declares_the_key_keeps_it_as_a_parameter() {
+    let (reg, _host) = load_batch_host();
+    run_batch(
+        &reg,
+        json!([{ "tool": "withparams", "params": { "x": 1 } }]),
+    )
+    .expect("batch failed");
+    let calls = recorded_calls(&reg);
+    assert_eq!(calls[0]["params"], json!({ "params": { "x": 1 } }));
+}
+
+/// A flat child's array parameter is a parameter, not a wrapper: the child
+/// gets the list it was given.
+#[test]
+fn a_flat_array_parameter_stays_a_parameter() {
+    let (reg, _host) = load_batch_host();
+    run_batch(&reg, json!([{ "tool": "ok", "ids": ["a"] }])).expect("batch failed");
+    let calls = recorded_calls(&reg);
+    assert_eq!(calls[0]["params"], json!({ "ids": ["a"] }));
+}
+
+/// A provider that cannot type a nested value sends an array as a one-item
+/// wrapper: many elements as {"item": [...]}, one element as {"item": x}.
+/// The child must get the array.
+#[test]
+fn a_one_item_wrapper_is_unwrapped_for_the_child() {
+    let (reg, _host) = load_batch_host();
+    run_batch(
+        &reg,
+        json!([
+            { "tool": "ok", "parameters": { "ids": { "item": ["a", "b"] } } },
+            { "tool": "ok", "parameters": { "ids": { "item": "a" } } },
+        ]),
+    )
+    .expect("batch failed");
+    let calls = recorded_calls(&reg);
+    assert_eq!(calls[0]["params"], json!({ "ids": ["a", "b"] }));
+    assert_eq!(calls[1]["params"], json!({ "ids": ["a"] }));
 }
 
 /// The batch plugin strips GPT's `functions.` prefix in Lua so child
