@@ -40,6 +40,16 @@ pub const RUN_TOOL_NAMES: [&str; 5] = [
     STOP_TOOL_NAME,
 ];
 
+/// Whether a tool array offers `send`. A host that brings its own tool set
+/// may leave it out, and then a run cannot message another one: the final
+/// answer is what the parent gets.
+pub fn has_send(definitions: &Value) -> bool {
+    definitions.as_array().is_some_and(|list| {
+        list.iter()
+            .any(|d| d.get("name").and_then(Value::as_str) == Some(SEND_TOOL_NAME))
+    })
+}
+
 /// A run just started on behalf of a host (the Lua `maki.run.spawn`).
 pub struct HostSpawn {
     pub handle: String,

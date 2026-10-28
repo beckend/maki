@@ -246,6 +246,23 @@ pub(super) fn rig_with(script: &Arc<Script>, limits: UnitLimits) -> Rig {
     }
 }
 
+/// A rig whose runs cannot message each other: the host left `send` out of
+/// its tool set.
+pub(super) fn rig_without_send(script: &Arc<Script>) -> Rig {
+    let mut rig = rig(script);
+    let registry = crate::tools::ToolRegistry::new();
+    registry
+        .register_many(
+            crate::tools::runs::all()
+                .into_iter()
+                .filter(|tool| tool.name() != crate::tools::runs::SEND_TOOL_NAME)
+                .map(|tool| (tool, crate::tools::ToolSource::Native)),
+        )
+        .unwrap();
+    rig.ctx.registry = Arc::new(registry);
+    rig
+}
+
 pub(super) fn agent_req(prompt: &str, extra: Value) -> SpawnRequest {
     // The rig spawns a continuable child, so a test can drive the idle and
     // wake paths. A delegated child is one-shot (the product default) and is
@@ -395,6 +412,22 @@ fn a_delegated_child_ends_after_its_turn() {
         rig.hub.claim_main_wake(),
         "the child's end wakes the parent"
     );
+}
+
+/// A child whose host left `send` out is told that its final answer is
+/// the result: a promise to send a message would name a tool it does not have.
+#[test]
+fn a_child_without_send_is_told_its_answer_is_the_result() {
+    let script = Script::new(vec![(CHILD, vec![Step::Reply(reply("done"))])]);
+    let rig = rig_without_send(&script);
+    let ack = spawn(&rig, CHILD, json!({}));
+    settle(&rig, ack.id);
+    let first = Value::Array(script.messages_of(CHILD, 0)).to_string();
+    assert!(
+        first.contains("Your final answer is the result your parent receives"),
+        "{first}"
+    );
+    assert!(!first.contains("send({ to ="), "{first}");
 }
 
 /// A delegated child is told, in its own task, that it is a sub-agent and

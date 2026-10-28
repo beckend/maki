@@ -30,6 +30,7 @@ use crate::prompt::ResolvedPrompts;
 use crate::runs::RunsCtx;
 use crate::runs::inbox::TurnEnd;
 use crate::tools::hook::Verdict;
+use crate::tools::runs::has_send;
 use crate::tools::{
     Deadline, FileAccess, LocalTools, ToolAudience, ToolContext, ToolFilter, ToolOutputMode,
 };
@@ -547,10 +548,19 @@ impl<'h> Agent<'h> {
         if let Some(update) = self
             .history
             .told()
-            .and_then(|told| context_update(&told, &now, &self.prompt_slots))
+            .and_then(|told| context_update(&told, &now, &self.prompt_slots, self.can_send()))
         {
             self.history.push(update);
         }
+    }
+
+    /// Whether this run may message another run. A host with its own tool set
+    /// may leave `send` out, and then the final answer is the result the
+    /// parent gets.
+    fn can_send(&self) -> bool {
+        self.history
+            .live_frame()
+            .is_some_and(|live| has_send(live.tools.definitions()))
     }
 
     /// Picks up a model selected or refreshed while the run was working. The

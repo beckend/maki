@@ -303,7 +303,11 @@ fn child_list(children: &[(String, String, u8)]) -> String {
 
 /// What the model reads about the runs around it. Plain sentences: it is
 /// told again only when the parent or the children change.
-pub(crate) fn topology_text(topology: &TopologyFacts) -> String {
+///
+/// `can_send` says whether this run may message its parent. A runtime that
+/// does not offer `send` (a host with its own tool set) must not be told to
+/// use it: there the final answer is the result the parent gets.
+pub(crate) fn topology_text(topology: &TopologyFacts, can_send: bool) -> String {
     let (handle, name, depth) = &topology.me;
     let (max_depth, siblings) = topology.limits;
     let at_cap = *depth >= max_depth;
@@ -333,12 +337,18 @@ pub(crate) fn topology_text(topology: &TopologyFacts) -> String {
         ""
     };
     let siblings = if siblings {
-        "You may message siblings by name or handle with send; runs(scope=\"all\") lists them."
+        " You may message siblings by name or handle with send; runs(scope=\"all\") lists them."
     } else {
-        "Messages to siblings are not enabled."
+        " Messages to siblings are not enabled."
     };
+    let report = if can_send {
+        "Send your result to your parent with send(to=\"parent\") before you finish, and a question or progress while you work; sending does not end your turn."
+    } else {
+        "Your final answer is the result your parent receives, so make it a self-contained summary."
+    };
+    let scope = "Your permission scope is the one you were started with and cannot be widened from inside this session, so a call that would need the user's approval is denied when nobody can answer it: do not retry such a call, say what you could not do instead.";
     format!(
-        "Run topology changed. You are agent \"{name}\" ({handle}), depth {depth} of {max_depth}. Your parent is {parent}. {children} Send your result to your parent with send(to=\"parent\") before you finish, and a question or progress while you work; sending does not end your turn. Your permission scope is the one you were started with and cannot be widened from inside this session, so a call that would need the user's approval is denied when nobody can answer it: do not retry such a call, say what you could not do instead. {siblings}{cap}"
+        "Run topology changed. You are agent \"{name}\" ({handle}), depth {depth} of {max_depth}. Your parent is {parent}. {children} {report} {scope} {siblings}{cap}"
     )
 }
 
@@ -348,6 +358,7 @@ pub(crate) fn context_update(
     told: &LiveFacts,
     now: &LiveFacts,
     prompts: &ResolvedPrompts,
+    can_send: bool,
 ) -> Option<Message> {
     let update = told.changes_to(now);
     if update.is_empty() {
@@ -376,7 +387,7 @@ pub(crate) fn context_update(
         None => {}
     }
     if let Some(topology) = &update.topology {
-        parts.push(topology_text(topology));
+        parts.push(topology_text(topology, can_send));
     }
     for (key, content) in &update.hints {
         parts.push(match content {
@@ -423,7 +434,7 @@ mod tests {
 
     #[test]
     fn unchanged_facts_tell_nothing() {
-        assert!(context_update(&facts(), &facts(), &ResolvedPrompts::default()).is_none());
+        assert!(context_update(&facts(), &facts(), &ResolvedPrompts::default(), true).is_none());
     }
 
     #[test_case(|f: &mut LiveFacts| prompt(f).date = NEXT_DATE.into(), NEXT_DATE ; "date")]
@@ -436,7 +447,7 @@ mod tests {
     fn changed_fact_is_told(change: fn(&mut LiveFacts), says: &str) {
         let mut now = facts();
         change(&mut now);
-        let update = context_update(&facts(), &now, &ResolvedPrompts::default()).unwrap();
+        let update = context_update(&facts(), &now, &ResolvedPrompts::default(), true).unwrap();
         let mut heard = facts();
         heard.apply(update.facts_update().unwrap());
         assert_eq!(heard, now);
@@ -500,21 +511,31 @@ mod tests {
     #[test]
     fn rendering_snapshot_main_and_sub() {
         assert_eq!(
-            topology_text(&main_topology()),
+            topology_text(&main_topology(), true),
             "Run topology changed. You are \"main\". Runs you started: \"auditor\" (ag-k3x9ab, agent), \"build\" (sh-4m2q7z, shell). Runs finish with a notice; do not poll. Maximum depth 2."
         );
         assert_eq!(
-            topology_text(&sub_topology()),
-            "Run topology changed. You are agent \"auditor\" (ag-k3x9ab), depth 1 of 2. Your parent is \"main\". You have no children. Send your result to your parent with send(to=\"parent\") before you finish, and a question or progress while you work; sending does not end your turn. Your permission scope is the one you were started with and cannot be widened from inside this session, so a call that would need the user's approval is denied when nobody can answer it: do not retry such a call, say what you could not do instead. Messages to siblings are not enabled."
+            topology_text(&sub_topology(), true),
+            "Run topology changed. You are agent \"auditor\" (ag-k3x9ab), depth 1 of 2. Your parent is \"main\". You have no children. Send your result to your parent with send(to=\"parent\") before you finish, and a question or progress while you work; sending does not end your turn. Your permission scope is the one you were started with and cannot be widened from inside this session, so a call that would need the user's approval is denied when nobody can answer it: do not retry such a call, say what you could not do instead.  Messages to siblings are not enabled."
         );
         let mut capped = sub_topology();
         capped.me.2 = 2;
         capped.parent = Some(("ag-aaaaaa".into(), "lead".into()));
         capped.limits.1 = true;
-        let text = topology_text(&capped);
+        let text = topology_text(&capped, true);
         assert!(text.contains("Your parent is \"lead\" (ag-aaaaaa)."));
         assert!(text.contains("You may message siblings by name or handle"));
         assert!(text.ends_with("do the work directly."), "{text}");
+    }
+
+    #[test]
+    fn a_child_without_send_is_told_its_answer_is_the_result() {
+        let text = topology_text(&sub_topology(), false);
+        assert!(
+            text.contains("Your final answer is the result your parent receives"),
+            "{text}"
+        );
+        assert!(!text.contains("send(to="), "{text}");
     }
 
     #[test]
@@ -524,11 +545,16 @@ mod tests {
             ..facts()
         };
         let told = at(Some(main_topology()));
-        assert!(context_update(&told, &told.clone(), &ResolvedPrompts::default()).is_none());
+        assert!(context_update(&told, &told.clone(), &ResolvedPrompts::default(), true).is_none());
         let mut grown = main_topology();
         grown.children.push(("ag-zzzzzz".into(), "zed".into(), 0));
-        let update =
-            context_update(&told, &at(Some(grown.clone())), &ResolvedPrompts::default()).unwrap();
+        let update = context_update(
+            &told,
+            &at(Some(grown.clone())),
+            &ResolvedPrompts::default(),
+            true,
+        )
+        .unwrap();
         assert!(update.first_text_content().unwrap().contains("\"zed\""));
         let mut heard = told;
         heard.apply(update.facts_update().unwrap());
@@ -548,12 +574,12 @@ mod tests {
         }
         now.topology = Some(topology);
         // Five children appeared since the last drain: one update names all.
-        let update = context_update(&told, &now, &ResolvedPrompts::default()).unwrap();
+        let update = context_update(&told, &now, &ResolvedPrompts::default(), true).unwrap();
         let text = update.first_text_content().unwrap();
         assert_eq!(text.matches("Run topology changed.").count(), 1);
         assert!((0..5).all(|n| text.contains(&format!("kid{n}"))));
         told.apply(update.facts_update().unwrap());
-        assert!(context_update(&told, &now, &ResolvedPrompts::default()).is_none());
+        assert!(context_update(&told, &now, &ResolvedPrompts::default(), true).is_none());
     }
 
     /// A resumed session: the history says the main agent has children, the
@@ -564,7 +590,7 @@ mod tests {
         let mut told = facts();
         told.topology = Some(main_topology());
         let now = facts();
-        let update = context_update(&told, &now, &ResolvedPrompts::default()).unwrap();
+        let update = context_update(&told, &now, &ResolvedPrompts::default(), true).unwrap();
         let text = update.first_text_content().unwrap();
         assert!(text.contains("You have no unfinished runs."), "{text}");
 
@@ -574,7 +600,7 @@ mod tests {
         for topology in [main_topology(), grown.clone()] {
             let mut step = replayed.clone();
             step.topology = Some(topology);
-            let u = context_update(&replayed, &step, &ResolvedPrompts::default()).unwrap();
+            let u = context_update(&replayed, &step, &ResolvedPrompts::default(), true).unwrap();
             replayed.apply(u.facts_update().unwrap());
         }
         replayed.apply(update.facts_update().unwrap());
@@ -600,7 +626,7 @@ mod tests {
             topology: Some(sub_topology()),
             ..told.clone()
         };
-        history.push(context_update(&told, &now, &ResolvedPrompts::default()).unwrap());
+        history.push(context_update(&told, &now, &ResolvedPrompts::default(), true).unwrap());
         assert_eq!(history.told().unwrap(), now);
 
         assert_eq!(

@@ -81,6 +81,17 @@ Before you finish, send your result to it with send({ to = \"parent\", message =
 \"<self-contained result>\" }). Send another message when a finding changes what the parent \
 should do next. Sending does not end your turn.";
 
+/// The same, for a child whose host left `send` out: there the final answer
+/// is the result the parent gets, and a promise to send would be a tool the
+/// child does not have.
+const RETURN_GUIDANCE_NO_SEND: &str = "\
+You are a sub-agent. Your parent is {parent}. It shares your workspace, but it does not see \
+your transcript, your tool output or your reasoning, and it does not get your final answer on \
+its own.
+
+Your final answer is the result your parent receives, so make it a self-contained summary: \
+what you did, what you found, and the file paths and line numbers that matter.";
+
 /// The model choice that `maki.agent.resolve_model` and `spawn` share: no tier
 /// keeps the parent's model, otherwise the requested tier clamped to the
 /// parent's own.
@@ -136,6 +147,10 @@ pub struct AgentLaunch {
     /// Rebuilt from a saved transcript (`fork` is that transcript) and started
     /// by a message, not by `spec.prompt`.
     pub(super) revived: bool,
+    /// Whether this run may message another one. A host that brings its own
+    /// tool set may leave `send` out, and then the child is told that its
+    /// final answer is the result.
+    pub(super) can_send: bool,
 }
 
 impl AgentLaunch {
@@ -211,6 +226,9 @@ impl AgentLaunch {
         let mut defs =
             ctx.registry
                 .definitions(&vars, &description, model.supports_tool_examples());
+        // Whether this child may message its parent. A host with its own tool
+        // set may leave `send` out.
+        let can_send = crate::tools::runs::has_send(&defs);
         let mut local: HashMap<String, LocalTool> = HashMap::new();
         if let (Some(captured), Some(schema)) = (&structured, &spec.output_schema) {
             let schema = with_object_root(schema.clone());
@@ -283,6 +301,7 @@ impl AgentLaunch {
             model_spec,
             fork: None,
             revived: false,
+            can_send,
         })
     }
 }
@@ -554,9 +573,15 @@ impl Driver {
         format!("\"{name}\" ({handle})")
     }
 
-    /// The guidance a delegated child reads with its task.
-    fn return_guidance(&self) -> String {
-        RETURN_GUIDANCE.replace("{parent}", &self.parent_label())
+    /// The guidance a delegated child reads with its task. It promises a
+    /// message only where the child has the tool to send one.
+    fn return_guidance(&self, can_send: bool) -> String {
+        let text = if can_send {
+            RETURN_GUIDANCE
+        } else {
+            RETURN_GUIDANCE_NO_SEND
+        };
+        text.replace("{parent}", &self.parent_label())
     }
 
     async fn drive(self, spec: AgentSpec, launch: AgentLaunch) {
@@ -613,7 +638,7 @@ impl Driver {
         if !message.is_empty() {
             message.push_str("\n\n");
         }
-        message.push_str(&self.return_guidance());
+        message.push_str(&self.return_guidance(launch.can_send));
         loop {
             // A no-op while the slot is held; after an idle wake it queues.
             if !self.slot().await {
