@@ -792,8 +792,8 @@ pub enum AgentEvent {
         reason: String,
         detail: Option<String>,
     },
-    /// A notice reached `main`'s inbox. With `wake` the frontend may start a
-    /// turn for it (`UnitHub::claim_main_wake` decides).
+    /// A notice or a message reached `main`'s inbox. With `wake` the frontend
+    /// may start a turn for it (`UnitHub::claim_main_wake` decides).
     RunNotice {
         wake: bool,
     },

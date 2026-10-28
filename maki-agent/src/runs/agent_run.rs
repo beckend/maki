@@ -932,6 +932,27 @@ mod inbox {
         let text = crate::runs::inbox::frame(&items, None);
         assert!(text.starts_with("<run-message from=\"work\""), "{text}");
     }
+
+    /// A child that reports to its parent must wake it: `main` has no turn of
+    /// its own to drain the inbox, so without the event the report waits for
+    /// the next turn that something else starts.
+    #[test]
+    fn a_child_that_reports_wakes_its_parent() {
+        let script = Script::new(vec![(CHILD, vec![Step::Reply(reply("ok"))])]);
+        let rig = rig(&script);
+        let ack = spawn(&rig, CHILD, json!({}));
+        settle(&rig, ack.id);
+        // The settlement notice already woke the parent; that must not be
+        // what this test sees.
+        for _ in rig.events.try_iter() {}
+        let to = rig.hub.resolve(ack.id, "parent").unwrap();
+        say(&rig, ack.id, to, "the answer is 42", DeliveryKind::Steer);
+        let woke = rig
+            .events
+            .try_iter()
+            .any(|e| matches!(e.event, crate::AgentEvent::RunNotice { wake: true }));
+        assert!(woke, "the parent's turn is started by the report");
+    }
 }
 
 mod hub {
