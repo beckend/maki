@@ -1328,6 +1328,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stop_reads_a_one_item_wrapper_array() {
+        // A provider that cannot type a nested value sends the ids as
+        // `{"item": [...]}`; the tool must still find the run.
+        let ctx = ctx();
+        let started = call(
+            Which::Spawn,
+            &ctx,
+            json!({"kind": "shell", "description": "long", "command": "sleep 600"}),
+        )
+        .unwrap();
+        let id = handle_of(&started);
+        let stopped = call(Which::Stop, &ctx, json!({"ids": {"item": [id]}})).unwrap();
+        assert!(stopped.ends_with(": stopped"), "{stopped}");
+    }
+
+    #[tokio::test]
     async fn tools_refuse_without_a_hub() {
         let mut ctx = ctx();
         ctx.runs = None;

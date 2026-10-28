@@ -419,12 +419,12 @@ async fn a_delegated_child_ends_after_its_turn() {
 
 /// A child whose host left `send` out is told that its final answer is
 /// the result: a promise to send a message would name a tool it does not have.
-#[test]
-fn a_child_without_send_is_told_its_answer_is_the_result() {
+#[tokio::test]
+async fn a_child_without_send_is_told_its_answer_is_the_result() {
     let script = Script::new(vec![(CHILD, vec![Step::Reply(reply("done"))])]);
     let rig = rig_without_send(&script);
-    let ack = spawn(&rig, CHILD, json!({}));
-    settle(&rig, ack.id);
+    let ack = spawn(&rig, CHILD, json!({})).await;
+    settle(&rig, ack.id).await;
     let first = Value::Array(script.messages_of(CHILD, 0)).to_string();
     assert!(
         first.contains("Your final answer is the result your parent receives"),
@@ -941,12 +941,12 @@ mod inbox {
     /// A child that reports to its parent must wake it: `main` has no turn of
     /// its own to drain the inbox, so without the event the report waits for
     /// the next turn that something else starts.
-    #[test]
-    fn a_child_that_reports_wakes_its_parent() {
+    #[tokio::test]
+    async fn a_child_that_reports_wakes_its_parent() {
         let script = Script::new(vec![(CHILD, vec![Step::Reply(reply("ok"))])]);
         let rig = rig(&script);
-        let ack = spawn(&rig, CHILD, json!({}));
-        settle(&rig, ack.id);
+        let ack = spawn(&rig, CHILD, json!({})).await;
+        settle(&rig, ack.id).await;
         // The settlement notice already woke the parent; that must not be
         // what this test sees.
         for _ in rig.events.try_iter() {}
@@ -3250,7 +3250,7 @@ mod chaos {
                 if script.order().len() >= n {
                     return;
                 }
-                std::thread::yield_now();
+                tokio::task::yield_now().await;
             }
             panic!("only {} of {n} agents started", script.order().len());
         };
