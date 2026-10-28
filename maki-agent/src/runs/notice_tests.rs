@@ -36,6 +36,26 @@ fn run(rig: &Rig, policy: NoticePolicy) -> UnitId {
     rig.hub.spawn(rig.hub.main(), req).unwrap().id
 }
 
+/// A notice the wake budget bounds: the kind a watch match carries. The
+/// budget holds back the noise, not a child's result, so the budget tests
+/// use this and the settlement tests use a real run.
+fn noise_notice(rig: &Rig, n: u32) {
+    let info = NoticeInfo {
+        kind: NoticeKind::Match,
+        run: rig.hub.main(),
+        handle: "sh-noise".to_owned(),
+        name: "noise".to_owned(),
+        generation: 0,
+        count: 1,
+        created: SystemTime::now(),
+    };
+    let mut inbox = rig.hub.main_inbox.lock();
+    inbox.enqueue_notice(
+        InboxItem::notice(info, format!("noise {n}"), true, rig.clock.now()),
+        rig.clock.now(),
+    );
+}
+
 fn terminal(summary: &str) -> Terminal {
     Terminal {
         reason: DoneReason::Completed,
@@ -87,15 +107,13 @@ fn settlement_queues_one_notice_in_the_owner_inbox() {
 fn wake_budget_three_then_overflow_marker() {
     let rig = rig();
     let main = rig.hub.main();
-    for _ in 0..3 {
-        let id = run(&rig, NoticePolicy::Wake);
-        finish(&rig, id);
+    for n in 0..3 {
+        noise_notice(&rig, n);
         assert!(rig.hub.claim_main_wake());
         // The turn that was started drains the notice.
         assert_eq!(main_inbox(&rig).drain_step().len(), 1);
     }
-    let fourth = run(&rig, NoticePolicy::Wake);
-    finish(&rig, fourth);
+    noise_notice(&rig, 3);
     assert!(!rig.hub.claim_main_wake(), "the fourth wake is suppressed");
     let queued = rig.hub.pending_notices(main);
     assert_eq!(queued.len(), 2, "{queued:?}");
@@ -106,8 +124,7 @@ fn wake_budget_three_then_overflow_marker() {
         .count();
     assert_eq!(markers, 1);
     // More notices stay quiet and add no second marker.
-    let fifth = run(&rig, NoticePolicy::Wake);
-    finish(&rig, fifth);
+    noise_notice(&rig, 4);
     assert!(!rig.hub.claim_main_wake());
     let queued = rig.hub.pending_notices(main);
     assert_eq!(queued.len(), 3);
@@ -122,31 +139,52 @@ fn wake_budget_three_then_overflow_marker() {
     assert_eq!(main_inbox(&rig).drain_step().len(), 3);
 }
 
+/// A settled agent is the result the parent asked for, so it wakes even when
+/// the notice budget is spent: the child's end must reach the parent.
 #[test]
-fn budget_resets_on_user_and_on_runs_read() {
+fn a_settled_agent_wakes_even_when_the_budget_is_spent() {
     let rig = rig();
-    for _ in 0..3 {
-        let id = run(&rig, NoticePolicy::Wake);
-        finish(&rig, id);
+    for n in 0..WAKE_BUDGET {
+        noise_notice(&rig, n);
         assert!(rig.hub.claim_main_wake());
         main_inbox(&rig).drain_step();
     }
-    let id = run(&rig, NoticePolicy::Wake);
-    finish(&rig, id);
+    // The noise is held back now.
+    noise_notice(&rig, 99);
+    assert!(
+        !rig.hub.claim_main_wake(),
+        "the budget holds the noise back"
+    );
+    // An agent that finishes is not held back.
+    let child = run(&rig, NoticePolicy::Wake);
+    finish(&rig, child);
+    assert!(
+        rig.hub.claim_main_wake(),
+        "the child's result reaches the parent"
+    );
+}
+
+#[test]
+fn budget_resets_on_user_and_on_runs_read() {
+    let rig = rig();
+    for n in 0..3 {
+        noise_notice(&rig, n);
+        assert!(rig.hub.claim_main_wake());
+        main_inbox(&rig).drain_step();
+    }
+    noise_notice(&rig, 3);
     assert!(!rig.hub.claim_main_wake());
     // The user speaks (or the model reads state): the counter starts over.
     rig.hub.note_engaged();
-    let id = run(&rig, NoticePolicy::Wake);
-    finish(&rig, id);
+    noise_notice(&rig, 4);
     assert!(rig.hub.claim_main_wake());
 }
 
 #[test]
 fn message_wake_does_not_spend_the_budget() {
     let rig = rig();
-    for _ in 0..3 {
-        let id = run(&rig, NoticePolicy::Wake);
-        finish(&rig, id);
+    for n in 0..3 {
+        noise_notice(&rig, n);
         assert!(rig.hub.claim_main_wake());
         main_inbox(&rig).drain_step();
     }
@@ -447,9 +485,8 @@ fn collapse_window_boundary_is_thirty_seconds() {
 fn exhausted_budget_marker_is_sent_once_and_stays_bounded() {
     let rig = rig();
     let main = rig.hub.main();
-    for _ in 0..inbox::MAX_PENDING + 5 {
-        let id = run(&rig, NoticePolicy::Wake);
-        finish(&rig, id);
+    for n in 0..inbox::MAX_PENDING + 5 {
+        noise_notice(&rig, n as u32);
     }
     for _ in 0..WAKE_BUDGET {
         assert!(rig.hub.claim_main_wake());

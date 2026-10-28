@@ -338,7 +338,7 @@ pub(crate) fn topology_text(topology: &TopologyFacts) -> String {
         "Messages to siblings are not enabled."
     };
     format!(
-        "Run topology changed. You are agent \"{name}\" ({handle}), depth {depth} of {max_depth}. Your parent is {parent}. {children} Use send(to=\"parent\") for a question or progress while you work; your result is delivered to your parent automatically when you finish, so do not send it. Sending does not end your turn. {siblings}{cap}"
+        "Run topology changed. You are agent \"{name}\" ({handle}), depth {depth} of {max_depth}. Your parent is {parent}. {children} Send your result to your parent with send(to=\"parent\") before you finish, and a question or progress while you work; sending does not end your turn. Your permission scope is the one you were started with and cannot be widened from inside this session, so a call that would need the user's approval is denied when nobody can answer it: do not retry such a call, say what you could not do instead. {siblings}{cap}"
     )
 }
 
@@ -505,7 +505,7 @@ mod tests {
         );
         assert_eq!(
             topology_text(&sub_topology()),
-            "Run topology changed. You are agent \"auditor\" (ag-k3x9ab), depth 1 of 2. Your parent is \"main\". You have no children. Use send(to=\"parent\") for a question or progress while you work; your result is delivered to your parent automatically when you finish, so do not send it. Sending does not end your turn. Messages to siblings are not enabled."
+            "Run topology changed. You are agent \"auditor\" (ag-k3x9ab), depth 1 of 2. Your parent is \"main\". You have no children. Send your result to your parent with send(to=\"parent\") before you finish, and a question or progress while you work; sending does not end your turn. Your permission scope is the one you were started with and cannot be widened from inside this session, so a call that would need the user's approval is denied when nobody can answer it: do not retry such a call, say what you could not do instead. Messages to siblings are not enabled."
         );
         let mut capped = sub_topology();
         capped.me.2 = 2;

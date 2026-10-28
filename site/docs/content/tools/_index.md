@@ -211,10 +211,12 @@ Load a skill that provides instructions and workflows for specific tasks.
 ### `spawn` <span class="badge badge-optin">opt-in</span> {#spawn}
 
 Start background work and return immediately with its id. kind "agent" starts a
-subagent: a separate agent with its own context that works on a self-contained task and
-reports back. kind "shell" starts a command that keeps running while you continue. You
+subagent: a separate agent with its own context that works on a self-contained task. The
+child is told to send you its result with `send` before it finishes, and you are woken when
+it ends. kind "shell" starts a command that keeps running while you continue. You
 are notified when a run finishes; do not poll or sleep. Start independent runs together
-in one message. Use `wait` only when you are blocked on a result, `send` to talk to a
+in one assistant message and continue useful work while they run. Use `wait` only when
+you are blocked on a result and have nothing else to do, `send` to talk to a
 run, `stop` to end it, `runs` to look. Only a limited number of agents work at once;
 the rest show as queued with a position and start in order. A full queue returns
 QUEUE_FULL: wait for runs to finish. A timeout_secs above the session maximum is
@@ -232,12 +234,12 @@ get DEPTH_LIMIT and must do the work yourself.
 | `model_tier` | string | no |  | agent only. Clamped to your tier. |
 | `name` | string | no |  | Optional unique name others can address this run by. `main` and `parent` are reserved. |
 | `notify` | string | no |  | On finish: wake starts a turn if you are idle (default), quiet waits for your next turn, never sends nothing (read with runs). |
-| `one_shot` | boolean | no |  | agent only. Complete after the first result instead of staying available. Default false. |
+| `one_shot` | boolean | no |  | agent only. Complete after the first result instead of staying available. Default true; set it to false to keep the agent available for follow-up messages. |
 | `output_schema` | object | no |  | agent only. JSON Schema the final result must satisfy. |
 | `prompt` | string | no |  | agent only. The complete, self-contained task. |
 | `subagent_type` | string | no |  | agent only. research is read-only; general can edit. Default general. |
 | `thinking` | string | no |  |  |
-| `timeout_secs` | integer | no |  | Wall clock limit. Default: 1800 for agents, 3600 for shell. 0 asks for the session maximum, so a long task is not cut off at the default. Expiry ends the run as timed_out. |
+| `timeout_secs` | integer | no |  | Wall clock limit. Default: the session maximum for agents (86400s) and 3600 for shell. 0 asks for the session maximum, so a long task is not cut off at the default. Expiry ends the run as timed_out. |
 | `watch` | string | no |  | shell only. Regex (Rust syntax) matched against each stdout/stderr line; matches become notices, at most 1 per second (lines in between are batched) and 20 per minute, then one overflow notice. Wakes you only with notify=wake. A bad regex is rejected. |
 
 ### `send` <span class="badge badge-optin">opt-in</span> {#send}
@@ -246,9 +248,9 @@ Send a message to another run in this session: your child, your parent (name "pa
 or "main". (Siblings only if the session enables it.) The message is queued and returns a
 message id at once. A running recipient reads it at its next step; an idle one starts a turn
 with it; a finished or evicted agent with a saved transcript is revived first. Sending does not end your turn and is not an answer: the recipient's reply, if any,
-comes as a message to you. Use mode "quiet" for FYI notes that must not start a turn. Your
-final result reaches your parent on its own: use send to a parent only for a question or
-mid-run progress.
+comes as a message to you. Use mode "quiet" for FYI notes that must not start a turn. A
+subagent sends its result to its parent this way: the parent does not see the subagent's
+transcript, so a result that is not sent is lost.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|

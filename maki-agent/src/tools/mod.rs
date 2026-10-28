@@ -169,6 +169,13 @@ impl ToolFilter {
         let mut exclude: Vec<&str> = extra_exclude.to_vec();
         exclude.extend(capability_exclusions(model));
         exclude.extend(config.disabled_tools.iter().map(|s| s.as_str()));
+        // The native `spawn` is the delegation tool while native runs are on,
+        // and it does not wait: the `task` plugin's tool would offer the model
+        // a second way to delegate, the one that blocks on the child. The
+        // plugin keeps it for the runs-off path and for the `/tasks` picker.
+        if config.runs.enabled {
+            exclude.push(TASK_TOOL_NAME);
+        }
         base.excluding(&exclude)
     }
 }
@@ -1272,5 +1279,30 @@ mod tests {
         assert!(all_builtin_tool_names().contains(&"wait"));
         crate::runs::sync_registration(&reg, &Default::default()).unwrap();
         assert!(!is_builtin_tool("stop"));
+    }
+
+    /// The native `spawn` is the delegation tool while native runs are on,
+    /// and it does not wait. The `task` plugin's tool would offer the model a
+    /// second way to delegate, the one that blocks on the child, so it leaves
+    /// the model's list; with runs off it is the only delegation there is.
+    #[test]
+    fn the_task_tool_is_not_offered_while_runs_are_on() {
+        let model = Model::from_spec("anthropic/claude-opus-4-8").unwrap();
+        let off = AgentConfig::default();
+        assert!(
+            ToolFilter::from_config(&off, &model, &[]).matches(TASK_TOOL_NAME),
+            "the legacy path keeps the task tool"
+        );
+        let on = AgentConfig {
+            runs: maki_config::RunsConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ..AgentConfig::default()
+        };
+        assert!(
+            !ToolFilter::from_config(&on, &model, &[]).matches(TASK_TOOL_NAME),
+            "the native spawn replaces the task tool"
+        );
     }
 }

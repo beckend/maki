@@ -96,7 +96,7 @@ pub const DEFAULT_RUNS_MAX_SHELLS: u32 = 8;
 pub const DEFAULT_RUNS_MAX_SHELLS_PER_OWNER: u32 = 4;
 pub const DEFAULT_RUNS_MAX_QUEUE: u32 = 16;
 pub const DEFAULT_RUNS_SPAWN_PER_MINUTE: u32 = 10;
-pub const DEFAULT_RUNS_AGENT_TIMEOUT_SECS: u64 = 1800;
+pub const DEFAULT_RUNS_AGENT_TIMEOUT_SECS: u64 = 86_400;
 pub const DEFAULT_RUNS_MAX_TIMEOUT_SECS: u64 = 86_400;
 pub const MIN_RUNS_MAX_DEPTH: u32 = 1;
 pub const MIN_RUNS_LIMIT: u32 = 1;
@@ -1685,7 +1685,7 @@ pub struct RunsConfig {
     #[config(default = DEFAULT_RUNS_SPAWN_PER_MINUTE, min = MIN_RUNS_LIMIT, desc = "Runs one run may start per rolling minute")]
     pub spawn_per_minute: u32,
 
-    #[config(default = DEFAULT_RUNS_AGENT_TIMEOUT_SECS, min = MIN_RUNS_TIMEOUT_SECS, desc = "Wall clock limit of an agent run (seconds) unless `spawn` sets `timeout_secs`; counted from when it starts working")]
+    #[config(default = DEFAULT_RUNS_AGENT_TIMEOUT_SECS, min = MIN_RUNS_TIMEOUT_SECS, desc = "Wall clock limit of an agent run (seconds) unless `spawn` sets `timeout_secs`; counted from when it starts working. A delegated child works unattended, so the default is the session maximum rather than a short leash")]
     pub default_timeout_secs: u64,
 
     #[config(default = DEFAULT_RUNS_MAX_TIMEOUT_SECS, min = MIN_RUNS_TIMEOUT_SECS, desc = "Largest `timeout_secs` a `spawn` may ask for (seconds); larger values are lowered to it")]

@@ -247,7 +247,15 @@ pub(super) fn rig_with(script: &Arc<Script>, limits: UnitLimits) -> Rig {
 }
 
 pub(super) fn agent_req(prompt: &str, extra: Value) -> SpawnRequest {
-    let mut input = json!({"kind": "agent", "description": "work", "prompt": prompt});
+    // The rig spawns a continuable child, so a test can drive the idle and
+    // wake paths. A delegated child is one-shot (the product default) and is
+    // spawned with `one_shot: true`.
+    let mut input = json!({
+        "kind": "agent",
+        "description": "work",
+        "prompt": prompt,
+        "one_shot": false
+    });
     input
         .as_object_mut()
         .unwrap()
@@ -371,6 +379,47 @@ fn a_woken_idle_agent_keeps_its_answer() {
     let view = settle(&rig, ack.id);
     assert_eq!(view.state.label(), "idle");
     assert_eq!(view.result.unwrap().summary, "second");
+}
+
+/// A delegated child ends after its turn: the parent is woken by the
+/// settlement notice, and the child does not park in `Idle` waiting for a
+/// message that would never come.
+#[test]
+fn a_delegated_child_ends_after_its_turn() {
+    let script = Script::new(vec![(CHILD, vec![Step::Reply(reply("done"))])]);
+    let rig = rig(&script);
+    let ack = spawn(&rig, CHILD, json!({"one_shot": true}));
+    let view = settle(&rig, ack.id);
+    assert_eq!(done_reason(&view), DoneReason::Completed);
+    assert!(
+        rig.hub.claim_main_wake(),
+        "the child's end wakes the parent"
+    );
+}
+
+/// A delegated child is told, in its own task, that it is a sub-agent and
+/// where its result goes: the parent shares the workspace but not the
+/// transcript, so the child has to send the result itself.
+#[test]
+fn a_delegated_child_is_told_to_report_to_its_parent() {
+    let script = Script::new(vec![(CHILD, vec![Step::Reply(reply("done"))])]);
+    let rig = rig(&script);
+    let ack = spawn(&rig, CHILD, json!({}));
+    settle(&rig, ack.id);
+    let messages = script.messages_of(CHILD, 0);
+    let first = Value::Array(messages).to_string();
+    assert!(
+        first.contains("You are a sub-agent"),
+        "the child is told what it is: {first}"
+    );
+    assert!(
+        first.contains("send({ to = \\\"parent\\\""),
+        "the child is told how to report: {first}"
+    );
+    assert!(
+        first.contains("Your parent is main"),
+        "the child is told who its parent is: {first}"
+    );
 }
 
 #[test]

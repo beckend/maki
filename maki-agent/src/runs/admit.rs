@@ -454,11 +454,11 @@ mod tests {
     }
 
     #[test]
-    fn default_timeout_30m() {
+    fn default_timeout_is_the_session_maximum() {
         let hub = hub_with(agents(8));
         let main = hub.main();
         let plain = agent(&hub, main, "a");
-        assert_eq!(timeout_of(&hub, plain), 1800);
+        assert_eq!(timeout_of(&hub, plain), 86_400);
         let mut req = request(RunKind::Agent, "b");
         req.timeout_secs = Some(90);
         assert_eq!(timeout_of(&hub, hub.spawn(main, req).unwrap().id), 90);

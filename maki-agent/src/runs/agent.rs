@@ -68,6 +68,19 @@ const DROPPED: &str = "the prompt was dropped by a plugin";
 const SCHEMA_ROOT_ERROR: &str = "output_schema must have type object";
 const CANCEL_NOTE_MARKER: &str = "[Response cut off by user cancel]";
 
+/// What a delegated child reads with its task. The parent shares the child's
+/// workspace but not its transcript, so the child has to send the result
+/// itself; the settlement notice that follows it carries only the closing
+/// text.
+const RETURN_GUIDANCE: &str = "\
+You are a sub-agent. Your parent is {parent}. It shares your workspace, but it does not see \
+your transcript, your tool output or your reasoning, and it does not get your final answer on \
+its own.
+
+Before you finish, send your result to it with send({ to = \"parent\", message = \
+\"<self-contained result>\" }). Send another message when a finding changes what the parent \
+should do next. Sending does not end your turn.";
+
 /// The model choice that `maki.agent.resolve_model` and `spawn` share: no tier
 /// keeps the parent's model, otherwise the requested tier clamped to the
 /// parent's own.
@@ -526,6 +539,26 @@ impl Driver {
         }
     }
 
+    /// How this run's parent is named to it: `main`, or the parent's name and
+    /// handle.
+    fn parent_label(&self) -> String {
+        let Some(facts) = self.hub().and_then(|hub| hub.topology_facts(self.id)) else {
+            return super::topology::MAIN.to_owned();
+        };
+        let Some((handle, name)) = facts.parent else {
+            return super::topology::MAIN.to_owned();
+        };
+        if handle == super::topology::MAIN {
+            return handle;
+        }
+        format!("\"{name}\" ({handle})")
+    }
+
+    /// The guidance a delegated child reads with its task.
+    fn return_guidance(&self) -> String {
+        RETURN_GUIDANCE.replace("{parent}", &self.parent_label())
+    }
+
     async fn drive(self, spec: AgentSpec, launch: AgentLaunch) {
         let _guard = SettleOnPanic {
             hub: self.hub.clone(),
@@ -574,6 +607,13 @@ impl Driver {
             }
             message.push_str(&inbox::frame(&first, None));
         }
+        // The parent does not see the child's transcript, so the child is told
+        // where its result goes. Last in the first message, so it is the last
+        // thing the child reads before it starts.
+        if !message.is_empty() {
+            message.push_str("\n\n");
+        }
+        message.push_str(&self.return_guidance());
         loop {
             // A no-op while the slot is held; after an idle wake it queues.
             if !self.slot().await {

@@ -17,6 +17,12 @@ use std::time::SystemTime;
 use super::notice::{Notice, NoticeInfo, NoticeKind};
 use super::{UnitError, UnitId};
 
+/// A notice about an agent run that finished: the result the recipient asked
+/// for, which wakes even when the notice budget is spent.
+fn settled_agent(info: &NoticeInfo) -> bool {
+    info.kind == NoticeKind::Settled && info.handle.starts_with(super::AGENT_HANDLE_PREFIX)
+}
+
 /// Hard limit of one message, in bytes.
 pub const MAX_MESSAGE_BYTES: usize = 16384;
 /// Pending items per inbox.
@@ -316,6 +322,17 @@ impl Guard<'_> {
             .any(|i| i.wake && i.kind != DeliveryKind::Notice)
     }
 
+    /// A settled agent's notice carries a result the recipient asked for, so
+    /// it wakes even when the notice budget is spent. The handle's prefix
+    /// says what kind of run it was: a shell that finishes is noise the
+    /// budget may hold back, an agent that finishes is an answer.
+    pub(crate) fn has_settlement_wakeable(&self) -> bool {
+        self.state
+            .items
+            .iter()
+            .any(|i| i.wake && i.notice.as_ref().is_some_and(settled_agent))
+    }
+
     /// Queues a notice. Identical queued notices within the window collapse
     /// into one with a count; a full inbox drops it and remembers how many,
     /// so one `Overflow` marker tells the recipient at its next drain. Never
@@ -366,7 +383,10 @@ impl Guard<'_> {
     pub(crate) fn demote_notice_wakes(&mut self) -> usize {
         let mut n = 0;
         for item in &mut self.state.items {
-            if item.kind == DeliveryKind::Notice && item.wake {
+            // A settled agent's notice carries a result the recipient asked
+            // for: it is not demoted.
+            let settlement = item.notice.as_ref().is_some_and(settled_agent);
+            if item.kind == DeliveryKind::Notice && item.wake && !settlement {
                 item.wake = false;
                 n += 1;
             }

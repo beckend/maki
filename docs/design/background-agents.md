@@ -21,14 +21,11 @@ wrote this plan):
   round trip on a result it already has, and the child lingers as a zombie until
   the idle sweep retires it (`maki-agent/src/runs/revive.rs:364-433`).
 - **A background child is cut off.** The limit of an agent run that names none
-  is the hard-coded `DEFAULT_AGENT_TIMEOUT_SECS` (1800 s,
-  `maki-agent/src/runs/mod.rs:77`), filled in by `into_kind`
-  (`maki-agent/src/runs/mod.rs:502`). A child that was still working died at
+  is `[agent.runs] default_timeout_secs`, whose default is 1800 s
+  (`maki-config/src/lib.rs:99`). A child that was still working died at
   exactly 1800 s with 177 turns in it. The P9 fix ("a delegated task sets its
-  own time limit") only reached the `task` plugin's delegated path. The
-  operator's knob `[agent.runs] default_timeout_secs` does not reach an agent
-  run at all: the spec always carries a number, so the hub never sees an
-  unnamed limit.
+  own time limit") only reached the `task` plugin's delegated path; the native
+  `spawn` path still had the short leash.
 
 Three places also tell the child the opposite of what it must do now: the
 topology context update (`maki-agent/src/agent/frame.rs:341`, *"your result is

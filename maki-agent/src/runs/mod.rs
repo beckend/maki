@@ -66,8 +66,11 @@ pub use revive::{RevivePlan, TombstoneView};
 use shell::ShellRun;
 pub use shell::{AdoptEvent, Adopted, OutputSlice, ShellOptions};
 
-const AGENT_HANDLE_PREFIX: &str = "ag";
-const SHELL_HANDLE_PREFIX: &str = "sh";
+/// The handle of an agent run, and of a shell run. The prefix says what kind
+/// of run a handle names, so a notice about a run can be read without the
+/// run itself.
+const AGENT_HANDLE_PREFIX: &str = "ag-";
+const SHELL_HANDLE_PREFIX: &str = "sh-";
 const HANDLE_CHARS: usize = 6;
 /// Crockford base32: no `i`, `l`, `o`, `u`, so handles survive being read aloud.
 const HANDLE_ALPHABET: &[u8; 32] = b"0123456789abcdefghjkmnpqrstvwxyz";
@@ -108,9 +111,8 @@ impl UnitHandle {
     fn derive(prefix: &str, id: &UnitId) -> Self {
         let bytes = id.0.as_bytes();
         let mut bits = u32::from_be_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]);
-        let mut chars = String::with_capacity(prefix.len() + 1 + HANDLE_CHARS);
+        let mut chars = String::with_capacity(prefix.len() + HANDLE_CHARS);
         chars.push_str(prefix);
-        chars.push('-');
         for _ in 0..HANDLE_CHARS {
             chars.push(HANDLE_ALPHABET[(bits & 0x1f) as usize] as char);
             bits >>= 5;
@@ -498,7 +500,10 @@ impl SpawnRequest {
                     thinking: self.thinking,
                     output_schema: self.output_schema,
                     fork,
-                    one_shot: self.one_shot.unwrap_or(false),
+                    // A delegated child ends after its report: the parent is
+                    // woken when it does. `one_shot: false` asks for a child
+                    // that stays available for follow-up messages.
+                    one_shot: self.one_shot.unwrap_or(true),
                     timeout_secs: self.timeout_secs.unwrap_or(DEFAULT_AGENT_TIMEOUT_SECS),
                 })
             }
@@ -2058,15 +2063,23 @@ impl UnitHub {
     /// Whether the frontend may start a turn for `main` now. True when a waking
     /// item is queued; a notice-only wake spends the budget (design 4.3). When
     /// the budget is gone the waking notices turn quiet and one marker says so.
+    /// A settled agent is the result the parent asked for, so its notice wakes
+    /// even then; it still counts towards the streak, so the noise behind it
+    /// is the part that is held back.
     pub fn claim_main_wake(&self) -> bool {
         let mut guard = self.main_inbox.lock();
         if !guard.has_wakeable() {
             return false;
         }
+        // A message to main always wakes.
         if guard.has_non_notice_wakeable() {
             return true;
         }
         let mut budget = self.wake.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.has_settlement_wakeable() {
+            budget.streak = budget.streak.saturating_add(1);
+            return true;
+        }
         if budget.streak < WAKE_BUDGET {
             budget.streak += 1;
             return true;
@@ -3056,6 +3069,48 @@ mod tests {
                 .unwrap_err(),
             UnitError::UnknownRun
         );
+    }
+
+    /// The spec of a spawned run, for the fields the model does not name.
+    fn spec_of(hub: &UnitHub, id: UnitId) -> AgentSpec {
+        let table = hub.table();
+        let unit = table.units.get(&id).unwrap();
+        let UnitKind::Agent(spec) = &unit.kind else {
+            unreachable!("an agent run")
+        };
+        spec.clone()
+    }
+
+    /// A delegated child ends after its report: the parent is woken when it
+    /// does, so a background child does not park in `Idle`. `one_shot: false`
+    /// asks for a child that stays available.
+    #[test]
+    fn an_agent_run_is_one_shot_by_default() {
+        let hub = hub();
+        let main = hub.main();
+        let ack = hub.spawn(main, request(RunKind::Agent, "a")).unwrap();
+        assert!(
+            spec_of(&hub, ack.id).one_shot,
+            "a delegated child ends after its turn"
+        );
+        let mut req = request(RunKind::Agent, "b");
+        req.one_shot = Some(false);
+        let ack = hub.spawn(main, req).unwrap();
+        assert!(
+            !spec_of(&hub, ack.id).one_shot,
+            "one_shot: false keeps the child available"
+        );
+    }
+
+    /// A delegated child works unattended, so the limit it gets by default is
+    /// the session maximum, not a short leash: a child that was still working
+    /// died at 1800 s before.
+    #[test]
+    fn an_agent_run_without_a_limit_gets_the_session_maximum() {
+        let hub = hub();
+        let main = hub.main();
+        let ack = hub.spawn(main, request(RunKind::Agent, "a")).unwrap();
+        assert_eq!(spec_of(&hub, ack.id).timeout_secs, 86_400);
     }
 
     #[test]

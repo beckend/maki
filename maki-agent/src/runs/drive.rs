@@ -280,6 +280,14 @@ mod headless {
         rig.hub.spawn(rig.hub.main(), req).unwrap().id
     }
 
+    /// An agent whose notice is quiet: it does not wake `main`, so the join
+    /// has to deliver it with a closing turn.
+    fn quiet_agent(rig: &Rig) -> UnitId {
+        let mut req = tests::request(RunKind::Agent, "work");
+        req.notify = Some(NoticePolicy::Quiet);
+        rig.hub.spawn(rig.hub.main(), req).unwrap().id
+    }
+
     fn finish(rig: &Rig, id: UnitId) {
         let terminal = Terminal {
             reason: DoneReason::Completed,
@@ -387,14 +395,16 @@ mod headless {
     fn join_delivers_quiet_notices_as_closing_turn() {
         smol::block_on(async {
             let rig = rig(true);
-            let ids: Vec<_> = (0..5).map(|_| agent(&rig)).collect();
-            for &id in &ids[..WAKE_BUDGET as usize] {
+            let ids: Vec<_> = (0..WAKE_BUDGET as usize).map(|_| agent(&rig)).collect();
+            for &id in &ids {
                 finish(&rig, id);
                 wake(&rig).await;
                 let text = run_turn(&rig);
                 assert!(text.contains("<run-notice"), "{text}");
             }
-            for &id in &ids[WAKE_BUDGET as usize..] {
+            // These two are quiet: their notices do not wake `main`.
+            let quiet: Vec<_> = (0..2).map(|_| quiet_agent(&rig)).collect();
+            for &id in &quiet {
                 finish(&rig, id);
             }
             let deadline = rig.hub.deadline_after(BOUND);
@@ -402,10 +412,10 @@ mod headless {
             assert_eq!(hub.join_until(deadline).await, Joined::Pending);
             assert!(
                 rig.wakes.try_recv().is_err(),
-                "past the budget nothing wakes"
+                "a quiet notice does not wake"
             );
             let text = run_turn(&rig);
-            for &id in &ids[WAKE_BUDGET as usize..] {
+            for &id in &quiet {
                 let handle = rig.hub.get(id).unwrap().handle.to_string();
                 assert!(text.contains(&handle), "{handle} missing from {text}");
             }

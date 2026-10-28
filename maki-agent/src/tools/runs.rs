@@ -150,10 +150,12 @@ const SPAWNERS: ToolAudience = ToolAudience::MAIN.union(ToolAudience::GENERAL_SU
 
 const SPAWN_DESCRIPTION: &str =
     "Start background work and return immediately with its id. kind \"agent\" starts a
-subagent: a separate agent with its own context that works on a self-contained task and
-reports back. kind \"shell\" starts a command that keeps running while you continue. You
+subagent: a separate agent with its own context that works on a self-contained task. The
+child is told to send you its result with `send` before it finishes, and you are woken when
+it ends. kind \"shell\" starts a command that keeps running while you continue. You
 are notified when a run finishes; do not poll or sleep. Start independent runs together
-in one message. Use `wait` only when you are blocked on a result, `send` to talk to a
+in one assistant message and continue useful work while they run. Use `wait` only when
+you are blocked on a result and have nothing else to do, `send` to talk to a
 run, `stop` to end it, `runs` to look. Only a limited number of agents work at once;
 the rest show as queued with a position and start in order. A full queue returns
 QUEUE_FULL: wait for runs to finish. A timeout_secs above the session maximum is
@@ -162,17 +164,17 @@ not cut off at the default. An agent's clock starts when it starts working. Not 
 get DEPTH_LIMIT and must do the work yourself.
 
 Agent runs do not see this conversation, so the prompt must contain everything they
-need. They share your workspace. An agent run stays available after it reports and can
-receive follow-up messages unless one_shot is true.";
+need. They share your workspace. An agent run ends after its report unless one_shot is
+false, which keeps it available for follow-up messages.";
 
 const SEND_DESCRIPTION: &str =
     "Send a message to another run in this session: your child, your parent (name \"parent\"),
 or \"main\". (Siblings only if the session enables it.) The message is queued and returns a
 message id at once. A running recipient reads it at its next step; an idle one starts a turn
 with it; a finished or evicted agent with a saved transcript is revived first. Sending does not end your turn and is not an answer: the recipient's reply, if any,
-comes as a message to you. Use mode \"quiet\" for FYI notes that must not start a turn. Your
-final result reaches your parent on its own: use send to a parent only for a question or
-mid-run progress.";
+comes as a message to you. Use mode \"quiet\" for FYI notes that must not start a turn. A
+subagent sends its result to its parent this way: the parent does not see the subagent's
+transcript, so a result that is not sent is lost.";
 
 const WAIT_DESCRIPTION: &str =
     "Block until runs have finished their work or a timeout expires. Use only when you cannot
@@ -285,10 +287,10 @@ impl Which {
                     "thinking": {"type": "string"},
                     "output_schema": {"type": "object", "description": "agent only. JSON Schema the final result must satisfy."},
                     "context": {"type": "string", "enum": ["fresh", "fork"], "description": "agent only. fork seeds the run with your completed turns, excluding the turn in flight (default fresh)."},
-                    "one_shot": {"type": "boolean", "description": "agent only. Complete after the first result instead of staying available. Default false."},
+                    "one_shot": {"type": "boolean", "description": "agent only. Complete after the first result instead of staying available. Default true; set it to false to keep the agent available for follow-up messages."},
                     "command": {"type": "string", "description": "shell only. Command line run with the user's shell."},
                     "cwd": {"type": "string"},
-                    "timeout_secs": {"type": "integer", "minimum": 0, "description": "Wall clock limit. Default: 1800 for agents, 3600 for shell. 0 asks for the session maximum, so a long task is not cut off at the default. Expiry ends the run as timed_out."},
+                    "timeout_secs": {"type": "integer", "minimum": 0, "description": "Wall clock limit. Default: the session maximum for agents (86400s) and 3600 for shell. 0 asks for the session maximum, so a long task is not cut off at the default. Expiry ends the run as timed_out."},
                     "watch": {"type": "string", "description": "shell only. Regex (Rust syntax) matched against each stdout/stderr line; matches become notices, at most 1 per second (lines in between are batched) and 20 per minute, then one overflow notice. Wakes you only with notify=wake. A bad regex is rejected."},
                     "notify": {"type": "string", "enum": ["wake", "quiet", "never"], "description": "On finish: wake starts a turn if you are idle (default), quiet waits for your next turn, never sends nothing (read with runs)."}
                 }
