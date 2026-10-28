@@ -30,9 +30,9 @@ use crate::tools::{
 };
 use crate::types::EventSender;
 use crate::{
-        Agent, AgentConfig, AgentEvent, AgentInput, AgentMode, AgentParams, AgentSeed,
-        EventStreamGuard, McpHandle, McpSession, ModelSlot, PermissionsConfig, RunLedger, RunTotals,
-        SessionEvents, SessionMailbox, ToolDeferral, ToolOutputLines, event_stream,
+    Agent, AgentConfig, AgentEvent, AgentInput, AgentMode, AgentParams, AgentSeed,
+    EventStreamGuard, McpHandle, McpSession, ModelSlot, PermissionsConfig, RunLedger, RunTotals,
+    SessionEvents, SessionMailbox, ToolDeferral, ToolOutputLines, event_stream,
 };
 
 const SESSION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
