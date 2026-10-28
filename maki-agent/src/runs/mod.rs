@@ -2604,6 +2604,13 @@ impl UnitHub {
         }
         drop(guard);
         inbox.signal();
+        // `main` has no turn of its own to drain the inbox, so the frontend
+        // has to hear about it: without the event an idle parent never learns
+        // that its child reported, and the message waits for the next turn
+        // that something else starts.
+        if accepted == Accepted::Wake && to == self.main {
+            self.events.try_send(AgentEvent::RunNotice { wake: true });
+        }
         Ok(())
     }
 
