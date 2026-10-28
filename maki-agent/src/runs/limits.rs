@@ -81,7 +81,7 @@ mod tests {
             ),
             (4, 8, 4, 2, 8, 16, 10, 64, false)
         );
-        assert_eq!(l.default_timeout, Duration::from_secs(1800));
+        assert_eq!(l.default_timeout, Duration::from_secs(86_400));
         assert_eq!(l.max_timeout, Duration::from_secs(86_400));
         assert_eq!(
             (l.max_retained, l.max_idle, l.idle_timeout),

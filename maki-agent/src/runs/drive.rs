@@ -266,6 +266,14 @@ mod headless {
         rig.hub.spawn(rig.hub.main(), req).unwrap().id
     }
 
+    /// An agent whose notice is quiet: it does not wake `main`, so the join
+    /// has to deliver it with a closing turn.
+    fn quiet_agent(rig: &Rig) -> UnitId {
+        let mut req = tests::request(RunKind::Agent, "work");
+        req.notify = Some(NoticePolicy::Quiet);
+        rig.hub.spawn(rig.hub.main(), req).unwrap().id
+    }
+
     fn finish(rig: &Rig, id: UnitId) {
         let terminal = Terminal {
             reason: DoneReason::Completed,
@@ -402,9 +410,6 @@ mod headless {
         assert_eq!(hub.join_until(deadline).await, Joined::Quiet);
     }
 
-    /// A notice that settles while a turn is in flight must not start a
-    /// second one; it wakes `main` once that turn is over, and `join` stays
-    /// open across the whole window.
     #[tokio::test]
     async fn notice_at_turn_end_is_not_lost_or_doubled() {
         let rig = rig(true);

@@ -146,7 +146,7 @@ How many lines of output to show per tool in the UI. All values are `usize` with
 | `max_shells_per_owner` | u32 | `4` | 1 | Shell runs one run may have running at once |
 | `max_queue` | u32 | `16` | 1 | Agent runs that may wait for a free slot; a further `spawn` fails with QUEUE_FULL |
 | `spawn_per_minute` | u32 | `10` | 1 | Runs one run may start per rolling minute |
-| `default_timeout_secs` | u64 | `1800` | 1 | Wall clock limit of an agent run (seconds) unless `spawn` sets `timeout_secs`; counted from when it starts working |
+| `default_timeout_secs` | u64 | `86400` | 1 | Wall clock limit of an agent run (seconds) unless `spawn` sets `timeout_secs`; counted from when it starts working. A delegated child works unattended, so the default is the session maximum rather than a short leash |
 | `max_timeout_secs` | u64 | `86400` | 1 | Largest `timeout_secs` a `spawn` may ask for (seconds); larger values are lowered to it |
 | `permission_timeout_secs` | u64 | `120` | 1 | How long a run's permission prompt waits for the user (seconds) before it is denied; the run gives up its slot meanwhile |
 | `unattended_permissions` | string | `deny` | - | A run's permission prompt when nobody can answer (`maki -p`): `deny`, or `allow_under_yolo` to allow it under `--yolo` (`inherit_yolo` is a deprecated alias) |

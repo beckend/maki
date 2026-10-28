@@ -4,7 +4,7 @@ use maki_storage::frame::TopologyFacts;
 
 use super::{RunKind, UnitId, UnitLimits, UnitTable};
 
-const MAIN: &str = "main";
+pub(super) const MAIN: &str = "main";
 
 /// The kind tag of a child in the fact.
 fn kind_tag(kind: RunKind) -> u8 {
