@@ -527,11 +527,31 @@ fn validate_array(
     let Value::Array(arr) = coerce_container(value, ParamKind::Array, path)? else {
         unreachable!("coerce_container(_, Array) returns an Array")
     };
-    arr.into_iter()
+    unwrap_nested_array(arr, item_schema)
+        .into_iter()
         .enumerate()
         .map(|(i, item)| path.with_index(i, |p| walk(item_schema, item, p)))
         .collect::<Result<Vec<_>, _>>()
         .map(Value::Array)
+}
+
+/// A provider that cannot type a nested value sends an array inside a value
+/// it has no schema for, and it wraps that array again: the edits of a
+/// multiedit arrive as `[[{...}, {...}]]`. When the items are known and are
+/// not arrays themselves, the outer layer is the wrapper and the inner one
+/// is what the caller meant. An item of no known shape keeps its own.
+fn unwrap_nested_array(arr: Vec<Value>, item_schema: &ParamSchema) -> Vec<Value> {
+    if arr.len() != 1 {
+        return arr;
+    }
+    match item_schema {
+        ParamSchema::Any { .. } | ParamSchema::Array { .. } => return arr,
+        _ => {}
+    }
+    let Value::Array(inner) = &arr[0] else {
+        return arr;
+    };
+    inner.clone()
 }
 
 fn schema_type_name(schema: &ParamSchema) -> &'static str {
@@ -971,6 +991,65 @@ mod tests {
             out["edits"],
             json!([{"old_string": "a", "new_string": "b"}])
         );
+    }
+
+    #[test]
+    fn a_nested_array_is_read_as_the_array_it_wraps() {
+        // A provider that cannot type a nested value wraps the array again:
+        // the edits of a multiedit arrive as [[{...}, {...}]].
+        let out = validate(
+            &MULTIEDIT_LIKE,
+            json!({
+                "path": "/x",
+                "edits": [[{"old_string": "a", "new_string": "b"}]]
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            out["edits"],
+            json!([{"old_string": "a", "new_string": "b"}])
+        );
+    }
+
+    #[test]
+    fn an_array_of_arrays_keeps_its_shape() {
+        // The items are arrays themselves, so the outer layer is data.
+        const MATRIX: ParamSchema = ParamSchema::Object {
+            properties: &[(
+                "rows",
+                &ParamSchema::Array {
+                    items: &ParamSchema::Array {
+                        items: &STR_PRIM,
+                        description: "",
+                    },
+                    description: "",
+                },
+                true,
+                &[],
+            )],
+            description: "",
+        };
+        let out = validate(&MATRIX, json!({"rows": [["a"]]})).unwrap();
+        assert_eq!(out["rows"], json!([["a"]]));
+    }
+
+    #[test]
+    fn a_nested_array_under_an_unknown_item_keeps_its_shape() {
+        // Nothing is known about the items, so the shape may be the caller's.
+        const OPEN: ParamSchema = ParamSchema::Object {
+            properties: &[(
+                "rows",
+                &ParamSchema::Array {
+                    items: &ParamSchema::Any { description: "" },
+                    description: "",
+                },
+                true,
+                &[],
+            )],
+            description: "",
+        };
+        let out = validate(&OPEN, json!({"rows": [["a"]]})).unwrap();
+        assert_eq!(out["rows"], json!([["a"]]));
     }
 
     #[test]
