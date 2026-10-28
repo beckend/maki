@@ -78,6 +78,43 @@ pub async fn host_spawn(ctx: &ToolContext, input: Value) -> Result<HostSpawn, St
     })
 }
 
+/// `spawn` for a host whose run belongs to the call: the run is stopped when
+/// the call's token fires, so a caller that walked away from its sub-agent
+/// leaves no run behind holding one of the agent slots. A run that must
+/// outlive the call (a background task) is spawned with [`host_spawn`].
+pub async fn host_spawn_bound(ctx: &ToolContext, input: Value) -> Result<HostSpawn, String> {
+    let runs = host_runs(ctx)?;
+    let value = host_input(Which::Spawn, input)?;
+    let mut req: SpawnRequest = serde_json::from_value(value).map_err(|e| e.to_string())?;
+    req.origin_tool_use_id = ctx.tool_use_id.as_deref().map(Arc::from);
+    let ack = spawn_ack(runs, ctx, req).await?;
+    stop_with_caller(runs, ctx, ack.id);
+    Ok(HostSpawn {
+        text: started_text(&ack),
+        handle: ack.handle.to_string(),
+        name: ack.name.to_string(),
+        kind: ack.kind.as_str(),
+        state: ack.state.label().to_owned(),
+    })
+}
+
+/// Stops {id} when the caller's token fires. The token is the turn's, so it
+/// fires when the turn ends, cancelled or not: a sub-agent that belongs to
+/// the turn dies with it instead of running on, holding a slot the next
+/// sub-agent needs.
+fn stop_with_caller(runs: &RunsCtx, ctx: &ToolContext, id: UnitId) {
+    let hub = Arc::downgrade(&runs.hub);
+    let caller = runs.self_run;
+    let cancel = ctx.cancel.clone();
+    smol::spawn(async move {
+        cancel.cancelled().await;
+        if let Some(hub) = hub.upgrade() {
+            hub.stop(caller, &[id], StopOpts::default());
+        }
+    })
+    .detach();
+}
+
 /// `wait` for a host: the settled views and whether the wait was satisfied.
 pub async fn host_wait(ctx: &ToolContext, input: Value) -> Result<(Vec<UnitView>, bool), String> {
     let runs = host_runs(ctx)?;
