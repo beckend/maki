@@ -1215,4 +1215,53 @@ mod delegated {
         let views = s.hub.list(s.hub.main(), maki_agent::runs::Scope::All);
         assert_eq!(views.len(), 1);
     }
+
+    /// The user's report: a cancelled sub-agent must not stop the next one
+    /// from being spawned. A cancelled run that keeps its slot makes every
+    /// later task queue behind a dead run, and a cancelled run that stays
+    /// live keeps the parent's child count up.
+    #[test]
+    fn a_cancelled_task_leaves_the_next_task_free_to_spawn() {
+        let (trigger, token) = maki_agent::cancel::CancelToken::new();
+        let trigger = std::sync::Mutex::new(Some(trigger));
+        let mut provider = MockProvider::new(vec![reply(ANSWER), reply(ANSWER)]);
+        provider.on_request = Some(Box::new(move || {
+            if let Some(t) = trigger.lock().unwrap().take() {
+                t.cancel();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }));
+        let mut s = setup_with(provider);
+        s.ctx.cancel = token;
+        let out = run_task(&s, json!({"description": "x", "prompt": "y"}));
+        assert!(out.unwrap_err().contains("cancelled"));
+        let views = s.hub.list(s.hub.main(), maki_agent::runs::Scope::All);
+        assert_eq!(views.len(), 1);
+        // The stop is asynchronous: the run settles when its driver sees the
+        // cancel. Give it the time it needs, then look.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let state = s.hub.list(s.hub.main(), maki_agent::runs::Scope::All)[0]
+                .state_label()
+                .to_owned();
+            if state == "killed" || state == "failed" || state == "completed" {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the cancelled run never settled, it stayed {state}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert_eq!(
+            s.hub.slots_in_use(),
+            0,
+            "a stopped run must not hold an agent slot"
+        );
+        // The next task, in a fresh turn with a fresh token, must run.
+        s.ctx.cancel = maki_agent::cancel::CancelToken::none();
+        let out = run_task(&s, json!({"description": "y", "prompt": "z"}));
+        assert_eq!(out.unwrap(), ANSWER);
+        assert_eq!(s.hub.slots_in_use(), 0);
+    }
 }
