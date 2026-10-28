@@ -767,6 +767,25 @@ impl UnitTable {
             .count()
     }
 
+    /// Children that still use up the owner's room: running, queued or on
+    /// their way out. An idle agent has finished its turn and holds no slot,
+    /// so it must not take room away from work in flight: a model that
+    /// started eight sub-agents could not start a ninth, because all eight
+    /// were finished and only waiting for a follow-up.
+    fn busy_children(&self, id: UnitId) -> usize {
+        self.children
+            .get(&id)
+            .into_iter()
+            .flatten()
+            .filter(|c| {
+                matches!(
+                    self.units[c].state,
+                    UnitState::Running | UnitState::Queued | UnitState::Stopping
+                )
+            })
+            .count()
+    }
+
     /// Gives free slots to the head of the line; a run that was `Queued`
     /// becomes `Running`. The caller wakes the waiters after the lock.
     fn promote(&mut self, max: usize) {
@@ -1075,8 +1094,8 @@ impl UnitHub {
         if kind.kind() == RunKind::Agent && caller_depth >= self.limits.max_depth {
             return Err(UnitError::DepthLimit);
         }
-        let live = table.live_children(caller);
-        if live >= usize::from(self.limits.max_children_per_run)
+        let busy = table.busy_children(caller);
+        if busy >= usize::from(self.limits.max_children_per_run)
             || table.spawned >= usize::from(self.limits.session_max_runs)
         {
             return Err(UnitError::SpawnLimit);

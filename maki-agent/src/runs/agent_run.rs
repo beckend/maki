@@ -323,6 +323,34 @@ fn completes_with_result_and_goes_idle() {
     assert_eq!(result.turns, 1);
 }
 
+/// An agent that finished its turn stays available for a follow-up, but it
+/// holds no slot and no room: it must not use up the owner's child budget.
+/// Otherwise a model that started eight sub-agents could not start a
+/// ninth, and every later spawn came back as SPAWN_LIMIT.
+#[test]
+fn an_idle_agent_does_not_use_up_the_child_budget() {
+    const SECOND: &str = "SECOND-TASK";
+    let script = Script::new(vec![
+        (CHILD, vec![Step::Reply(reply("found it"))]),
+        (SECOND, vec![Step::Reply(reply("found that"))]),
+    ]);
+    let rig = rig_with(
+        &script,
+        UnitLimits {
+            max_children_per_run: 1,
+            ..UnitLimits::default()
+        },
+    );
+    let first = spawn(&rig, CHILD, json!({}));
+    let view = settle(&rig, first.id);
+    assert_eq!(view.state.label(), "idle");
+    // The second spawn must be admitted: the first one is finished.
+    let second = spawn(&rig, SECOND, json!({}));
+    let view = settle(&rig, second.id);
+    assert_eq!(view.state.label(), "idle");
+    assert_eq!(view.result.unwrap().summary, "found that");
+}
+
 #[test]
 fn one_shot_completes() {
     let script = Script::new(vec![(CHILD, vec![Step::Reply(reply("all done"))])]);

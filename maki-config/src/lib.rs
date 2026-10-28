@@ -1658,7 +1658,7 @@ pub struct RunsConfig {
     #[config(default = DEFAULT_RUNS_MAX_DEPTH, min = MIN_RUNS_MAX_DEPTH, desc = "Deepest agent nesting (the main agent is 0); an agent at this depth cannot spawn agents")]
     pub max_depth: u32,
 
-    #[config(default = DEFAULT_RUNS_MAX_CHILDREN, min = MIN_RUNS_LIMIT, desc = "Most unfinished runs one run may have started")]
+    #[config(default = DEFAULT_RUNS_MAX_CHILDREN, min = MIN_RUNS_LIMIT, desc = "Most runs one run may have in flight at once; a finished run that stays available does not use it up")]
     pub max_children_per_run: u32,
 
     #[config(default = DEFAULT_RUNS_SESSION_MAX, min = MIN_RUNS_LIMIT, desc = "Most runs one session may start in total")]
