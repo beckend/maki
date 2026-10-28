@@ -351,6 +351,28 @@ fn an_idle_agent_does_not_use_up_the_child_budget() {
     assert_eq!(view.result.unwrap().summary, "found that");
 }
 
+/// An idle agent that is woken by a message takes a slot again, and the hub
+/// has to call it running again: a run that is still called idle cannot
+/// settle, so the answer of the new turn was dropped and the run was killed.
+#[test]
+fn a_woken_idle_agent_keeps_its_answer() {
+    let script = Script::new(vec![(
+        CHILD,
+        vec![Step::Reply(reply("first")), Step::Reply(reply("second"))],
+    )]);
+    let rig = rig(&script);
+    let ack = spawn(&rig, CHILD, json!({}));
+    let view = settle(&rig, ack.id);
+    assert_eq!(view.state.label(), "idle");
+    assert_eq!(view.result.unwrap().summary, "first");
+    // A message wakes the run: it works again and answers.
+    say(&rig, rig.hub.main(), ack.id, "more", DeliveryKind::Steer);
+    await_requests(&script, CHILD, 2);
+    let view = settle(&rig, ack.id);
+    assert_eq!(view.state.label(), "idle");
+    assert_eq!(view.result.unwrap().summary, "second");
+}
+
 #[test]
 fn one_shot_completes() {
     let script = Script::new(vec![(CHILD, vec![Step::Reply(reply("all done"))])]);
