@@ -64,7 +64,7 @@ async fn stop_a_running_agent_then_spawn_another() {
     let before = rig.hub.slots_in_use();
 
     let first = spawn(&rig, "FIRST-TASK", json!({})).await;
-    await_requests(&script, "FIRST-TASK", 1);
+    await_requests(&script, "FIRST-TASK", 1).await;
     assert_eq!(rig.hub.slots_in_use(), before + 1, "the run holds a slot");
 
     let outcomes = rig.hub.stop(main, &[first.id], StopOpts::default());
@@ -82,7 +82,7 @@ async fn stop_a_running_agent_then_spawn_another() {
         !matches!(second.state, UnitState::Queued),
         "the new run must not queue behind a dead one"
     );
-    await_requests(&script, "SECOND-TASK", 1);
+    await_requests(&script, "SECOND-TASK", 1).await;
     let view = settle_bounded(&rig, second.id, Duration::from_secs(10));
     assert!(
         matches!(view.state, UnitState::Done(_) | UnitState::Idle),
@@ -104,7 +104,7 @@ async fn stop_a_queued_agent_then_spawn_another() {
     let main = rig.hub.main();
 
     let first = spawn(&rig, "FIRST-TASK", json!({})).await;
-    await_requests(&script, "FIRST-TASK", 1);
+    await_requests(&script, "FIRST-TASK", 1).await;
     let second = spawn(&rig, "SECOND-TASK", json!({})).await;
     assert!(
         matches!(second.state, UnitState::Queued),
@@ -135,7 +135,7 @@ async fn stop_a_queued_agent_then_spawn_another() {
     // Freeing the slot must hand it to the live queued run.
     rig.hub.stop(main, &[first.id], StopOpts::default());
     settle_bounded(&rig, first.id, Duration::from_secs(10));
-    await_requests(&script, "THIRD-TASK", 1);
+    await_requests(&script, "THIRD-TASK", 1).await;
     let view = settle_bounded(&rig, third.id, Duration::from_secs(10));
     assert!(
         matches!(view.state, UnitState::Done(_) | UnitState::Idle),
@@ -157,7 +157,7 @@ async fn cancel_the_wait_then_stop_then_spawn_another() {
     let main = rig.hub.main();
 
     let first = spawn(&rig, "FIRST-TASK", json!({})).await;
-    await_requests(&script, "FIRST-TASK", 1);
+    await_requests(&script, "FIRST-TASK", 1).await;
 
     // Esc during the `task` call: the tool's cancel token fires.
     let (trigger, token) = CancelToken::new();
@@ -194,7 +194,7 @@ async fn cancel_the_wait_then_stop_then_spawn_another() {
         !matches!(second.state, UnitState::Queued),
         "the new run must not queue behind the cancelled one"
     );
-    await_requests(&script, "SECOND-TASK", 1);
+    await_requests(&script, "SECOND-TASK", 1).await;
     let view = settle_bounded(&rig, second.id, Duration::from_secs(10));
     assert!(
         matches!(view.state, UnitState::Done(_) | UnitState::Idle),
@@ -229,7 +229,7 @@ async fn five_cancels_in_a_row_keep_the_capacity() {
     ];
     for round in 0..5 {
         let first = spawn(&rig, routes[round], json!({})).await;
-        await_requests(&script, routes[round], 1);
+        await_requests(&script, routes[round], 1).await;
         let _ = (rig.hub.wait(
             main,
             &[first.id],
@@ -253,7 +253,7 @@ async fn five_cancels_in_a_row_keep_the_capacity() {
             !matches!(next.state, UnitState::Queued),
             "round {round}: the new run must not queue"
         );
-        await_requests(&script, routes[round + 1], 1);
+        await_requests(&script, routes[round + 1], 1).await;
         let view = settle_bounded(&rig, next.id, Duration::from_secs(10));
         assert!(
             matches!(view.state, UnitState::Done(_) | UnitState::Idle),
@@ -290,7 +290,7 @@ async fn five_cancels_with_one_slot_keep_the_pool_free() {
     ];
     for round in 0..5 {
         let first = spawn(&rig, routes[round], json!({})).await;
-        await_requests(&script, routes[round], 1);
+        await_requests(&script, routes[round], 1).await;
         let _ = (rig.hub.wait(
             main,
             &[first.id],
@@ -317,7 +317,7 @@ async fn five_cancels_with_one_slot_keep_the_pool_free() {
             !matches!(next.state, UnitState::Queued),
             "round {round}: the new run must not queue"
         );
-        await_requests(&script, routes[round + 1], 1);
+        await_requests(&script, routes[round + 1], 1).await;
         let view = settle_bounded(&rig, next.id, Duration::from_secs(10));
         assert!(
             matches!(view.state, UnitState::Done(_) | UnitState::Idle),
@@ -339,7 +339,7 @@ async fn a_cancelled_run_is_not_a_live_child() {
     trigger.cancel();
 
     let first = spawn(&rig, "ALPHA-TASK", json!({})).await;
-    await_requests(&script, "ALPHA-TASK", 1);
+    await_requests(&script, "ALPHA-TASK", 1).await;
     let _ = (rig.hub.wait(
         main,
         &[first.id],
@@ -372,7 +372,7 @@ async fn the_freed_slot_goes_to_the_live_run_not_the_dead_one() {
     let main = rig.hub.main();
 
     let first = spawn(&rig, "FIRST-TASK", json!({})).await;
-    await_requests(&script, "FIRST-TASK", 1);
+    await_requests(&script, "FIRST-TASK", 1).await;
     let second = spawn(&rig, "SECOND-TASK", json!({})).await;
     assert!(matches!(second.state, UnitState::Queued));
 
@@ -390,7 +390,7 @@ async fn the_freed_slot_goes_to_the_live_run_not_the_dead_one() {
     // Kill the running one: the slot must go to the live queued run.
     rig.hub.stop(main, &[first.id], StopOpts::default());
     settle_bounded(&rig, first.id, Duration::from_secs(10));
-    await_requests(&script, "THIRD-TASK", 1);
+    await_requests(&script, "THIRD-TASK", 1).await;
     assert!(
         rig.hub.table().pool.holds(third.id),
         "the live run holds the freed slot"
@@ -437,7 +437,7 @@ async fn the_plugin_path_after_a_cancel_still_spawns() {
     ))
     .await
     .expect("the first spawn works");
-    await_requests(&script, "FIRST-TASK", 1);
+    await_requests(&script, "FIRST-TASK", 1).await;
     let first_id = rig
         .hub
         .resolve(rig.hub.main(), &first.handle)
@@ -483,7 +483,7 @@ async fn the_plugin_path_after_a_cancel_still_spawns() {
         second.as_ref().err()
     );
     let second = second.unwrap();
-    await_requests(&script, "SECOND-TASK", 1);
+    await_requests(&script, "SECOND-TASK", 1).await;
     let second_id = rig
         .hub
         .resolve(rig.hub.main(), &second.handle)
@@ -556,7 +556,7 @@ async fn a_cancel_leaves_no_pool_ghost() {
     trigger.cancel();
 
     let first = spawn(&rig, "ALPHA-TASK", json!({})).await;
-    await_requests(&script, "ALPHA-TASK", 1);
+    await_requests(&script, "ALPHA-TASK", 1).await;
     check_pool(&rig, "before the cancel");
     let _ = (rig.hub.wait(
         main,
@@ -600,7 +600,7 @@ async fn a_cancelled_parent_cascade_frees_every_slot() {
     let main = rig.hub.main();
 
     let parent = spawn(&rig, "PARENT-TASK", json!({})).await;
-    await_requests(&script, "PARENT-TASK", 2);
+    await_requests(&script, "PARENT-TASK", 2).await;
     let kids = rig.hub.list(parent.id, Scope::Children);
     assert_eq!(kids.len(), 1, "the parent spawned a child");
     let kid = kids[0].id;
@@ -618,7 +618,7 @@ async fn a_cancelled_parent_cascade_frees_every_slot() {
     let script2 = Script::new(vec![("NEXT-TASK", vec![Step::Reply(reply("next"))])]);
     let rig2 = rig_with(&script2, UnitLimits::default());
     let next = spawn(&rig2, "NEXT-TASK", json!({})).await;
-    await_requests(&script2, "NEXT-TASK", 1);
+    await_requests(&script2, "NEXT-TASK", 1).await;
     let view = settle_bounded(&rig2, next.id, Duration::from_secs(10));
     assert!(
         matches!(view.state, UnitState::Done(_) | UnitState::Idle),
@@ -654,7 +654,7 @@ async fn a_cancelled_wait_by_a_slot_holding_parent_keeps_the_pool_sane() {
     let main = rig.hub.main();
 
     let parent = spawn(&rig, "PARENT-TASK", json!({})).await;
-    await_requests(&script, "PARENT-TASK", 2);
+    await_requests(&script, "PARENT-TASK", 2).await;
     let kids = rig.hub.list(parent.id, Scope::Children);
     assert_eq!(kids.len(), 1);
     let kid = kids[0].id;
@@ -665,7 +665,7 @@ async fn a_cancelled_wait_by_a_slot_holding_parent_keeps_the_pool_sane() {
             Instant::now() < deadline,
             "the parent never gave its slot up"
         );
-        std::thread::sleep(Duration::from_millis(2));
+        tokio::time::sleep(Duration::from_millis(2)).await;
     }
     check_pool(&rig, "while the parent waits");
 
@@ -706,7 +706,7 @@ async fn eight_cancels_do_not_use_up_the_child_budget() {
 
     for (n, route) in TASK_ROUTE.iter().enumerate().take(8) {
         let id = spawn(&rig, route, json!({})).await.id;
-        await_requests(&script, route, 1);
+        await_requests(&script, route, 1).await;
         let _ = (rig
             .hub
             .wait(main, &[id], WaitMode::All, Duration::from_secs(600), &token))
@@ -728,7 +728,7 @@ async fn eight_cancels_do_not_use_up_the_child_budget() {
         !matches!(ninth.state, UnitState::Queued),
         "the ninth spawn must not queue"
     );
-    await_requests(&script, TASK_ROUTE[8], 1);
+    await_requests(&script, TASK_ROUTE[8], 1).await;
 }
 
 /// The route names the rounds above use. Distinct, and no name is a prefix

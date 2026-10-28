@@ -326,6 +326,34 @@ async fn completes_with_result_and_goes_idle() {
     assert_eq!(result.turns, 1);
 }
 
+/// An agent that finished its turn stays available for a follow-up, but it
+/// holds no slot and no room: it must not use up the owner's child budget.
+/// Otherwise a model that started eight sub-agents could not start a
+/// ninth, and every later spawn came back as SPAWN_LIMIT.
+#[tokio::test]
+async fn an_idle_agent_does_not_use_up_the_child_budget() {
+    const SECOND: &str = "SECOND-TASK";
+    let script = Script::new(vec![
+        (CHILD, vec![Step::Reply(reply("found it"))]),
+        (SECOND, vec![Step::Reply(reply("found that"))]),
+    ]);
+    let rig = rig_with(
+        &script,
+        UnitLimits {
+            max_children_per_run: 1,
+            ..UnitLimits::default()
+        },
+    );
+    let first = spawn(&rig, CHILD, json!({})).await;
+    let view = settle(&rig, first.id).await;
+    assert_eq!(view.state.label(), "idle");
+    // The second spawn must be admitted: the first one is finished.
+    let second = spawn(&rig, SECOND, json!({})).await;
+    let view = settle(&rig, second.id).await;
+    assert_eq!(view.state.label(), "idle");
+    assert_eq!(view.result.unwrap().summary, "found that");
+}
+
 #[tokio::test]
 async fn one_shot_completes() {
     let script = Script::new(vec![(CHILD, vec![Step::Reply(reply("all done"))])]);
@@ -2990,7 +3018,7 @@ mod chaos {
         {
             assert!(Instant::now() < deadline, "seed {seed}: runs never settled");
             rig.clock.advance(Duration::from_secs(6));
-            std::thread::sleep(Duration::from_millis(5));
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
         check_transitions(&mut seen, &revived, &rig, seed);
         assert_eq!(rig.hub.slots_in_use(), 0, "seed {seed}: leaked slots");
@@ -3020,7 +3048,7 @@ mod chaos {
                 Instant::now() < deadline,
                 "seed {seed}: a task keeps the hub alive"
             );
-            std::thread::sleep(Duration::from_millis(5));
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
     }
 
@@ -3103,7 +3131,7 @@ mod chaos {
         };
         started(SLOTS);
         // Give any wrongly admitted fifth agent a chance to show up.
-        std::thread::sleep(Duration::from_millis(50));
+        tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(script.order().len(), SLOTS, "queued agents ran early");
         assert_eq!(rig.hub.slots_in_use(), SLOTS);
         assert_eq!(rig.hub.table().pool.queued_len(), N - SLOTS);
@@ -3176,7 +3204,7 @@ mod chaos {
                 started.elapsed() < Duration::from_secs(20),
                 "timer never fired"
             );
-            std::thread::sleep(Duration::from_millis(10));
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
         let view = rig.hub.get(ack.id).unwrap();
         let UnitState::Done(term) = &view.state else {
@@ -3187,7 +3215,7 @@ mod chaos {
         assert_eq!(rig.hub.slots_in_use(), 0);
         // Releasing the runner afterwards must not settle it a second time.
         release.send(()).unwrap();
-        std::thread::sleep(Duration::from_millis(50));
+        tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(finished_order(&rig).len(), 1);
         let after = rig.hub.get(ack.id).unwrap();
         assert_eq!(after.state.label(), "killed");

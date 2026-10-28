@@ -138,7 +138,7 @@ How many lines of output to show per tool in the UI. All values are `usize` with
 |-------|------|---------|-----|-------------|
 | `enabled` | bool | `false` | - | Register the `spawn`, `send`, `runs`, `wait` and `stop` tools for background agents and shell jobs |
 | `max_depth` | u32 | `2` | 1 | Deepest agent nesting (the main agent is 0); an agent at this depth cannot spawn agents |
-| `max_children_per_run` | u32 | `8` | 1 | Most unfinished runs one run may have started |
+| `max_children_per_run` | u32 | `8` | 1 | Most runs one run may have in flight at once; a finished run that stays available does not use it up |
 | `session_max_runs` | u32 | `64` | 1 | Most runs one session may start in total |
 | `siblings` | bool | `false` | - | Let runs with the same parent message each other with `send`. Off: a run reaches only its parent, its children and `main` |
 | `max_agents` | u32 | `4` | 1 | Agent runs that may work at once; more start queued, first come first served. A run waiting in `wait` does not count |

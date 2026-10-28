@@ -766,6 +766,25 @@ impl UnitTable {
             .count()
     }
 
+    /// Children that still use up the owner's room: running, queued or on
+    /// their way out. An idle agent has finished its turn and holds no slot,
+    /// so it must not take room away from work in flight: a model that
+    /// started eight sub-agents could not start a ninth, because all eight
+    /// were finished and only waiting for a follow-up.
+    fn busy_children(&self, id: UnitId) -> usize {
+        self.children
+            .get(&id)
+            .into_iter()
+            .flatten()
+            .filter(|c| {
+                matches!(
+                    self.units[c].state,
+                    UnitState::Running | UnitState::Queued | UnitState::Stopping
+                )
+            })
+            .count()
+    }
+
     /// Gives free slots to the head of the line; a run that was `Queued`
     /// becomes `Running`. The caller wakes the waiters after the lock.
     fn promote(&mut self, max: usize) {
@@ -1074,8 +1093,8 @@ impl UnitHub {
         if kind.kind() == RunKind::Agent && caller_depth >= self.limits.max_depth {
             return Err(UnitError::DepthLimit);
         }
-        let live = table.live_children(caller);
-        if live >= usize::from(self.limits.max_children_per_run)
+        let busy = table.busy_children(caller);
+        if busy >= usize::from(self.limits.max_children_per_run)
             || table.spawned >= usize::from(self.limits.session_max_runs)
         {
             return Err(UnitError::SpawnLimit);
@@ -2955,8 +2974,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_zero_timeout_asks_for_the_session_maximum() {
+    #[tokio::test]
+    async fn a_zero_timeout_asks_for_the_session_maximum() {
         let hub = hub_with(UnitLimits {
             default_timeout: Duration::from_secs(1800),
             max_timeout: Duration::from_secs(3600),
@@ -2981,8 +3000,8 @@ mod tests {
         assert_eq!(timeout_of(&hub, ack.id), 3600);
     }
 
-    #[test]
-    fn an_agent_without_a_timeout_gets_the_default() {
+    #[tokio::test]
+    async fn an_agent_without_a_timeout_gets_the_default() {
         let hub = hub_with(UnitLimits {
             default_timeout: Duration::from_secs(1800),
             max_timeout: Duration::from_secs(3600),
@@ -2993,8 +3012,8 @@ mod tests {
         assert_eq!(timeout_of(&hub, ack.id), 1800);
     }
 
-    #[test]
-    fn depth_limit_rejects_agent_spawn() {
+    #[tokio::test]
+    async fn depth_limit_rejects_agent_spawn() {
         let hub = hub_with(UnitLimits {
             max_depth: 1,
             ..UnitLimits::default()

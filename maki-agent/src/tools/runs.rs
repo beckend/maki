@@ -950,8 +950,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn schema_matches_snapshot() {
+    #[tokio::test]
+    async fn schema_matches_snapshot() {
         let mut actual = Map::new();
         for which in ALL {
             actual.insert(which.name().to_owned(), which.json_schema());
