@@ -68,7 +68,7 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "1.0.3-fork"
+version = "1.0.4-fork"
 edition = "2024"
 authors = ["Tony Solomonik <tony.solomonik@gmail.com>"]
 license = "MIT"
