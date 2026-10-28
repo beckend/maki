@@ -8,6 +8,8 @@ pub mod agent;
 #[cfg(test)]
 mod agent_run;
 mod broker;
+#[cfg(test)]
+mod cancel_repro;
 pub mod clock;
 mod drive;
 pub mod inbox;
@@ -643,6 +645,16 @@ struct UnitTable {
 /// Window of the per-owner spawn rate.
 const SPAWN_WINDOW: Duration = Duration::from_secs(60);
 
+/// Whether a run may hold an agent slot: it is queued, working or idle. A
+/// run that is stopping or done cannot work any more, so it must not be
+/// given a slot it would only hold until it settles.
+fn can_work(state: &UnitState) -> bool {
+    matches!(
+        state,
+        UnitState::Queued | UnitState::Running | UnitState::Idle
+    )
+}
+
 fn settled_info(run: UnitId, handle: String, name: String, generation: u64) -> NoticeInfo {
     NoticeInfo {
         kind: NoticeKind::Settled,
@@ -759,12 +771,16 @@ impl UnitTable {
     /// becomes `Running`. The caller wakes the waiters after the lock.
     fn promote(&mut self, max: usize) {
         let units = &self.units;
-        self.pool.resume(|id| {
-            units
-                .get(&id)
-                .is_none_or(|u| matches!(u.state, UnitState::Done(_) | UnitState::Idle))
-        });
-        for id in self.pool.grant(max) {
+        let admissible = |id: UnitId| units.get(&id).is_some_and(|u| can_work(&u.state));
+        self.pool.resume(
+            |id| {
+                units
+                    .get(&id)
+                    .is_none_or(|u| matches!(u.state, UnitState::Done(_) | UnitState::Idle))
+            },
+            admissible,
+        );
+        for id in self.pool.grant(max, admissible) {
             let Some(unit) = self.units.get_mut(&id) else {
                 continue;
             };
@@ -1166,7 +1182,11 @@ impl UnitHub {
         table.units.insert(id, unit);
         if is_agent {
             table.pool.request(id, false);
-            table.pool.grant(max_agents);
+            // `promote`, not a bare `grant`: the run that takes the slot has
+            // to say so (state and event), and a run that was waiting for
+            // one has to be woken. A bare grant left the run `Queued` while
+            // it worked, and its driver asleep.
+            table.promote(max_agents);
         }
         let queue_position = table.pool.position(id);
         let started = shell_spec.map(|spec| {
@@ -1210,6 +1230,9 @@ impl UnitHub {
         );
         table.outbox.push(started_event);
         self.release(table);
+        // A slot may have gone to a run that was waiting for one, so the
+        // waiters have to look again.
+        self.settled.notify(usize::MAX);
         if let Some((spec, run)) = started {
             let hub = Arc::downgrade(self);
             let (clock, opts) = (Arc::clone(&self.clock), self.shell.clone());

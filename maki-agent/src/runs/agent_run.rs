@@ -22,10 +22,10 @@ use crate::cancel::CancelToken;
 use crate::tools::ToolContext;
 use crate::tools::test_support::stub_ctx;
 
-const PARENT: &str = "PARENT-SCRIPT";
-const CHILD: &str = "CHILD-TASK";
+pub(super) const PARENT: &str = "PARENT-SCRIPT";
+pub(super) const CHILD: &str = "CHILD-TASK";
 
-enum Step {
+pub(super) enum Step {
     Reply(StreamResponse),
     Gate(flume::Receiver<()>, StreamResponse),
     Hang,
@@ -37,7 +37,7 @@ enum Step {
 
 /// Answers by the first user message: each route has its own queue, so two
 /// agents sharing the provider never steal each other's answers.
-struct Script {
+pub(super) struct Script {
     routes: Mutex<Vec<(&'static str, VecDeque<Step>)>>,
     seen: Mutex<Vec<(String, Vec<Value>)>>,
     /// Routes whose every request must come from a run that holds a slot.
@@ -47,7 +47,7 @@ struct Script {
 }
 
 impl Script {
-    fn new(routes: Vec<(&'static str, Vec<Step>)>) -> Arc<Self> {
+    pub(super) fn new(routes: Vec<(&'static str, Vec<Step>)>) -> Arc<Self> {
         Arc::new(Self {
             routes: Mutex::new(routes.into_iter().map(|(k, v)| (k, v.into())).collect()),
             seen: Mutex::default(),
@@ -57,19 +57,19 @@ impl Script {
     }
 
     /// From now on a request on `route` without a slot for `id` is a breach.
-    fn watch(&self, route: &'static str, hub: &Arc<UnitHub>, id: UnitId) {
+    pub(super) fn watch(&self, route: &'static str, hub: &Arc<UnitHub>, id: UnitId) {
         self.watch
             .lock()
             .unwrap()
             .push((route, Arc::clone(hub), id));
     }
 
-    fn assert_slots_held(&self) {
+    pub(super) fn assert_slots_held(&self) {
         let breaches = self.breaches.lock().unwrap();
         assert!(breaches.is_empty(), "requests without a slot: {breaches:?}");
     }
 
-    fn requests(&self, route: &str) -> usize {
+    pub(super) fn requests(&self, route: &str) -> usize {
         self.seen
             .lock()
             .unwrap()
@@ -79,7 +79,7 @@ impl Script {
     }
 
     /// The routes of the requests in the order they came.
-    fn order(&self) -> Vec<String> {
+    pub(super) fn order(&self) -> Vec<String> {
         self.seen
             .lock()
             .unwrap()
@@ -88,7 +88,7 @@ impl Script {
             .collect()
     }
 
-    fn messages_of(&self, route: &str, n: usize) -> Vec<Value> {
+    pub(super) fn messages_of(&self, route: &str, n: usize) -> Vec<Value> {
         self.seen
             .lock()
             .unwrap()
@@ -164,7 +164,7 @@ impl Provider for Script {
     }
 }
 
-fn reply(text: &str) -> StreamResponse {
+pub(super) fn reply(text: &str) -> StreamResponse {
     response(
         vec![ContentBlock::Text { text: text.into() }],
         StopReason::EndTurn,
@@ -172,7 +172,7 @@ fn reply(text: &str) -> StreamResponse {
     )
 }
 
-fn tool_use(id: &str, name: &str, input: Value) -> StreamResponse {
+pub(super) fn tool_use(id: &str, name: &str, input: Value) -> StreamResponse {
     response(
         vec![ContentBlock::tool_use(id, name, input)],
         StopReason::ToolUse,
@@ -180,7 +180,11 @@ fn tool_use(id: &str, name: &str, input: Value) -> StreamResponse {
     )
 }
 
-fn response(content: Vec<ContentBlock>, stop: StopReason, usage: TokenUsage) -> StreamResponse {
+pub(super) fn response(
+    content: Vec<ContentBlock>,
+    stop: StopReason,
+    usage: TokenUsage,
+) -> StreamResponse {
     StreamResponse {
         message: Message {
             role: Role::Assistant,
@@ -193,19 +197,19 @@ fn response(content: Vec<ContentBlock>, stop: StopReason, usage: TokenUsage) -> 
     }
 }
 
-struct Rig {
-    ctx: ToolContext,
-    hub: Arc<UnitHub>,
-    events: flume::Receiver<Envelope>,
-    dir: TempDir,
-    clock: Arc<ManualClock>,
+pub(super) struct Rig {
+    pub(super) ctx: ToolContext,
+    pub(super) hub: Arc<UnitHub>,
+    pub(super) events: flume::Receiver<Envelope>,
+    pub(super) dir: TempDir,
+    pub(super) clock: Arc<ManualClock>,
 }
 
-fn rig(script: &Arc<Script>) -> Rig {
+pub(super) fn rig(script: &Arc<Script>) -> Rig {
     rig_with(script, UnitLimits::default())
 }
 
-fn rig_with(script: &Arc<Script>, limits: UnitLimits) -> Rig {
+pub(super) fn rig_with(script: &Arc<Script>, limits: UnitLimits) -> Rig {
     let mut ctx = stub_ctx(&AgentMode::Build);
     ctx.provider = script.clone();
     let registry = crate::tools::ToolRegistry::new();
@@ -242,7 +246,7 @@ fn rig_with(script: &Arc<Script>, limits: UnitLimits) -> Rig {
     }
 }
 
-fn agent_req(prompt: &str, extra: Value) -> SpawnRequest {
+pub(super) fn agent_req(prompt: &str, extra: Value) -> SpawnRequest {
     let mut input = json!({"kind": "agent", "description": "work", "prompt": prompt});
     input
         .as_object_mut()
@@ -251,7 +255,7 @@ fn agent_req(prompt: &str, extra: Value) -> SpawnRequest {
     serde_json::from_value(input).unwrap()
 }
 
-fn spawn_as(rig: &Rig, caller: UnitId, req: SpawnRequest) -> SpawnAck {
+pub(super) fn spawn_as(rig: &Rig, caller: UnitId, req: SpawnRequest) -> SpawnAck {
     let spec = match req.clone().into_kind().unwrap() {
         UnitKind::Agent(spec) => spec,
         UnitKind::Shell(_) => unreachable!(),
@@ -260,12 +264,12 @@ fn spawn_as(rig: &Rig, caller: UnitId, req: SpawnRequest) -> SpawnAck {
     rig.hub.spawn_agent(caller, req, launch).unwrap()
 }
 
-fn spawn(rig: &Rig, prompt: &str, extra: Value) -> SpawnAck {
+pub(super) fn spawn(rig: &Rig, prompt: &str, extra: Value) -> SpawnAck {
     spawn_as(rig, rig.hub.main(), agent_req(prompt, extra))
 }
 
 /// Settled means `Idle` or `Done`; the manual clock never fires the timeout.
-fn settle(rig: &Rig, id: UnitId) -> UnitView {
+pub(super) fn settle(rig: &Rig, id: UnitId) -> UnitView {
     let views = smol::block_on(rig.hub.wait(
         rig.hub.main(),
         &[id],
@@ -277,7 +281,7 @@ fn settle(rig: &Rig, id: UnitId) -> UnitView {
 }
 
 /// Until the scripted provider has been asked `n` times; bounded, no sleeps.
-fn await_requests(script: &Script, route: &str, n: usize) {
+pub(super) fn await_requests(script: &Script, route: &str, n: usize) {
     for _ in 0..50_000_000u64 {
         if script.requests(route) >= n {
             return;
@@ -287,7 +291,7 @@ fn await_requests(script: &Script, route: &str, n: usize) {
     panic!("provider never saw {n} requests on {route}");
 }
 
-fn done_reason(view: &UnitView) -> DoneReason {
+pub(super) fn done_reason(view: &UnitView) -> DoneReason {
     match &view.state {
         UnitState::Done(t) => {
             assert!(t.reason != DoneReason::Failed, "failed: {:?}", t.detail);
@@ -297,7 +301,7 @@ fn done_reason(view: &UnitView) -> DoneReason {
     }
 }
 
-fn finished_order(rig: &Rig) -> Vec<String> {
+pub(super) fn finished_order(rig: &Rig) -> Vec<String> {
     rig.events
         .try_iter()
         .filter_map(|e| match e.event {

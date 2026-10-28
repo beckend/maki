@@ -224,7 +224,7 @@ impl UnitHub {
         let run = AgentRun::new(&self.cancel, info, broker);
         table.agents.insert(id, Arc::clone(&run));
         table.pool.request(id, false);
-        table.pool.grant(max_agents);
+        table.promote(max_agents);
         let event = table.event_of(
             id,
             AgentEvent::RunStateChanged {

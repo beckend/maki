@@ -60,13 +60,19 @@ impl Pool {
     }
 
     /// Hands free slots to the head of the line, priority first. Returns who
-    /// got one.
-    pub fn grant(&mut self, max: usize) -> Vec<UnitId> {
+    /// got one. A run that can no longer work is dropped from the line
+    /// instead of taking a slot it would never give back: a run that was
+    /// stopped while it waited would hold the slot until it settles.
+    pub fn grant(&mut self, max: usize, is_admissible: impl Fn(UnitId) -> bool) -> Vec<UnitId> {
         let mut granted = Vec::new();
         while self.held.len() < max {
             let Some(next) = self.priority.pop_front().or_else(|| self.fifo.pop_front()) else {
                 break;
             };
+            if !is_admissible(next) {
+                self.blocked.remove(&next);
+                continue;
+            }
             self.held.insert(next);
             granted.push(next);
         }
@@ -91,8 +97,13 @@ impl Pool {
     }
 
     /// Blocked runs whose wait is over, for `is_settled`, now in line with
-    /// priority.
-    pub fn resume(&mut self, is_settled: impl Fn(UnitId) -> bool) {
+    /// priority. A blocked run that was stopped meanwhile is forgotten: it
+    /// cannot work any more, so it must not come back for a slot.
+    pub fn resume(
+        &mut self,
+        is_settled: impl Fn(UnitId) -> bool,
+        is_admissible: impl Fn(UnitId) -> bool,
+    ) {
         let ready: Vec<UnitId> = self
             .blocked
             .iter()
@@ -106,7 +117,11 @@ impl Pool {
             .map(|(id, _)| *id)
             .collect();
         for id in ready {
-            self.request(id, true);
+            if is_admissible(id) {
+                self.request(id, true);
+            } else {
+                self.blocked.remove(&id);
+            }
         }
     }
 
@@ -114,6 +129,28 @@ impl Pool {
     pub fn position(&self, id: UnitId) -> Option<(usize, usize)> {
         let at = self.fifo.iter().position(|i| *i == id)?;
         Some((at + 1, self.fifo.len()))
+    }
+
+    /// The runs that hold a slot, for invariant checks.
+    #[cfg(test)]
+    pub fn holders(&self) -> Vec<UnitId> {
+        self.held.iter().copied().collect()
+    }
+
+    /// The runs that wait for a slot, priority first.
+    #[cfg(test)]
+    pub fn waiting(&self) -> Vec<UnitId> {
+        self.priority
+            .iter()
+            .chain(self.fifo.iter())
+            .copied()
+            .collect()
+    }
+
+    /// The runs that gave their slot up to wait on other runs.
+    #[cfg(test)]
+    pub fn blocked_runs(&self) -> Vec<UnitId> {
+        self.blocked.keys().copied().collect()
     }
 }
 
