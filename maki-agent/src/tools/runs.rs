@@ -106,13 +106,12 @@ fn stop_with_caller(runs: &RunsCtx, ctx: &ToolContext, id: UnitId) {
     let hub = Arc::downgrade(&runs.hub);
     let caller = runs.self_run;
     let cancel = ctx.cancel.clone();
-    smol::spawn(async move {
+    tokio::spawn(async move {
         cancel.cancelled().await;
         if let Some(hub) = hub.upgrade() {
             hub.stop(caller, &[id], StopOpts::default());
         }
-    })
-    .detach();
+    });
 }
 
 /// `wait` for a host: the settled views and whether the wait was satisfied.
@@ -1242,7 +1241,7 @@ mod tests {
             let end = std::time::Instant::now() + Duration::from_secs(30);
             while hub.pending_notices(hub.main()).is_empty() {
                 assert!(std::time::Instant::now() < end, "no notice");
-                tokio::task::yield_now().await;
+                std::thread::yield_now();
             }
         }
         for n in 0..3 {
