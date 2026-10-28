@@ -157,14 +157,25 @@ impl ToolFilter {
         let base = if config.allowed_tools.is_empty() {
             Self::All
         } else {
-            Self::Only(
-                config
-                    .allowed_tools
-                    .iter()
-                    .filter(|s| is_builtin_tool(s))
-                    .cloned()
-                    .collect(),
-            )
+            let mut allowed: Vec<String> = config
+                .allowed_tools
+                .iter()
+                .filter(|s| is_builtin_tool(s))
+                .cloned()
+                .collect();
+            if config.runs.enabled {
+                // Native runs are the delegation surface: without `spawn` the
+                // parent cannot delegate at all, and without `send` a child
+                // cannot report back. A host that narrows the tool list must
+                // not be able to break that silently; `disabled_tools` is the
+                // explicit way to say no.
+                for name in runs::RUN_TOOL_NAMES {
+                    if !allowed.iter().any(|n| n == name) {
+                        allowed.push(name.to_owned());
+                    }
+                }
+            }
+            Self::Only(allowed)
         };
         let mut exclude: Vec<&str> = extra_exclude.to_vec();
         exclude.extend(capability_exclusions(model));
@@ -1262,6 +1273,35 @@ mod tests {
             assert!(!is_builtin_tool(name), "{name}");
             assert!(!all_builtin_tool_names().contains(&name), "{name}");
         }
+    }
+
+    /// A host that narrows the tool list must not be able to take the
+    /// delegation surface away: without `spawn` the parent cannot delegate,
+    /// and without `send` a child cannot report back.
+    #[test]
+    fn a_narrowed_tool_list_keeps_the_run_tools() {
+        let model = Model::from_spec("anthropic/claude-opus-4-8").unwrap();
+        let config = AgentConfig {
+            allowed_tools: vec!["read".to_owned(), "bash".to_owned()],
+            runs: maki_config::RunsConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let filter = ToolFilter::from_config(&config, &model, &[]);
+        for name in runs::RUN_TOOL_NAMES {
+            assert!(filter.matches(name), "{name} is the delegation surface");
+        }
+        // With native runs off the list is the host's, and `send` is not a
+        // tool then.
+        let off = AgentConfig {
+            allowed_tools: vec!["read".to_owned(), "bash".to_owned()],
+            ..Default::default()
+        };
+        let filter = ToolFilter::from_config(&off, &model, &[]);
+        assert!(!filter.matches("send"));
+        assert!(filter.matches("read"));
     }
 
     #[test]

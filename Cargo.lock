@@ -3162,7 +3162,7 @@ checksum = "fc04a4c58212d57930a24bf47d3fa87485264a3a054e9c10e042eb373573ad3c"
 
 [[package]]
 name = "maki"
-version = "1.0.2-fork"
+version = "1.0.3-fork"
 dependencies = [
  "async-compat",
  "clap",
@@ -3193,7 +3193,7 @@ dependencies = [
 
 [[package]]
 name = "maki-acp"
-version = "1.0.2-fork"
+version = "1.0.3-fork"
 dependencies = [
  "agent-client-protocol-schema",
  "color-eyre",
@@ -3213,7 +3213,7 @@ dependencies = [
 
 [[package]]
 name = "maki-agent"
-version = "1.0.2-fork"
+version = "1.0.3-fork"
 dependencies = [
  "arc-swap",
  "base64 0.23.1",
@@ -3259,7 +3259,7 @@ dependencies = [
 
 [[package]]
 name = "maki-config"
-version = "1.0.2-fork"
+version = "1.0.3-fork"
 dependencies = [
  "dotenvy",
  "globset",
@@ -3279,7 +3279,7 @@ dependencies = [
 
 [[package]]
 name = "maki-config-macro"
-version = "1.0.2-fork"
+version = "1.0.3-fork"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3288,7 +3288,7 @@ dependencies = [
 
 [[package]]
 name = "maki-docgen"
-version = "1.0.2-fork"
+version = "1.0.3-fork"
 dependencies = [
  "maki-agent",
  "maki-config",
@@ -3302,7 +3302,7 @@ dependencies = [
 
 [[package]]
 name = "maki-highlight"
-version = "1.0.2-fork"
+version = "1.0.3-fork"
 dependencies = [
  "flume",
  "serde_json",
@@ -3314,7 +3314,7 @@ dependencies = [
 
 [[package]]
 name = "maki-interpreter"
-version = "1.0.2-fork"
+version = "1.0.3-fork"
 dependencies = [
  "monty",
  "monty-types",
@@ -3326,7 +3326,7 @@ dependencies = [
 
 [[package]]
 name = "maki-lua"
-version = "1.0.2-fork"
+version = "1.0.3-fork"
 dependencies = [
  "arc-swap",
  "base64 0.23.1",
@@ -3411,7 +3411,7 @@ dependencies = [
 
 [[package]]
 name = "maki-lua-macro"
-version = "1.0.2-fork"
+version = "1.0.3-fork"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3420,7 +3420,7 @@ dependencies = [
 
 [[package]]
 name = "maki-markdown"
-version = "1.0.2-fork"
+version = "1.0.3-fork"
 dependencies = [
  "fastrand",
  "maki-highlight",
@@ -3432,7 +3432,7 @@ dependencies = [
 
 [[package]]
 name = "maki-otel"
-version = "1.0.2-fork"
+version = "1.0.3-fork"
 dependencies = [
  "fastrand",
  "flate2",
@@ -3450,7 +3450,7 @@ dependencies = [
 
 [[package]]
 name = "maki-pack"
-version = "1.0.2-fork"
+version = "1.0.3-fork"
 dependencies = [
  "maki-storage",
  "serde",
@@ -3464,7 +3464,7 @@ dependencies = [
 
 [[package]]
 name = "maki-providers"
-version = "1.0.2-fork"
+version = "1.0.3-fork"
 dependencies = [
  "base64 0.23.1",
  "fastrand",
@@ -3498,7 +3498,7 @@ dependencies = [
 
 [[package]]
 name = "maki-storage"
-version = "1.0.2-fork"
+version = "1.0.3-fork"
 dependencies = [
  "async-compat",
  "bs58",
@@ -3517,7 +3517,7 @@ dependencies = [
 
 [[package]]
 name = "maki-ui"
-version = "1.0.2-fork"
+version = "1.0.3-fork"
 dependencies = [
  "arboard",
  "arc-swap",
