@@ -83,7 +83,9 @@ async fn enabled(_lua: Lua, ctx: mlua::UserDataRef<LuaCtx>) -> LuaResult<bool> {
 /// required; `name`, `prompt`, `subagent_type`, `model_tier`, `thinking`,
 /// `output_schema`, `context`, `one_shot`, `command`, `cwd`, `timeout_secs`,
 /// `watch` and `notify` are optional. A run that cannot start now queues.
-/// Needs the `run` permission.
+/// `bind_to_caller` is this function's own: with it, the run belongs to the
+/// call and is stopped when the call is cancelled, so a caller that walked
+/// away from its sub-agent leaves no run behind. Needs the `run` permission.
 ///
 /// @param ctx LuaCtx Agent context.
 /// @param opts table The spawn input.
@@ -96,16 +98,30 @@ async fn enabled(_lua: Lua, ctx: mlua::UserDataRef<LuaCtx>) -> LuaResult<bool> {
 ///   prompt = "Search the codebase for auth middleware.",
 ///   subagent_type = "research",
 ///   one_shot = true,
+///   bind_to_caller = true,
 /// })
 /// if err then error(err) end
 /// print(run.handle, run.state)
 #[lua_fn(guard = Run)]
 async fn spawn(lua: Lua, ctx: mlua::UserDataRef<LuaCtx>, opts: LuaValue) -> LuaResult<Pair<Table>> {
-    let input = lua_to_json(&lua, &opts)?;
+    let mut input = lua_to_json(&lua, &opts)?;
+    // `bind_to_caller` is the plugin's own field, not one of the tool's: it
+    // is read here and taken out before the input is validated.
+    let bound = input
+        .get("bind_to_caller")
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(false);
+    if let Some(obj) = input.as_object_mut() {
+        obj.remove("bind_to_caller");
+    }
     let agent = try_pair!(dispatch_ctx(&ctx, "spawn"));
     let tctx = agent.to_tool_context();
     drop(ctx);
-    let run = try_pair!(native::host_spawn(&tctx, input).await);
+    let run = try_pair!(if bound {
+        native::host_spawn_bound(&tctx, input).await
+    } else {
+        native::host_spawn(&tctx, input).await
+    });
     let t = lua.create_table()?;
     t.set("handle", run.handle)?;
     t.set("name", run.name)?;
@@ -230,13 +246,23 @@ mod tests {
 
     struct Fixture {
         lua: Lua,
-        _hub: Option<Arc<UnitHub>>,
+        hub: Option<Arc<UnitHub>>,
         _dir: tempfile::TempDir,
     }
 
     fn fixture(with_runs: bool, perms: PluginPermissions) -> Fixture {
+        fixture_with_cancel(with_runs, perms, maki_agent::cancel::CancelToken::none())
+    }
+
+    /// A fixture whose tool call carries {cancel}, so a test can fire it.
+    fn fixture_with_cancel(
+        with_runs: bool,
+        perms: PluginPermissions,
+        cancel: maki_agent::cancel::CancelToken,
+    ) -> Fixture {
         let dir = tempfile::tempdir().unwrap();
         let mut ctx = stub_ctx_with(&AgentMode::Build, None, Some("tu-1"));
+        ctx.cancel = cancel;
         let hub = with_runs.then(|| {
             let (tx, _rx) = flume::unbounded();
             let hub = UnitHub::with_shell_options(
@@ -263,7 +289,7 @@ mod tests {
             .unwrap();
         Fixture {
             lua,
-            _hub: hub,
+            hub,
             _dir: dir,
         }
     }
@@ -333,6 +359,50 @@ mod tests {
             "#,
         );
         assert_eq!(state, "killed");
+    }
+
+    /// A run spawned with `bind_to_caller` belongs to the call: it is
+    /// stopped when the call's token fires, so a caller that walked away
+    /// from its sub-agent leaves no run behind holding an agent slot. A run
+    /// without it outlives the call, as a background task does.
+    #[test]
+    fn a_bound_run_is_stopped_with_its_caller() {
+        let (trigger, token) = maki_agent::cancel::CancelToken::new();
+        let f = fixture_with_cancel(true, PluginPermissions::trusted(), token);
+        eval::<()>(
+            &f,
+            r#"
+            local r = assert(run.spawn(ctx, { kind = "shell", description = "sleeper", command = "sleep 60", name = "bound", bind_to_caller = true }))
+            local u = assert(run.spawn(ctx, { kind = "shell", description = "sleeper", command = "sleep 60", name = "free" }))
+            return
+            "#,
+        );
+        trigger.cancel();
+        let hub = f.hub.as_ref().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let state_of = |name: &str| {
+            hub.list(hub.main(), maki_agent::runs::Scope::All)
+                .into_iter()
+                .find(|v| v.name.as_str() == name)
+                .map(|v| v.state_label().to_owned())
+                .unwrap_or_default()
+        };
+        loop {
+            let bound = state_of("bound");
+            if bound == "killed" {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the bound run was not stopped with its caller, it is {bound}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert_ne!(
+            state_of("free"),
+            "killed",
+            "a run that was not bound must outlive the call"
+        );
     }
 
     #[test]

@@ -79,6 +79,11 @@ local function delegate(input, ctx, subagent_type)
     one_shot = true,
     notify = background and "wake" or "never",
     timeout_secs = timeout_secs,
+    -- The blocking path owns the sub-agent: when the user cancels the turn
+    -- the run is stopped with it, so it leaves no slot behind for the next
+    -- sub-agent. A background task must outlive the turn, so it is not
+    -- bound.
+    bind_to_caller = not background,
   })
   if err then
     return { llm_output = "sub-agent error: " .. err, is_error = true }

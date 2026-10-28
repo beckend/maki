@@ -5373,7 +5373,9 @@ fields are the tool's: `kind` (`"agent"` or `"shell"`) and `description` are
 required; `name`, `prompt`, `subagent_type`, `model_tier`, `thinking`,
 `output_schema`, `context`, `one_shot`, `command`, `cwd`, `timeout_secs`,
 `watch` and `notify` are optional. A run that cannot start now queues.
-Needs the `run` permission.
+`bind_to_caller` is this function's own: with it, the run belongs to the
+call and is stopped when the call is cancelled, so a caller that walked
+away from its sub-agent leaves no run behind. Needs the `run` permission.
 
 Requires the `run` [plugin permission](#plugin-permissions).
 
@@ -5394,6 +5396,7 @@ local run, err = maki.run.spawn(ctx, {
   prompt = "Search the codebase for auth middleware.",
   subagent_type = "research",
   one_shot = true,
+  bind_to_caller = true,
 })
 if err then error(err) end
 print(run.handle, run.state)
