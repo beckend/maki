@@ -126,12 +126,28 @@ fn stop_with_caller(runs: &RunsCtx, ctx: &ToolContext, id: UnitId) {
 }
 
 /// `wait` for a host: the settled views and whether the wait was satisfied.
+/// A plugin waits for whatever it started, agent or command: the model's
+/// `wait` tool is the one that keeps to commands.
 pub async fn host_wait(ctx: &ToolContext, input: Value) -> Result<(Vec<UnitView>, bool), String> {
     let runs = host_runs(ctx)?;
     let value = host_input(Which::Wait, input)?;
     let args: WaitArgs = serde_json::from_value(value).map_err(|e| e.to_string())?;
     engaged(runs);
-    wait_views(runs, &args, &ctx.cancel, ctx.tool_use_id.as_deref()).await
+    let ids = resolve_all(runs, &args.ids)?;
+    let mode = match args.mode.as_deref() {
+        Some("any") => WaitMode::Any,
+        _ => WaitMode::All,
+    };
+    let timeout = Duration::from_secs(args.timeout_secs.unwrap_or(DEFAULT_WAIT_SECS));
+    wait_views(
+        runs,
+        &ids,
+        mode,
+        timeout,
+        &ctx.cancel,
+        ctx.tool_use_id.as_deref(),
+    )
+    .await
 }
 
 /// `send`, `runs` and `stop` for a host, answered with the text a model gets.
@@ -165,7 +181,8 @@ child is told to send you its result with `send` before it finishes, and you are
 it ends. kind \"shell\" starts a command that keeps running while you continue. You
 are notified when a run finishes; do not poll or sleep. Start independent runs together
 in one assistant message and continue useful work while they run. Use `wait` only when
-you are blocked on a result and have nothing else to do, `send` to talk to a
+you are blocked on a command's result and have nothing else to do (it waits for
+commands, not for agents), `send` to talk to a
 run, `stop` to end it, `runs` to look. Only a limited number of agents work at once;
 the rest show as queued with a position and start in order. A full queue returns
 QUEUE_FULL: wait for runs to finish. A timeout_secs above the session maximum is
@@ -187,11 +204,13 @@ subagent sends its result to its parent this way: the parent does not see the su
 transcript, so a result that is not sent is lost.";
 
 const WAIT_DESCRIPTION: &str =
-    "Block until runs have finished their work or a timeout expires. Use only when you cannot
-proceed without the result; otherwise keep working, you will be notified. mode \"all\" (default)
-returns when every listed run is done or idle (finished its turn), \"any\" when the first is.
-A timeout is not an error: you get the current states and the runs keep going. Results you
-receive here are not repeated as notices.";
+    "Block until commands have finished their work or a timeout expires. Use only when you cannot
+    proceed without the result; otherwise keep working, you will be notified. mode \"all\" (default)
+    returns when every listed command is done, \"any\" when the first is.
+    A timeout is not an error: you get the current states and the commands keep going. Results you
+    receive here are not repeated as notices.
+    Only commands are waited for. An agent is not: it reports with send and its end sends a
+    notice, so waiting for one would hold your turn for nothing.";
 
 const RUNS_DESCRIPTION: &str =
     "List your runs and everything below you, or inspect one. Without id: a tree of runs with id,
@@ -329,7 +348,7 @@ impl Which {
                 "type": "object",
                 "required": ["ids"],
                 "properties": {
-                    "ids": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 16},
+                    "ids": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 16, "description": "Command handles to wait for (sh-...). Agents are not waited for: they report with send."},
                     "mode": {"type": "string", "enum": ["all", "any"]},
                     "timeout_secs": {"type": "integer", "minimum": 1, "maximum": 600, "description": "Default 60."}
                 }
@@ -610,19 +629,15 @@ fn resolve_all(runs: &RunsCtx, keys: &[String]) -> Result<Vec<UnitId>, String> {
 
 async fn wait_views(
     runs: &RunsCtx,
-    args: &WaitArgs,
+    ids: &[UnitId],
+    mode: WaitMode,
+    timeout: Duration,
     cancel: &CancelToken,
     tool_use_id: Option<&str>,
 ) -> Result<(Vec<UnitView>, bool), String> {
-    let ids = resolve_all(runs, &args.ids)?;
-    let mode = match args.mode.as_deref() {
-        Some("any") => WaitMode::Any,
-        _ => WaitMode::All,
-    };
-    let timeout = Duration::from_secs(args.timeout_secs.unwrap_or(DEFAULT_WAIT_SECS));
     let views = runs
         .hub
-        .wait(runs.self_run, &ids, mode, timeout, cancel)
+        .wait(runs.self_run, ids, mode, timeout, cancel)
         .await;
     let settled = |v: &UnitView| matches!(v.state, UnitState::Done(_) | UnitState::Idle);
     let satisfied = match mode {
@@ -644,7 +659,32 @@ async fn wait(
     cancel: &CancelToken,
     tool_use_id: Option<&str>,
 ) -> Result<String, String> {
-    let (views, satisfied) = wait_views(runs, &args, cancel, tool_use_id).await?;
+    let ids = resolve_all(runs, &args.ids)?;
+    // Wait is for commands. An agent reports with send and its end sends a
+    // notice, so waiting for one would hold the turn for nothing.
+    let mut commands = Vec::new();
+    let mut skipped = Vec::new();
+    for id in ids {
+        match runs.hub.get(id) {
+            Some(view) if view.kind == RunKind::Agent => skipped.push(view.handle.to_string()),
+            _ => commands.push(id),
+        }
+    }
+    if commands.is_empty() {
+        return Err(format!(
+            "WAIT_TAKES_COMMANDS: {} {} an agent. An agent reports with send and its end sends a \
+             notice, so wait only waits for commands.",
+            skipped.join(", "),
+            if skipped.len() == 1 { "is" } else { "are" },
+        ));
+    }
+    let mode = match args.mode.as_deref() {
+        Some("any") => WaitMode::Any,
+        _ => WaitMode::All,
+    };
+    let timeout = Duration::from_secs(args.timeout_secs.unwrap_or(DEFAULT_WAIT_SECS));
+    let (views, satisfied) =
+        wait_views(runs, &commands, mode, timeout, cancel, tool_use_id).await?;
     let settled = |v: &UnitView| matches!(v.state, UnitState::Done(_) | UnitState::Idle);
     let mut out = String::new();
     for view in &views {
@@ -652,13 +692,18 @@ async fn wait(
             out.push_str("\n\n");
         }
         out.push_str(&record(view));
-        if view.kind == RunKind::Agent {
-            out.push_str(&agent_result(view, false));
-        } else if let UnitState::Done(t) = &view.state
+        if let UnitState::Done(t) = &view.state
             && !t.result.summary.is_empty()
         {
             let _ = write!(out, "\nlast output:\n{}", t.result.summary);
         }
+    }
+    if !skipped.is_empty() {
+        let _ = write!(
+            out,
+            "\n\nNot waited for: {}. An agent reports with send and its end sends a notice, so wait only waits for commands.",
+            skipped.join(", ")
+        );
     }
     if !satisfied {
         let pending: Vec<String> = views
@@ -1198,6 +1243,48 @@ mod tests {
             hub.pending_notices(hub.main()).is_empty(),
             "wait consumed it"
         );
+    }
+
+    /// An agent in the hub, made directly: the tool only needs to know its
+    /// kind. Nothing drives it, so it stays as it is.
+    fn agent_unit(ctx: &ToolContext, name: &str) -> String {
+        let runs = ctx.runs.as_ref().unwrap();
+        let req: SpawnRequest = serde_json::from_value(json!({
+            "kind": "agent",
+            "description": name,
+            "prompt": "work",
+        }))
+        .unwrap();
+        let ack = runs.hub.spawn(runs.self_run, req).unwrap();
+        ack.handle.as_str().to_owned()
+    }
+
+    /// Wait is for commands: an agent reports with send and its end sends a
+    /// notice, so waiting for one would hold the turn for nothing.
+    #[test]
+    fn wait_refuses_to_wait_for_an_agent() {
+        let ctx = ctx();
+        let agent = agent_unit(&ctx, "child");
+        let err = call(Which::Wait, &ctx, json!({"ids": [agent]})).unwrap_err();
+        assert!(err.starts_with("WAIT_TAKES_COMMANDS"), "{err}");
+        assert!(err.contains(&agent), "{err}");
+    }
+
+    #[test]
+    fn wait_waits_for_a_command_and_leaves_an_agent_alone() {
+        let ctx = ctx();
+        let agent = agent_unit(&ctx, "child");
+        let started = call(
+            Which::Spawn,
+            &ctx,
+            json!({"kind": "shell", "description": "count", "command": "echo one"}),
+        )
+        .unwrap();
+        let shell = handle_of(&started).to_owned();
+        let out = call(Which::Wait, &ctx, json!({"ids": [shell, agent.clone()]})).unwrap();
+        assert!(out.contains("(shell, completed)"), "{out}");
+        assert!(out.contains("Not waited for"), "{out}");
+        assert!(out.contains(&agent), "{out}");
     }
 
     #[test]

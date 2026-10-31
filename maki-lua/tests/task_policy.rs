@@ -995,9 +995,23 @@ fn native_and_legacy_task_enabled() {
         handle.starts_with("ag-") && !handle.starts_with("toolu_"),
         "{handle}"
     );
-    let waited = run("wait", json!({"ids": [handle]})).unwrap();
-    assert!(waited.contains("native says hi"), "{waited}");
-    assert!(waited.contains("completed"), "{waited}");
+    // The model's wait keeps to commands, so an agent is awaited the way a
+    // plugin does: on the hub.
+    let id = hub.resolve(hub.main(), &handle).unwrap();
+    let views = smol::block_on(hub.wait(
+        hub.main(),
+        &[id],
+        maki_agent::runs::WaitMode::All,
+        std::time::Duration::from_secs(30),
+        &CancelToken::none(),
+    ));
+    let summary = &views[0].result.as_ref().unwrap().summary;
+    assert!(summary.contains("native says hi"), "{summary}");
+    assert!(
+        views[0].state.label().contains("completed"),
+        "{}",
+        views[0].state.label()
+    );
 
     // And `task` still delegates fine after a native run existed.
     assert_eq!(

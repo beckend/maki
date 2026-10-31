@@ -619,29 +619,26 @@ fn a_cancelled_parent_cascade_frees_every_slot() {
     );
 }
 
-/// The nested case: a parent that holds a slot waits for its own child. The
+/// The nested case: a parent that holds a slot waits for its own command. The
 /// wait is cancelled (Esc), so the parent gives its slot up and must get it
 /// back or the pool must not keep its ghost.
 #[test]
 fn a_cancelled_wait_by_a_slot_holding_parent_keeps_the_pool_sane() {
-    let spawn_child = super::agent_run::tool_use(
+    let spawn_command = super::agent_run::tool_use(
         "t1",
         "spawn",
-        json!({"kind": "agent", "description": "kid", "prompt": "KID-TASK"}),
+        json!({"kind": "shell", "description": "kid", "command": "sleep 600"}),
     );
-    let wait_child =
+    let wait_command =
         super::agent_run::tool_use("t2", "wait", json!({"ids": ["kid"], "timeout_secs": 600}));
-    let script = Script::new(vec![
-        (
-            "PARENT-TASK",
-            vec![
-                Step::Reply(spawn_child),
-                Step::Reply(wait_child),
-                Step::Hang,
-            ],
-        ),
-        ("KID-TASK", vec![Step::Hang]),
-    ]);
+    let script = Script::new(vec![(
+        "PARENT-TASK",
+        vec![
+            Step::Reply(spawn_command),
+            Step::Reply(wait_command),
+            Step::Hang,
+        ],
+    )]);
     let rig = rig(&script);
     let main = rig.hub.main();
 
