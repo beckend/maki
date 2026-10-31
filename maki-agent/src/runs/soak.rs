@@ -71,8 +71,8 @@ fn pgids(journal: &RunJournal) -> Vec<u32> {
         .collect()
 }
 
-#[test]
-fn many_spawns_and_stops_leak_nothing_and_stay_bounded() {
+#[tokio::test]
+async fn many_spawns_and_stops_leak_nothing_and_stay_bounded() {
     let dir = tempfile::tempdir().unwrap();
     let (hub, journal) = hub_in(dir.path());
     let mut spawned = 0;
@@ -133,8 +133,8 @@ fn many_spawns_and_stops_leak_nothing_and_stay_bounded() {
     assert!(Replay::read(journal.dir()).clean_mark);
 }
 
-#[test]
-fn dropping_the_hub_leaves_no_live_process_group() {
+#[tokio::test]
+async fn dropping_the_hub_leaves_no_live_process_group() {
     let dir = tempfile::tempdir().unwrap();
     let (hub, journal) = hub_in(dir.path());
     for _ in 0..MAX_SHELLS {

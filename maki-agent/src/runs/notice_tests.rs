@@ -141,8 +141,8 @@ async fn wake_budget_three_then_overflow_marker() {
 
 /// A settled agent is the result the parent asked for, so it wakes even when
 /// the notice budget is spent: the child's end must reach the parent.
-#[test]
-fn a_settled_agent_wakes_even_when_the_budget_is_spent() {
+#[tokio::test]
+async fn a_settled_agent_wakes_even_when_the_budget_is_spent() {
     let rig = rig();
     for n in 0..WAKE_BUDGET {
         noise_notice(&rig, n);
@@ -164,8 +164,8 @@ fn a_settled_agent_wakes_even_when_the_budget_is_spent() {
     );
 }
 
-#[test]
-fn budget_resets_on_user_and_on_runs_read() {
+#[tokio::test]
+async fn budget_resets_on_user_and_on_runs_read() {
     let rig = rig();
     for n in 0..3 {
         noise_notice(&rig, n);

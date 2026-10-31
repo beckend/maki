@@ -200,7 +200,9 @@ async fn call(
 /// (required), `mode` (`"all"` or `"any"`), `timeout_secs` (1 to 600). A wait
 /// that times out returns the runs as they stand (`settled` is false for those
 /// still going); a cancel of the calling task returns `(nil, err)` and leaves
-/// the runs running. Needs the `agent` permission.
+/// the runs running. A plugin waits for whatever it started; the model's
+/// `wait` tool is the one that keeps to commands, since an agent reports with
+/// send and its end sends a notice. Needs the `agent` permission.
 ///
 /// @param ctx LuaCtx Agent context.
 /// @param opts table The wait input.

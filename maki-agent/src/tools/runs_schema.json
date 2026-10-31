@@ -186,6 +186,7 @@
   "wait": {
     "properties": {
       "ids": {
+        "description": "Command handles to wait for (sh-...). Agents are not waited for: they report with send.",
         "items": {
           "type": "string"
         },

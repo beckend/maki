@@ -3250,7 +3250,7 @@ mod chaos {
                 if script.order().len() >= n {
                     return;
                 }
-                tokio::task::yield_now().await;
+                std::thread::yield_now();
             }
             panic!("only {} of {n} agents started", script.order().len());
         };
