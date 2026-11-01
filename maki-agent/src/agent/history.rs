@@ -13,7 +13,11 @@ use super::frame::LiveFrame;
 use crate::mcp::{McpSession, ToolDeferral};
 use crate::session::SessionHeader;
 
-const CANCEL_MARKER: &str = "[Cancelled by user]";
+pub(crate) const CANCEL_MARKER: &str = "[Cancelled by user]";
+/// The request ended without anything asking for it: the provider dropped the
+/// stream (a transport hiccup, an aborted connection). It is not a cancel,
+/// and saying it was would put a lie in the transcript.
+pub(crate) const REQUEST_DROPPED_MARKER: &str = "[Cancelled: the request was dropped]";
 pub const UNAVAILABLE_RESULT: &str = "[Tool result not available]";
 
 pub type HistorySnapshot = maki_storage::sessions::HistorySnapshot<Message>;
@@ -452,13 +456,16 @@ fn dangling_results(messages: &[Message], note: &str) -> Option<Message> {
     })
 }
 
-pub(crate) fn sanitize_cancelled_history(history: &mut History, rollback_len: usize) {
+/// The marker the caller knows to be true: "[Cancelled by user]" only when
+/// something asked for the stop, "[Cancelled: the request was dropped]" when
+/// the request ended and nobody cancelled anything.
+pub(crate) fn sanitize_cancelled_history(history: &mut History, rollback_len: usize, marker: &str) {
     if history.len() <= rollback_len {
         return;
     }
     history.edit(|msgs| {
-        close_dangling_tool_calls(msgs, CANCEL_MARKER);
-        msgs.push(Message::synthetic(CANCEL_MARKER.into()));
+        close_dangling_tool_calls(msgs, marker);
+        msgs.push(Message::synthetic(marker.into()));
     });
 }
 
@@ -555,7 +562,7 @@ mod tests {
         expect_cancel_marker: bool,
     ) {
         let mut history = History::new(messages);
-        sanitize_cancelled_history(&mut history, rollback_len);
+        sanitize_cancelled_history(&mut history, rollback_len, CANCEL_MARKER);
         assert_eq!(history.len(), expected_len);
         if expect_cancel_marker {
             assert_ends_with_cancel_marker(&history);
@@ -568,7 +575,7 @@ mod tests {
             Message::user("hello".into()),
             make_tool_use_msg(&["t1", "t2"]),
         ]);
-        sanitize_cancelled_history(&mut history, 0);
+        sanitize_cancelled_history(&mut history, 0, CANCEL_MARKER);
 
         assert_eq!(extract_error_ids(&history.as_slice()[2]), ["t1", "t2"]);
         assert_ends_with_cancel_marker(&history);
@@ -645,7 +652,7 @@ mod tests {
             .with_mirror(Arc::clone(&mirror));
         let epoch = mirror.load().epoch;
 
-        sanitize_cancelled_history(&mut history, 0);
+        sanitize_cancelled_history(&mut history, 0, CANCEL_MARKER);
 
         let snap = mirror.load();
         assert_eq!(snap.epoch, epoch, "cancel cleanup is a pure append");
@@ -981,7 +988,7 @@ mod tests {
         let before = mirror.load_full();
         let rollback_len = history.len();
 
-        sanitize_cancelled_history(&mut history, rollback_len);
+        sanitize_cancelled_history(&mut history, rollback_len, CANCEL_MARKER);
 
         let after = mirror.load_full();
         assert_eq!(before.epoch, after.epoch);

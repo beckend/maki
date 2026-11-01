@@ -48,6 +48,14 @@ const RESULT_TAIL: usize = 768;
 /// A run that ignores its cancel this long is force-settled.
 pub(super) const FORCE_SETTLE_AFTER: Duration = Duration::from_secs(5);
 const MAX_NUDGES: u32 = 2;
+/// How many times a turn is tried again after the provider dropped the
+/// request. One is enough for a transport hiccup; more would spend the
+/// model's tokens on a connection that is plainly gone.
+const MAX_DROPPED_RETRIES: u32 = 1;
+/// What the parent is told when the request was dropped rather than stopped.
+const REQUEST_DROPPED_DETAIL: &str =
+    "the request was dropped before the turn ended; nothing stopped the run";
+
 const MAX_SCHEMA_ERRORS: usize = 3;
 const DETAIL_LIMIT: usize = 200;
 const STRUCTURED_OUTPUT_NAME: &str = "structured_output";
@@ -649,6 +657,7 @@ impl Driver {
                 return;
             }
             let mut nudges = 0;
+            let mut dropped = 0;
             let (verdict, mut result) = loop {
                 // A nudge turn follows a finished one, but a turn must never
                 // start on a slot something else took, so ask again.
@@ -659,9 +668,23 @@ impl Driver {
                 }
                 let end = self
                     .turn(
-                        &launch, history, &mut gauge, &events, &rx, message, deadline,
+                        &launch,
+                        history,
+                        &mut gauge,
+                        &events,
+                        &rx,
+                        message.clone(),
+                        deadline,
                     )
                     .await;
+                // A request the provider dropped is not a decision: the
+                // transport lost it, and nothing asked for the run to stop.
+                // The turn is worth another try before the run gives up, or
+                // the work dies with a connection that hiccuped.
+                if self.request_dropped(&end) && dropped < MAX_DROPPED_RETRIES {
+                    dropped += 1;
+                    continue;
+                }
                 let (judged, result) = self.judge(&launch, end);
                 match judged {
                     Judged::Nudge(next) if nudges < MAX_NUDGES => {
@@ -918,6 +941,20 @@ impl Driver {
         TurnEnd { result, text }
     }
 
+    /// The request was dropped: the provider ended the stream and nothing
+    /// asked for the run to stop. A transport hiccup, not a decision.
+    fn request_dropped(&self, end: &TurnEnd) -> bool {
+        if !matches!(
+            end.result,
+            Err(AgentError::Cancelled) | Ok(DoneReason::Cancelled)
+        ) {
+            return false;
+        }
+        !self.run.token.is_cancelled()
+            && !self.run.timed_out.load(Ordering::Acquire)
+            && !self.run.soft.load(Ordering::Acquire)
+    }
+
     fn judge(&self, launch: &AgentLaunch, end: TurnEnd) -> (Judged, UnitResult) {
         let mut result = UnitResult::default();
         let verdict = match end.result {
@@ -930,7 +967,14 @@ impl Driver {
                 } else if self.run.soft.load(Ordering::Acquire) {
                     Judged::Final(Verdict::Idle { interrupted: true })
                 } else {
-                    Judged::Final(Verdict::Done(UnitDone::Killed, None))
+                    // Nothing asked for this run to stop: the request was
+                    // dropped. It must not read as a stop, because the parent
+                    // is told what happened and can only act on the truth:
+                    // a dropped request is worth another try, a stop is not.
+                    Judged::Final(Verdict::Done(
+                        UnitDone::Failed,
+                        Some(REQUEST_DROPPED_DETAIL.to_owned()),
+                    ))
                 }
             }
             Err(e) => {

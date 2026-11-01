@@ -19,7 +19,7 @@ use super::display_order::{observation_detail, observation_line};
 use super::frame::{
     FRAME_REBUILT, FrameFit, RunContextBuilder, context_update, fingerprint, fit_frame,
 };
-use super::history::{History, sanitize_cancelled_history};
+use super::history::{CANCEL_MARKER, History, REQUEST_DROPPED_MARKER, sanitize_cancelled_history};
 use super::hook::{AgentHooks, AgentSlot};
 use super::instructions::{CallInstructions, LoadedInstructions};
 use super::streaming::{StreamError, StreamRequest, stream_with_retry};
@@ -409,7 +409,16 @@ impl<'h> Agent<'h> {
         let reason = match result {
             Ok(reason) => reason,
             Err(AgentError::Cancelled) => {
-                sanitize_cancelled_history(self.history, self.rollback_len);
+                // The marker must name what happened. A token that fired means
+                // something asked for the stop; a request that ended without
+                // one means the provider dropped it and nobody cancelled
+                // anything.
+                let marker = if self.cancel.is_cancelled() {
+                    CANCEL_MARKER
+                } else {
+                    REQUEST_DROPPED_MARKER
+                };
+                sanitize_cancelled_history(self.history, self.rollback_len, marker);
                 DoneReason::Cancelled
             }
             Err(e) => return Err(e),

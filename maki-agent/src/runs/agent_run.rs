@@ -31,6 +31,9 @@ pub(super) enum Step {
     Hang,
     /// The provider fails; the run must settle `failed`.
     Fail(&'static str),
+    /// The provider drops the request: the stream ends without an answer and
+    /// without anything asking for it, the way a lost connection does.
+    Drop,
     /// Blocks the executor thread until released, so a cancel cannot reach it.
     Block(std::sync::mpsc::Receiver<()>),
 }
@@ -151,6 +154,7 @@ impl Provider for Script {
                 Step::Fail(message) => Err(AgentError::Config {
                     message: message.to_owned(),
                 }),
+                Step::Drop => Err(AgentError::Cancelled),
                 Step::Block(release) => {
                     let _ = release.recv();
                     Ok(reply("late"))
@@ -414,6 +418,51 @@ async fn a_delegated_child_ends_after_its_turn() {
     assert!(
         rig.hub.claim_main_wake(),
         "the child's end wakes the parent"
+    );
+}
+
+/// A request the provider dropped is not a decision: the transport lost it
+/// and nothing asked for the run to stop. The turn is tried again, and the
+/// work is not lost to a connection that hiccuped.
+#[test]
+fn a_dropped_request_is_tried_again() {
+    let script = Script::new(vec![(CHILD, vec![Step::Drop, Step::Reply(reply("done"))])]);
+    let rig = rig(&script);
+    let ack = spawn(&rig, CHILD, json!({"one_shot": true}));
+    await_requests(&script, CHILD, 2);
+    let view = settle(&rig, ack.id);
+    assert_eq!(done_reason(&view), DoneReason::Completed);
+    // The retry's prompt must not claim the user cancelled anything.
+    let second = Value::Array(script.messages_of(CHILD, 1)).to_string();
+    assert!(
+        second.contains("the request was dropped"),
+        "the dropped request must say so: {second}"
+    );
+    assert!(
+        !second.contains("Cancelled by user"),
+        "nothing stopped the run: {second}"
+    );
+}
+
+/// A request that is dropped every time ends as a failure with a reason,
+/// not as a run "stopped before it finished": the parent has to learn that
+/// nothing stopped it, so it can try again instead of believing the user
+/// did.
+#[test]
+fn a_dropped_request_that_never_lands_fails_with_a_reason() {
+    let script = Script::new(vec![(CHILD, vec![Step::Drop, Step::Drop])]);
+    let rig = rig(&script);
+    let ack = spawn(&rig, CHILD, json!({"one_shot": true}));
+    await_requests(&script, CHILD, 2);
+    let view = settle(&rig, ack.id);
+    let UnitState::Done(t) = &view.state else {
+        panic!("not done: {}", view.state.label());
+    };
+    assert_eq!(t.reason, DoneReason::Failed);
+    assert!(
+        t.detail.as_deref().unwrap_or_default().contains("dropped"),
+        "{:?}",
+        t.detail
     );
 }
 
