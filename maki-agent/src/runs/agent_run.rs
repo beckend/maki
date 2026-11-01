@@ -424,13 +424,13 @@ async fn a_delegated_child_ends_after_its_turn() {
 /// A request the provider dropped is not a decision: the transport lost it
 /// and nothing asked for the run to stop. The turn is tried again, and the
 /// work is not lost to a connection that hiccuped.
-#[test]
-fn a_dropped_request_is_tried_again() {
+#[tokio::test]
+async fn a_dropped_request_is_tried_again() {
     let script = Script::new(vec![(CHILD, vec![Step::Drop, Step::Reply(reply("done"))])]);
     let rig = rig(&script);
-    let ack = spawn(&rig, CHILD, json!({"one_shot": true}));
-    await_requests(&script, CHILD, 2);
-    let view = settle(&rig, ack.id);
+    let ack = spawn(&rig, CHILD, json!({"one_shot": true})).await;
+    await_requests(&script, CHILD, 2).await;
+    let view = settle(&rig, ack.id).await;
     assert_eq!(done_reason(&view), DoneReason::Completed);
     // The retry's prompt must not claim the user cancelled anything.
     let second = Value::Array(script.messages_of(CHILD, 1)).to_string();
@@ -448,13 +448,13 @@ fn a_dropped_request_is_tried_again() {
 /// not as a run "stopped before it finished": the parent has to learn that
 /// nothing stopped it, so it can try again instead of believing the user
 /// did.
-#[test]
-fn a_dropped_request_that_never_lands_fails_with_a_reason() {
+#[tokio::test]
+async fn a_dropped_request_that_never_lands_fails_with_a_reason() {
     let script = Script::new(vec![(CHILD, vec![Step::Drop, Step::Drop])]);
     let rig = rig(&script);
-    let ack = spawn(&rig, CHILD, json!({"one_shot": true}));
-    await_requests(&script, CHILD, 2);
-    let view = settle(&rig, ack.id);
+    let ack = spawn(&rig, CHILD, json!({"one_shot": true})).await;
+    await_requests(&script, CHILD, 2).await;
+    let view = settle(&rig, ack.id).await;
     let UnitState::Done(t) = &view.state else {
         panic!("not done: {}", view.state.label());
     };

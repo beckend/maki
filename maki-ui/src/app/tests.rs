@@ -12604,6 +12604,44 @@ fn native_run_creates_tab_keyed_by_handle() {
     assert!(!app.chats[app.chat_index["toolu_legacy"]].is_finished());
 }
 
+/// A run that outlives the turn that started it keeps one chat. The index
+/// that routes a run's events is wiped at the end of every turn, so the next
+/// event of a live run must still find the chat it already has: a second one
+/// would list the same run twice in the picker, and the first would never
+/// end, because its events went to the other.
+#[test]
+fn a_native_run_that_outlives_its_turn_keeps_one_chat() {
+    const HANDLE: &str = "ag-k3x9ab";
+    let mut app = streaming_app();
+    let native = |event| {
+        subagent_msg_with_run_id(event, HANDLE, Some("reader"), maki_agent::BACKGROUND_RUN_ID)
+    };
+    app.update(native(AgentEvent::RunStarted {
+        handle: HANDLE.into(),
+        name: "reader".into(),
+        kind: "agent".into(),
+        parent: None,
+        depth: 1,
+        one_shot: false,
+    }));
+    assert_eq!(app.chats.len(), 2);
+
+    // The turn ends: the routing cache goes with it.
+    app.chat_index.clear();
+
+    app.update(native(AgentEvent::TextDelta {
+        text: "still working".into(),
+    }));
+    assert_eq!(
+        app.chats.len(),
+        2,
+        "the run must not come back as a second chat"
+    );
+    app.sync_subagents();
+    let stored = app.state.session.subagents();
+    assert_eq!(stored.len(), 1, "the run must be stored once: {stored:?}");
+}
+
 #[test]
 fn native_run_is_stored_with_its_state() {
     const HANDLE: &str = "ag-k3x9ab";
