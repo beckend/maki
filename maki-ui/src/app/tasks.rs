@@ -1599,6 +1599,37 @@ mod tests {
         assert_eq!(app.chats[1].last_message_text(), text);
     }
 
+    /// The index that routes a task's events is a per-turn cache, so a task
+    /// that ends long after the turn that started it is not in it any more.
+    /// Its chat still has to end, or the picker shows it as running forever
+    /// and the status bar spins on a task that is gone.
+    #[test]
+    fn a_task_that_ends_after_its_turn_still_ends() {
+        let mut app = app_with_subagent_id(TASK_ID);
+        // The turn ends: the routing cache goes with it.
+        app.chat_index.clear();
+        close_subagent_transcript(&mut app, TASK_ID);
+        assert_eq!(app.chats[1].task_status(), TaskStatus::Done);
+    }
+
+    /// The chats are the source of the subagent mirror, and the checkpoint is
+    /// where the mirror is written: a task the chats hold has to reach the
+    /// session file, or a reload brings back a list the picker never shows.
+    #[test]
+    fn a_checkpoint_writes_the_tasks_the_chats_hold() {
+        let mut app = app_with_subagent_id(TASK_ID);
+        app.state.session_mut().set_subagents(Vec::new());
+        app.checkpoint();
+        let recorded: Vec<_> = app
+            .state
+            .session
+            .subagents()
+            .iter()
+            .map(|sa| sa.tool_use_id.clone())
+            .collect();
+        assert_eq!(recorded, vec![TASK_ID.to_owned()]);
+    }
+
     /// No way of ending a turn may leave a task `working`: nothing runs after
     /// to correct it, and the picker would spin on it forever. The finished
     /// task comes along to show the sweep leaves it alone.

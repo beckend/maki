@@ -27,7 +27,7 @@ pub(crate) mod tool;
 pub(crate) mod top;
 pub(crate) mod treesitter;
 pub(crate) mod ui;
-pub(crate) mod util;
+pub mod util;
 pub(crate) mod uv;
 pub(crate) mod yaml;
 

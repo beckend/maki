@@ -2712,7 +2712,16 @@ impl App {
             // to the ToolDone that follows elsewhere. A plugin task is never in
             // `chat_index`, and rightly stays open here: it writes its
             // transcript after every prompt, and its close is `StreamClosed`.
-            if let Some(&sub_idx) = self.chat_index.get(tool_use_id.as_str()) {
+            // A plugin task is never in the index and rightly stays open here:
+            // it writes its transcript after every prompt, and its close is
+            // `StreamClosed`. A native run's task ends with its transcript,
+            // and the index that used to say so is a per-turn cache, so it is
+            // gone by the time the transcript lands: a task that never ends
+            // keeps the picker showing it as running, and the status bar
+            // spinning on a task that is long gone.
+            if let Ok(sub_idx) = self.chat_of_task(&tool_use_id)
+                && self.chats[sub_idx].plugin.is_none()
+            {
                 self.chats[sub_idx].mark_finished(TaskOutcome::Unknown, DONE_TEXT);
             }
             self.state
