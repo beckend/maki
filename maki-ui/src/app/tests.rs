@@ -370,6 +370,7 @@ fn subagent_info_with_tx(
         name: name.into(),
         prompt: None,
         model: None,
+        subagent_type: None,
         opts: None,
         answer_tx,
         inbox: Arc::default(),
@@ -11609,6 +11610,7 @@ fn a_restored_receipt_nobody_answered_reads_lost() {
         tool_use_id: RECEIPT_TURN_ID.into(),
         name: RESEARCH_NAME.into(),
         model: None,
+        subagent_type: None,
         thinking: None,
         fast: false,
         plugin: Some(Arc::from(SLOW_TOOL)),
@@ -13117,5 +13119,45 @@ fn restored_run_that_was_live_reads_as_lost() {
     assert_eq!(
         app.state.session.subagents()[0].run.as_ref().unwrap().state,
         "lost"
+    );
+}
+
+/// A child the journal lost comes back with the tools it had, and one the
+/// session does not describe comes back read-only: the tools it comes back
+/// with are never wider than the ones it had.
+#[test]
+fn a_remembered_run_keeps_its_kind() {
+    let run = maki_storage::sessions::StoredRun {
+        handle: "ag-lost01".into(),
+        name: "lost".into(),
+        parent: None,
+        kind: "agent".into(),
+        state: "killed".into(),
+        depth: 1,
+        one_shot: true,
+    };
+    let stored = StoredSubagent {
+        tool_use_id: "ag-lost01".into(),
+        name: "lost".into(),
+        model: None,
+        subagent_type: Some("general".into()),
+        thinking: None,
+        fast: false,
+        plugin: None,
+        cost: None,
+        started_at: None,
+        ended_at: None,
+        run: Some(run),
+    };
+    let spec = super::session::spec_for(&stored);
+    assert_eq!(spec.subagent_type, "general");
+    assert!(spec.one_shot);
+    assert!(spec.prompt.is_empty());
+    let mut unknown = stored.clone();
+    unknown.subagent_type = None;
+    assert_eq!(
+        super::session::spec_for(&unknown).subagent_type,
+        "research",
+        "a child the session does not describe is read-only"
     );
 }

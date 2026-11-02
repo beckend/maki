@@ -170,6 +170,9 @@ impl App {
         else {
             return vec![];
         };
+        // A run the journal lost is taken back from what the session kept, so
+        // the message revives it instead of failing.
+        self.remember_run(&handle);
         self.chats[self.active_chat].show_user_message(sub.text.clone(), sub.images);
         vec![Action::SendToRun {
             handle,

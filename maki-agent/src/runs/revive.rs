@@ -39,10 +39,80 @@ pub struct TombstoneView {
 
 impl UnitHub {
     /// Where an agent's transcript is written, when there is a writable
-    /// journal to put it beside.
+    /// journal to put it beside. A session with no journal (another process
+    /// holds the lock) still has its runs directory, so the transcript is
+    /// written there: the history of a run is not the journal's business.
     pub(super) fn transcript_path(&self, handle: &str) -> Option<PathBuf> {
-        let journal = self.journal.get()?;
-        (!journal.read_only()).then(|| maki_storage::runs::transcript_path(journal.dir(), handle))
+        if let Some(journal) = self.journal.get() {
+            return (!journal.read_only())
+                .then(|| maki_storage::runs::transcript_path(journal.dir(), handle));
+        }
+        self.shell
+            .dir
+            .as_ref()
+            .map(|dir| maki_storage::runs::transcript_path(dir, handle))
+    }
+
+    /// Takes back a run the session remembers: the journal lost it (it was
+    /// never written, or the file it was in was compacted away), but the
+    /// session kept the run's name, its kind and its transcript. The hub
+    /// knows it again as a finished agent, so a message revives it instead of
+    /// failing.
+    pub fn remember_run(
+        &self,
+        handle: &str,
+        name: &str,
+        spec: AgentSpec,
+        parent: UnitId,
+        transcript: Vec<Message>,
+    ) -> Result<UnitId, UnitError> {
+        let mut table = self.table();
+        if let Some(id) = table.handles.get(&UnitHandle(handle.into())) {
+            return Ok(*id);
+        }
+        if !UnitName::is_valid(name) {
+            return Err(UnitError::BadField {
+                field: "name",
+                kind: "pattern",
+            });
+        }
+        // The transcript the session kept is the run's history from now on.
+        if let Some(path) = self.transcript_path(handle) {
+            let _ = transcript::rewrite(&path, &transcript);
+        }
+        let id = UnitId::new();
+        let now = SystemTime::now();
+        let unit = Unit {
+            id,
+            handle: UnitHandle(handle.into()),
+            name: UnitName(name.into()),
+            owner: parent,
+            parent,
+            depth: 1,
+            kind: UnitKind::Agent(spec),
+            description: String::new(),
+            origin_tool_use_id: None,
+            state: UnitState::Done(Box::new(Terminal {
+                reason: DoneReason::Killed,
+                exit_code: None,
+                detail: Some("the session remembers this run".to_owned()),
+                result: UnitResult::default(),
+            })),
+            created_at: now,
+            started_at: Some(now),
+            finished_at: Some(now),
+            last_activity: self.clock.now(),
+            progress: None,
+            usage: Default::default(),
+            cost: 0.0,
+            notice_policy: NoticePolicy::Wake,
+        };
+        table.handles.insert(unit.handle.clone(), id);
+        table.names.insert(unit.name.clone(), id);
+        table.children.entry(parent).or_default().push(id);
+        table.order.push(id);
+        table.units.insert(id, unit);
+        Ok(id)
     }
 
     fn transcript_file(&self, handle: &str) -> Option<PathBuf> {
@@ -217,6 +287,7 @@ impl UnitHub {
             name: name.to_string(),
             prompt: Some(spec.prompt.clone()),
             model: Some(launch.model_spec.clone()),
+            subagent_type: Some(spec.subagent_type.clone()),
             opts: Some(launch.request_options()),
             answer_tx: Some(broker.sender()),
             inbox: Arc::new(crate::SubagentInbox::default()),

@@ -2262,6 +2262,7 @@ mod perm {
             name: "x".into(),
             prompt: None,
             model: None,
+            subagent_type: None,
             opts: None,
             answer_tx: None,
             inbox: Arc::new(crate::SubagentInbox::default()),
@@ -2510,6 +2511,64 @@ mod revive {
         assert_eq!(saved.len(), first_turn + 2, "the follow-up and its reply");
         // Same identity.
         assert_eq!(rig.hub.get(ack.id).unwrap().handle, ack.handle);
+    }
+
+    /// A run the journal lost is taken back from what the session kept: the
+    /// hub knows it again, and a message revives it from its transcript.
+    #[tokio::test]
+    async fn a_remembered_run_can_be_revived() {
+        let script = Script::new(vec![(CHILD, vec![Step::Reply(reply("the answer"))])]);
+        let (rig, _dir) = journaled(&script, UnitLimits::default());
+        let spec = AgentSpec {
+            prompt: String::new(),
+            subagent_type: "general".into(),
+            model_tier: None,
+            thinking: None,
+            output_schema: None,
+            fork: false,
+            one_shot: true,
+            timeout_secs: 600,
+        };
+        let history = vec![text_message(
+            Role::User,
+            &format!("{CHILD} the first question"),
+        )];
+        let id = rig
+            .hub
+            .remember_run("ag-lost01", "lost", spec, rig.hub.main(), history)
+            .unwrap();
+        // The hub knows the run again.
+        assert_eq!(rig.hub.resolve(rig.hub.main(), "ag-lost01").unwrap(), id);
+        let plan = rig
+            .hub
+            .revive_plan(rig.hub.main(), id)
+            .unwrap()
+            .expect("a remembered run is revivable");
+        let transcript = rig.hub.load_transcript(plan.handle.as_str()).unwrap();
+        let launch = AgentLaunch::prepare(&rig.ctx, &plan.spec).await.unwrap();
+        let sent = rig
+            .hub
+            .revive(
+                rig.hub.main(),
+                plan,
+                launch,
+                transcript,
+                "go on".to_owned(),
+                DeliveryKind::Steer,
+            )
+            .unwrap();
+        assert_eq!(sent.state, "revived");
+        let view = settle(&rig, id).await;
+        assert_eq!(view.result.unwrap().summary, "the answer");
+        let request = seen_text(&script, CHILD).remove(0);
+        assert!(
+            request.contains("the first question"),
+            "the history came back: {request}"
+        );
+        assert!(
+            request.contains("go on"),
+            "the message was delivered: {request}"
+        );
     }
 
     #[tokio::test]

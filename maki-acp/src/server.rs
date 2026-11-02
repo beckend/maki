@@ -1578,6 +1578,7 @@ mod tests {
             name: SUBAGENT_NAME.to_owned(),
             prompt: None,
             model: None,
+            subagent_type: None,
             opts: None,
             answer_tx,
             inbox: Arc::default(),

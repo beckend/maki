@@ -93,6 +93,10 @@ pub struct Chat {
     pub list_cost: Option<f64>,
     pub context_size: u32,
     pub model_id: Option<String>,
+    /// `research` or `general`: what kind of subagent this chat is. The
+    /// session keeps it, so a child the journal lost comes back with the
+    /// tools it had.
+    pub subagent_type: Option<String>,
     /// A subagent's own settings; `None` on the main chat, which reads the
     /// session's.
     pub opts: Option<RequestOptions>,
@@ -141,6 +145,7 @@ impl Chat {
             list_cost: None,
             context_size: 0,
             model_id: None,
+            subagent_type: None,
             opts: None,
             inbox: None,
             answer_tx: None,

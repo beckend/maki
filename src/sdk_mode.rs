@@ -1969,6 +1969,7 @@ mod tests {
                 name: NOTICE_CHILD.into(),
                 prompt: None,
                 model: None,
+                subagent_type: None,
                 opts: None,
                 answer_tx: None,
                 inbox: Arc::default(),

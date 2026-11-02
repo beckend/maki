@@ -690,6 +690,12 @@ pub struct StoredSubagent {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// `research` or `general`: what kind of subagent this was, so a child
+    /// the journal lost comes back with the tools it had. Absent on subagents
+    /// written before this was recorded, and on anything but a tool-spawned
+    /// child.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent_type: Option<String>,
     /// Absent on subagents written before this was recorded, and the one flag
     /// that says whether `fast` below is the subagent's or just a default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2506,6 +2512,7 @@ mod tests {
                 tool_use_id: id.into(),
                 name: "sub".into(),
                 model: None,
+                subagent_type: None,
                 thinking: None,
                 fast: false,
                 plugin: plugin.map(Arc::from),
@@ -3628,6 +3635,7 @@ mod tests {
             tool_use_id: "ag-k3x9ab".into(),
             name: "auditor".into(),
             model: None,
+            subagent_type: None,
             thinking: None,
             fast: false,
             plugin: None,

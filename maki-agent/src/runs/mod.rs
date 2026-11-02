@@ -1230,6 +1230,7 @@ impl UnitHub {
                     name: name.to_string(),
                     prompt: Some(spec.prompt.clone()),
                     model: Some(launch.model_spec.clone()),
+                    subagent_type: Some(spec.subagent_type.clone()),
                     opts: Some(launch.request_options()),
                     answer_tx: Some(broker.sender()),
                     inbox: Arc::new(crate::SubagentInbox::default()),

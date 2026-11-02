@@ -1355,6 +1355,11 @@ pub struct SubagentInfo {
     pub prompt: Option<String>,
     #[serde(rename = "parent_model", skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// What kind of subagent this is: "research" (read-only) or "general".
+    /// The session keeps it, so a child the journal lost comes back with the
+    /// tools it had.
+    #[serde(rename = "subagent_type", skip_serializing_if = "Option::is_none")]
+    pub subagent_type: Option<String>,
     /// What the subagent actually runs with, already reconciled against its
     /// model. `None` means unknown (a restore predating it), which reads as
     /// the parent's settings.
