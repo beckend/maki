@@ -86,7 +86,7 @@ impl UnitHub {
         let UnitKind::Agent(spec) = &unit.kind else {
             return Err(UnitError::NotAgent);
         };
-        let UnitState::Done(terminal) = &unit.state else {
+        let UnitState::Done(_) = &unit.state else {
             return Ok(None);
         };
         if from != self.user
@@ -101,9 +101,9 @@ impl UnitHub {
         if !self.can_message(&table, from, unit) {
             return Err(UnitError::NotReachable);
         }
-        if spec.one_shot && terminal.reason == DoneReason::Completed {
-            return Err(UnitError::RecipientTerminal);
-        }
+        // A finished agent is resumable: its transcript is what it comes
+        // back with. A one-shot agent is no exception, it only ends after
+        // its turn instead of staying available.
         let saved = self
             .transcript_file(unit.handle.as_str())
             .is_some_and(|p| p.exists());

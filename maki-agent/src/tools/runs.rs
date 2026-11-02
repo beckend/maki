@@ -199,13 +199,15 @@ and never poll one. Keep working instead; the result is delivered to you.
 
 Agent runs do not see this conversation, so the prompt must contain everything they
 need. They share your workspace. An agent run ends after its report unless one_shot is
-false, which keeps it available for follow-up messages.";
+false, which keeps it available for follow-up messages. A finished agent can be
+resumed either way: send it a message and it comes back with its transcript.";
 
 const SEND_DESCRIPTION: &str =
     "Send a message to another run in this session: your child, your parent (name \"parent\"),
 or \"main\". (Siblings only if the session enables it.) The message is queued and returns a
 message id at once. A running recipient reads it at its next step; an idle one starts a turn
-with it; a finished or evicted agent with a saved transcript is revived first. Sending does not end your turn and is not an answer: the recipient's reply, if any,
+with it; a finished or evicted agent with a saved transcript is revived first, so a message
+resumes a child that already reported. Sending does not end your turn and is not an answer: the recipient's reply, if any,
 comes as a message to you. Use mode \"quiet\" for FYI notes that must not start a turn. A
 subagent sends its result to its parent this way: the parent does not see the subagent's
 transcript, so a result that is not sent is lost.";

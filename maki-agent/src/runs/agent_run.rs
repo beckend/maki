@@ -2513,16 +2513,35 @@ mod revive {
     }
 
     #[tokio::test]
-    async fn one_shot_not_revivable() {
-        let script = Script::new(vec![(CHILD, vec![Step::Reply(reply("done"))])]);
+    async fn a_completed_one_shot_agent_is_revivable() {
+        let script = Script::new(vec![(
+            CHILD,
+            vec![
+                Step::Reply(reply("first answer")),
+                Step::Reply(reply("second answer")),
+            ],
+        )]);
         let (rig, _dir) = journaled(&script, UnitLimits::default());
         let ack = spawn(&rig, CHILD, json!({"one_shot": true})).await;
         assert_eq!(
             done_reason(&settle(&rig, ack.id).await),
             DoneReason::Completed
         );
-        let err = rig.hub.revive_plan(rig.hub.main(), ack.id).unwrap_err();
-        assert_eq!(err, UnitError::RecipientTerminal);
+        // A one-shot agent ends after its turn, but it is resumable: the
+        // transcript is what it comes back with.
+        let plan = rig.hub.revive_plan(rig.hub.main(), ack.id).unwrap();
+        assert!(plan.is_some());
+        let sent = revive(&rig, ack.id, "follow up please").await.unwrap();
+        assert_eq!(sent.state, "revived");
+        let view = settle(&rig, ack.id).await;
+        assert_eq!(done_reason(&view), DoneReason::Completed);
+        assert_eq!(view.result.unwrap().summary, "second answer");
+        let second = seen_text(&script, CHILD).remove(1);
+        assert!(
+            second.contains("first answer"),
+            "history restored: {second}"
+        );
+        assert!(second.contains("follow up please"), "message delivered");
     }
 
     #[tokio::test]

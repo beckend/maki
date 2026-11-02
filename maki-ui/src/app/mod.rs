@@ -829,12 +829,11 @@ impl App {
             .filter(|run| run.kind == "agent")
     }
 
-    /// Whether a message typed in the active tab can reach its run: any live
-    /// one, and a finished one the hub can bring back (a one-shot that
-    /// completed cannot be).
+    /// Whether a message typed in the active tab can reach its run: every
+    /// native agent run takes one, a finished one included, since the hub
+    /// brings it back from its transcript.
     fn run_tab_takes_input(&self) -> bool {
-        self.native_tab(self.active_chat)
-            .is_some_and(|run| !(run.one_shot && run.state == "completed"))
+        self.native_tab(self.active_chat).is_some()
     }
 
     /// Keeps `RunsView` in step with the hub's run events, shells included.

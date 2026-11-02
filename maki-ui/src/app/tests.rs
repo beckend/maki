@@ -13027,14 +13027,19 @@ fn typing_into_a_finished_run_tab_revives_it() {
 }
 
 #[test]
-fn a_completed_one_shot_run_tab_stays_read_only() {
+fn a_completed_one_shot_run_tab_takes_input() {
     let mut app = streaming_app();
     start_run(&mut app, RUN_A, "reader", None, true);
     finish_run(&mut app, RUN_A, "reader", "completed");
     let idx = app.chat_index[RUN_A];
     app.set_active_chat(idx);
-    assert!(!app.chat_accepts_input());
-    assert!(app.update(Msg::Key(key(KeyCode::Char('x')))).is_empty());
+    assert!(app.chat_accepts_input());
+    // A finished run is brought back from its transcript by the message.
+    let actions = type_and_submit(&mut app, "one more thing");
+    assert!(matches!(
+        &actions[..],
+        [Action::SendToRun { handle, text }] if handle == RUN_A && text == "one more thing"
+    ));
 }
 
 #[test]
