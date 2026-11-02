@@ -504,6 +504,11 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
         params.resumed.id.id(),
         false,
     );
+    // A run the journal lost is still in the session, with what it was and
+    // what it said, so the hub takes it back and a message revives it.
+    if let (Some(runs), Some(session)) = (runs.as_ref(), params.resumed.session.as_ref()) {
+        crate::runs::remember_session_runs(&runs.hub, session);
+    }
     let session_ref = params.resumed.id.clone();
     let mailbox = open_mailbox(&params.resumed);
 

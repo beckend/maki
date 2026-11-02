@@ -14,7 +14,6 @@ use crate::text_buffer::Writers;
 
 const LOST_TEXT: &str = "Lost when maki exited";
 use maki_agent::agent::SessionExport;
-use maki_agent::runs::AgentSpec;
 use maki_agent::session::SessionHeader;
 use maki_agent::{SessionMailbox, TaskEnd, Transcript};
 use maki_lua::agent_autocmd::HostEvent;
@@ -32,26 +31,6 @@ use super::{App, MAIN_CHAT, Mode, PlanState, Sending, Status};
 
 /// The shortest gap between two writes that carry only UI state.
 const SOFT_SAVE_DELAY: Duration = Duration::from_millis(1000);
-
-/// The spec a remembered run comes back with: what the session kept of it.
-/// The prompt is not sent again (a revived run starts from its transcript),
-/// and a child the session does not describe is read-only, so the tools it
-/// comes back with are never wider than the ones it had.
-pub(crate) fn spec_for(stored: &StoredSubagent) -> AgentSpec {
-    AgentSpec {
-        prompt: String::new(),
-        subagent_type: stored
-            .subagent_type
-            .clone()
-            .unwrap_or_else(|| "research".to_owned()),
-        model_tier: None,
-        thinking: None,
-        output_schema: None,
-        fork: false,
-        one_shot: stored.run.as_ref().is_some_and(|run| run.one_shot),
-        timeout_secs: maki_config::DEFAULT_RUNS_MAX_TIMEOUT_SECS,
-    }
-}
 
 pub(super) const FORK_TITLE_PREFIX: &str = "fork of ";
 pub(super) const FORK_EMPTY_MSG: &str = "Nothing to fork, the copy would be empty";
@@ -307,51 +286,10 @@ impl App {
     /// process that could not take the lock) is still in the session, and the
     /// child the user wants to continue must not be lost with it.
     pub(crate) fn remember_runs(&mut self) {
-        let handles: Vec<String> = self
-            .state
-            .session
-            .subagents()
-            .iter()
-            .filter_map(|sub| sub.run.as_ref().map(|run| run.handle.clone()))
-            .collect();
-        for handle in handles {
-            self.remember_run(&handle);
-        }
-    }
-
-    /// One run the hub lost, taken back from what the session kept.
-    pub(crate) fn remember_run(&mut self, handle: &str) {
         let Some(runs) = self.live_runs() else {
             return;
         };
-        let hub = &runs.hub;
-        if hub.resolve(hub.main(), handle).is_ok() {
-            return;
-        }
-        let Some(sub) = self
-            .state
-            .session
-            .subagents()
-            .iter()
-            .find(|sub| sub.run.as_ref().is_some_and(|run| run.handle == handle))
-        else {
-            return;
-        };
-        let Some(run) = sub.run.as_ref() else {
-            return;
-        };
-        if run.kind != "agent" {
-            return;
-        }
-        let spec = spec_for(sub);
-        let transcript = self
-            .state
-            .session
-            .subagent_messages()
-            .get(handle)
-            .map(|messages| messages.as_ref().clone())
-            .unwrap_or_default();
-        let _ = hub.remember_run(handle, &sub.name, spec, hub.main(), transcript);
+        maki_agent::runs::remember_session_runs(&runs.hub, &self.state.session);
     }
 
     /// The hub of this session, when the agent is live and runs are on.

@@ -61,7 +61,7 @@ pub use inbox::{DeliveryKind, Inbox, InboxItem, MessageId, SendAck};
 pub use journal::ReconcileReport;
 pub use limits::UnitLimits;
 pub use notice::{Notice, NoticeInfo, NoticeKind};
-pub use revive::{RevivePlan, TombstoneView};
+pub use revive::{RevivePlan, TombstoneView, remember_session_runs, spec_for};
 use shell::ShellRun;
 pub use shell::{AdoptEvent, Adopted, OutputSlice, ShellOptions};
 

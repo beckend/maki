@@ -10,6 +10,8 @@ use std::path::PathBuf;
 
 use maki_storage::runs::{AckRec, JournalRecord, Replay, STATE_REVIVED, StateRec};
 
+use crate::session::StoredSession;
+
 use super::agent::AgentRun;
 use super::broker::PermissionBroker;
 use super::inbox::MessageId;
@@ -519,5 +521,48 @@ impl UnitHub {
         table.idle_results.remove(&id);
         table.pool.drop_run(id);
         table.tombstones.insert(id, unit);
+    }
+}
+
+/// Takes back the runs a stored session remembers: a run the journal lost
+/// (its record never written, or compacted away) is still in the session,
+/// with its name, its kind and its transcript, and that is enough to bring it
+/// back. The hub knows it again as a finished agent, so a message revives it
+/// like any other.
+pub fn remember_session_runs(hub: &UnitHub, session: &StoredSession) {
+    for sub in session.subagents() {
+        let Some(run) = &sub.run else {
+            continue;
+        };
+        if run.kind != "agent" {
+            continue;
+        }
+        if hub.resolve(hub.main(), &run.handle).is_ok() {
+            continue;
+        }
+        let spec = spec_for(sub.subagent_type.as_deref(), run.one_shot);
+        let transcript = session
+            .subagent_messages()
+            .get(&run.handle)
+            .map(|messages| messages.as_ref().clone())
+            .unwrap_or_default();
+        let _ = hub.remember_run(&run.handle, &sub.name, spec, hub.main(), transcript);
+    }
+}
+
+/// The spec a remembered run comes back with: what the session kept of it.
+/// The prompt is not sent again (a revived run starts from its transcript),
+/// and a child the session does not describe is read-only, so the tools it
+/// comes back with are never wider than the ones it had.
+pub fn spec_for(subagent_type: Option<&str>, one_shot: bool) -> AgentSpec {
+    AgentSpec {
+        prompt: String::new(),
+        subagent_type: subagent_type.unwrap_or("research").to_owned(),
+        model_tier: None,
+        thinking: None,
+        output_schema: None,
+        fork: false,
+        one_shot,
+        timeout_secs: maki_config::DEFAULT_RUNS_MAX_TIMEOUT_SECS,
     }
 }

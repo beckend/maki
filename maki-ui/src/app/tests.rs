@@ -13149,14 +13149,21 @@ fn a_remembered_run_keeps_its_kind() {
         ended_at: None,
         run: Some(run),
     };
-    let spec = super::session::spec_for(&stored);
+    let spec = maki_agent::runs::spec_for(
+        stored.subagent_type.as_deref(),
+        stored.run.as_ref().is_some_and(|run| run.one_shot),
+    );
     assert_eq!(spec.subagent_type, "general");
     assert!(spec.one_shot);
     assert!(spec.prompt.is_empty());
     let mut unknown = stored.clone();
     unknown.subagent_type = None;
     assert_eq!(
-        super::session::spec_for(&unknown).subagent_type,
+        maki_agent::runs::spec_for(
+            unknown.subagent_type.as_deref(),
+            unknown.run.as_ref().is_some_and(|run| run.one_shot)
+        )
+        .subagent_type,
         "research",
         "a child the session does not describe is read-only"
     );
