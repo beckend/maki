@@ -623,10 +623,13 @@ impl App {
     }
 
     /// What `/tasks` counts in its hint: the tasks quitting or a rewind would
-    /// end, as opposed to the tool tasks a turn owns.
+    /// end, as opposed to the tool tasks a turn owns. A native run counts as
+    /// one: it works in the background like a plugin's task does, and the
+    /// status bar says the session is busy while it does.
     pub(crate) fn running_background_tasks(&self) -> impl Iterator<Item = &Chat> {
         self.chats.iter().filter(|chat| {
-            chat.plugin.is_some()
+            chat.task_id().is_some()
+                && (chat.plugin.is_some() || chat.run.is_some())
                 && chat.parent.is_none()
                 && chat.task_status() == TaskStatus::Working
         })

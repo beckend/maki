@@ -13028,6 +13028,19 @@ fn typing_into_a_finished_run_tab_revives_it() {
     assert!(rendered(&mut app).contains("[runs 1 running]"));
 }
 
+/// A native run works in the background like a plugin's task does: the
+/// status bar says the session is busy while it does, and it stops saying so
+/// when the run ends.
+#[test]
+fn a_working_native_run_counts_as_a_background_task() {
+    let mut app = streaming_app();
+    start_run(&mut app, RUN_A, "reader", None, false);
+    assert_eq!(app.running_background_tasks().count(), 1);
+    assert!(app.is_working(), "the status bar spins while a run works");
+    finish_run(&mut app, RUN_A, "reader", "completed");
+    assert_eq!(app.running_background_tasks().count(), 0);
+}
+
 #[test]
 fn a_completed_one_shot_run_tab_takes_input() {
     let mut app = streaming_app();
