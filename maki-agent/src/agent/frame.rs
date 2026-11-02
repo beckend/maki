@@ -333,8 +333,15 @@ pub(crate) fn topology_text(topology: &TopologyFacts, can_send: bool) -> String 
         } else {
             format!("Runs you started: {}.", child_list(&topology.children))
         };
+        // The parent is the one that has to be told what a run does for it:
+        // the child reports with send and its end wakes the parent, so
+        // waiting for it, sleeping on it or polling it is all wasted.
         return format!(
-            "Run topology changed. You are \"{MAIN_NAME}\". {runs} Runs finish with a notice; do not poll. Maximum depth {max_depth}."
+            "Run topology changed. You are \"{MAIN_NAME}\". {runs} A sub-agent you started \
+             reports its result to you (it sends it to \"parent\") and its end wakes you, so \
+             keep working: never wait for it, never sleep to watch it, never poll it. A \
+             command's output arrives when it ends. Runs finish with a notice. Maximum depth \
+             {max_depth}."
         );
     };
     let parent = if parent_handle == MAIN_NAME {
@@ -346,6 +353,15 @@ pub(crate) fn topology_text(topology: &TopologyFacts, can_send: bool) -> String 
         "You have no children.".to_owned()
     } else {
         format!("Your children: {}.", child_list(&topology.children))
+    };
+    // A run that has children of its own is a parent too, and the same rule
+    // holds for it.
+    let children_report = if topology.children.is_empty() {
+        ""
+    } else {
+        " A sub-agent you started reports its result to you (it sends it to \"parent\") and its \
+         end wakes you, so keep working: never wait for it, never sleep to watch it, never poll \
+         it."
     };
     let cap = if at_cap {
         " You are at the maximum depth: spawn(kind=\"agent\") will fail with DEPTH_LIMIT; do the work directly."
@@ -364,7 +380,7 @@ pub(crate) fn topology_text(topology: &TopologyFacts, can_send: bool) -> String 
     };
     let scope = "Your permission scope is the one you were started with and cannot be widened from inside this session, so a call that would need the user's approval is denied when nobody can answer it: do not retry such a call, say what you could not do instead.";
     format!(
-        "Run topology changed. You are agent \"{name}\" ({handle}), depth {depth} of {max_depth}. Your parent is {parent}. {children} {report} {scope} {siblings}{cap}"
+        "Run topology changed. You are agent \"{name}\" ({handle}), depth {depth} of {max_depth}. Your parent is {parent}. {children}{children_report} {report} {scope} {siblings}{cap}"
     )
 }
 
@@ -550,7 +566,7 @@ mod tests {
     fn rendering_snapshot_main_and_sub() {
         assert_eq!(
             topology_text(&main_topology(), true),
-            "Run topology changed. You are \"main\". Runs you started: \"auditor\" (ag-k3x9ab, agent), \"build\" (sh-4m2q7z, shell). Runs finish with a notice; do not poll. Maximum depth 2."
+            "Run topology changed. You are \"main\". Runs you started: \"auditor\" (ag-k3x9ab, agent), \"build\" (sh-4m2q7z, shell). A sub-agent you started reports its result to you (it sends it to \"parent\") and its end wakes you, so keep working: never wait for it, never sleep to watch it, never poll it. A command's output arrives when it ends. Runs finish with a notice. Maximum depth 2."
         );
         assert_eq!(
             topology_text(&sub_topology(), true),

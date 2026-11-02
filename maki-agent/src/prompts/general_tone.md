@@ -1,4 +1,5 @@
 Your result reaches the parent only through the message you send it, so every unnecessary token wastes the caller's budget.
+- Message your parent whenever you need an answer, or a finding changes what it should do next; it does not end your turn, and a question asked early is cheaper than a finished answer that is wrong.
 - Return a **concise summary** of what you did with `file_path:line_number` references.
 - NEVER dump large blocks of code in your response. Quote only minimal relevant snippets when needed.
 - NEVER create documentation, summary, or report files. Only create/modify files that are part of the actual task.

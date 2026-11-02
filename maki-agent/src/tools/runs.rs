@@ -171,7 +171,13 @@ const DEFAULT_WAIT_SECS: u64 = 60;
 const DEFAULT_STOP_WAIT_SECS: u64 = 10;
 const DEFAULT_TAIL_LINES: usize = 40;
 const NO_RUNTIME: &str = "runs are not available in this session";
-const SPAWNERS: ToolAudience = ToolAudience::MAIN.union(ToolAudience::GENERAL_SUB);
+/// Who may start a run: the main agent and any sub-agent. A sub-agent that
+/// may not spawn is a leaf, and the depth limit then only bounds how deep
+/// the tree can go, not who may plant it. The child's scope is inherited, so
+/// a read-only sub-agent's own children stay read-only.
+const SPAWNERS: ToolAudience = ToolAudience::MAIN
+    .union(ToolAudience::GENERAL_SUB)
+    .union(ToolAudience::RESEARCH_SUB);
 
 const SPAWN_DESCRIPTION: &str =
     "Start background work and return immediately with its id. kind \"agent\" starts a
@@ -187,7 +193,9 @@ the rest show as queued with a position and start in order. A full queue returns
 QUEUE_FULL: wait for runs to finish. A timeout_secs above the session maximum is
 lowered to it, and timeout_secs 0 asks for that maximum outright, so a long task is
 not cut off at the default. An agent's clock starts when it starts working. Not available to agents at the maximum depth: you
-get DEPTH_LIMIT and must do the work yourself.
+get DEPTH_LIMIT and must do the work yourself. The result comes to you: a sub-agent
+sends it with `send` and its end wakes you, so never wait for one, never sleep on one
+and never poll one. Keep working instead; the result is delivered to you.
 
 Agent runs do not see this conversation, so the prompt must contain everything they
 need. They share your workspace. An agent run ends after its report unless one_shot is
@@ -1019,6 +1027,21 @@ mod tests {
 
     fn tool(which: Which) -> RunTool {
         RunTool(which)
+    }
+
+    /// A sub-agent may start its own sub-agent: the tree is not a two-level
+    /// thing, and the depth limit is what bounds how deep it goes, not who may
+    /// plant it. A sub-agent that may not spawn would be a leaf.
+    #[test]
+    fn a_sub_agent_may_start_its_own_sub_agent() {
+        let spawn = tool(Which::Spawn);
+        for audience in [ToolAudience::GENERAL_SUB, ToolAudience::RESEARCH_SUB] {
+            assert!(
+                spawn.audience().contains(audience),
+                "{audience:?} may not spawn"
+            );
+        }
+        assert!(spawn.audience().contains(ToolAudience::MAIN));
     }
 
     fn ctx() -> ToolContext {
