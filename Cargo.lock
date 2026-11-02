@@ -3638,7 +3638,7 @@ dependencies = [
 
 [[package]]
 name = "maki"
-version = "1.0.10-fork"
+version = "1.0.11-fork"
 dependencies = [
  "clap",
  "color-eyre",
@@ -3670,7 +3670,7 @@ dependencies = [
 
 [[package]]
 name = "maki-acp"
-version = "1.0.10-fork"
+version = "1.0.11-fork"
 dependencies = [
  "agent-client-protocol-schema",
  "color-eyre",
@@ -3693,7 +3693,7 @@ dependencies = [
 
 [[package]]
 name = "maki-agent"
-version = "1.0.10-fork"
+version = "1.0.11-fork"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -3742,7 +3742,7 @@ dependencies = [
 
 [[package]]
 name = "maki-config"
-version = "1.0.10-fork"
+version = "1.0.11-fork"
 dependencies = [
  "dotenvy",
  "globset",
@@ -3762,7 +3762,7 @@ dependencies = [
 
 [[package]]
 name = "maki-config-macro"
-version = "1.0.10-fork"
+version = "1.0.11-fork"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3771,7 +3771,7 @@ dependencies = [
 
 [[package]]
 name = "maki-docgen"
-version = "1.0.10-fork"
+version = "1.0.11-fork"
 dependencies = [
  "maki-agent",
  "maki-config",
@@ -3786,7 +3786,7 @@ dependencies = [
 
 [[package]]
 name = "maki-highlight"
-version = "1.0.10-fork"
+version = "1.0.11-fork"
 dependencies = [
  "flume",
  "serde_json",
@@ -3798,7 +3798,7 @@ dependencies = [
 
 [[package]]
 name = "maki-interpreter"
-version = "1.0.10-fork"
+version = "1.0.11-fork"
 dependencies = [
  "getrandom 0.4.3",
  "monty",
@@ -3812,7 +3812,7 @@ dependencies = [
 
 [[package]]
 name = "maki-lua"
-version = "1.0.10-fork"
+version = "1.0.11-fork"
 dependencies = [
  "arc-swap",
  "base64 0.23.1",
@@ -3899,7 +3899,7 @@ dependencies = [
 
 [[package]]
 name = "maki-lua-macro"
-version = "1.0.10-fork"
+version = "1.0.11-fork"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3908,7 +3908,7 @@ dependencies = [
 
 [[package]]
 name = "maki-markdown"
-version = "1.0.10-fork"
+version = "1.0.11-fork"
 dependencies = [
  "fastrand",
  "maki-highlight",
@@ -3920,7 +3920,7 @@ dependencies = [
 
 [[package]]
 name = "maki-otel"
-version = "1.0.10-fork"
+version = "1.0.11-fork"
 dependencies = [
  "http",
  "maki-config",
@@ -3938,7 +3938,7 @@ dependencies = [
 
 [[package]]
 name = "maki-pack"
-version = "1.0.10-fork"
+version = "1.0.11-fork"
 dependencies = [
  "maki-storage",
  "serde",
@@ -3952,7 +3952,7 @@ dependencies = [
 
 [[package]]
 name = "maki-providers"
-version = "1.0.10-fork"
+version = "1.0.11-fork"
 dependencies = [
  "aws-config",
  "aws-credential-types",
@@ -3989,7 +3989,7 @@ dependencies = [
 
 [[package]]
 name = "maki-storage"
-version = "1.0.10-fork"
+version = "1.0.11-fork"
 dependencies = [
  "bs58",
  "etcetera",
@@ -4007,7 +4007,7 @@ dependencies = [
 
 [[package]]
 name = "maki-ui"
-version = "1.0.10-fork"
+version = "1.0.11-fork"
 dependencies = [
  "arboard",
  "arc-swap",
