@@ -95,7 +95,19 @@ end
 Runner.allow_background = opts.allow_background
 Runner.allow_model = opts.allow_model
 Runner.schema = schema
-Runner.semaphore = maki.async.semaphore(opts.max_concurrent)
+local slots = maki.async.semaphore(opts.max_concurrent)
+
+-- {on_wait} runs only when every slot is taken, right before the call parks
+-- for one.
+function Runner.acquire_slot(on_wait)
+  local permit = slots:try_acquire()
+  if permit then
+    return permit
+  end
+  on_wait()
+  return slots:acquire()
+end
+
 -- The native path in `init.lua` answers with the same wording, so the text
 -- lives in one place.
 Runner.errors = {

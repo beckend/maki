@@ -349,7 +349,7 @@ fn load_background_host() -> (Arc<ToolRegistry>, PluginHost) {
 fn load_task_host_with_opts(
     opts: serde_json::Map<String, serde_json::Value>,
 ) -> (Arc<ToolRegistry>, PluginHost) {
-    load_task_host_in(Arc::new(ToolRegistry::new()), opts)
+    load_task_host_source(Arc::new(ToolRegistry::new()), opts, true)
 }
 
 /// The same host, over a registry the caller filled: the native run tools are
@@ -358,9 +358,19 @@ fn load_task_host_in(
     reg: Arc<ToolRegistry>,
     opts: serde_json::Map<String, serde_json::Value>,
 ) -> (Arc<ToolRegistry>, PluginHost) {
+    load_task_host_source(reg, opts, false)
+}
+
+/// The native run tools reserve the name `wait`, so a host that loads them
+/// leaves the stub out; the suites that wait on the stub keep it.
+fn load_task_host_source(
+    reg: Arc<ToolRegistry>,
+    opts: serde_json::Map<String, serde_json::Value>,
+    with_wait_stub: bool,
+) -> (Arc<ToolRegistry>, PluginHost) {
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     let prelude = STUB_PRELUDE
-        .replace("@WAIT_STUB@", "")
+        .replace("@WAIT_STUB@", if with_wait_stub { WAIT_STUB } else { "" })
         .replace("@PLAIN_TEXT@", PLAIN_TEXT)
         .replace("@RECOVERED_TEXT@", RECOVERED_TEXT)
         .replace("@PROMPT_ERR@", PROMPT_ERR_MSG)
@@ -467,8 +477,8 @@ fn thinking_forwards_to_session(thinking: Option<Value>) {
     assert_eq!(snap.get("thinking"), thinking.as_ref());
 }
 
-#[tokio::test]
-async fn model_spec_forwards_full_spec_to_resolve_model() {
+#[test]
+fn model_spec_forwards_full_spec_to_resolve_model() {
     let mut opts = serde_json::Map::new();
     opts.insert("allow_model".into(), json!(true));
     let (reg, _host) = load_task_host_with_opts(opts);
@@ -488,8 +498,8 @@ async fn model_spec_forwards_full_spec_to_resolve_model() {
     );
 }
 
-#[tokio::test]
-async fn model_spec_ignored_when_allow_model_off() {
+#[test]
+fn model_spec_ignored_when_allow_model_off() {
     let (reg, _host) = load_task_host();
     let mut input = task_input(SCENARIO_PLAIN, None);
     input["model"] = json!(FULL_MODEL_SPEC);
@@ -576,8 +586,8 @@ fn structured_happy_path_returns_validated_json(schema: Value) {
     );
 }
 
-#[tokio::test]
-async fn invalid_then_valid_recovers_within_one_prompt() {
+#[test]
+fn invalid_then_valid_recovers_within_one_prompt() {
     let (reg, _host) = load_task_host();
     let out = exec_tool(
         &reg,
@@ -601,8 +611,8 @@ async fn invalid_then_valid_recovers_within_one_prompt() {
     assert_eq!(snap["closed"], json!(1));
 }
 
-#[tokio::test]
-async fn missing_structured_output_nudges_then_errors() {
+#[test]
+fn missing_structured_output_nudges_then_errors() {
     let (reg, _host) = load_task_host();
     let err = exec_tool(
         &reg,
@@ -621,8 +631,8 @@ async fn missing_structured_output_nudges_then_errors() {
     assert_eq!(snap["closed"], json!(1));
 }
 
-#[tokio::test]
-async fn invalid_only_errors_with_bounded_schema_errors() {
+#[test]
+fn invalid_only_errors_with_bounded_schema_errors() {
     let (reg, _host) = load_task_host();
     let err = exec_tool(
         &reg,
@@ -643,8 +653,8 @@ async fn invalid_only_errors_with_bounded_schema_errors() {
     );
 }
 
-#[tokio::test]
-async fn prompt_error_maps_to_sub_agent_error() {
+#[test]
+fn prompt_error_maps_to_sub_agent_error() {
     let (reg, _host) = load_task_host();
     let err = exec_tool(&reg, TASK_TOOL, task_input(SCENARIO_PROMPT_ERROR, None)).unwrap_err();
     assert_eq!(err, format!("{SUB_AGENT_ERROR_PREFIX}{PROMPT_ERR_MSG}"));
@@ -655,8 +665,8 @@ async fn prompt_error_maps_to_sub_agent_error() {
 /// Esc during a sub-agent run: the prompt hands back both an error and
 /// whatever the sub-agent managed to say, and half a transcript is worth
 /// more to the model than a bare "cancelled".
-#[tokio::test]
-async fn interrupted_prompt_reports_the_partial_transcript() {
+#[test]
+fn interrupted_prompt_reports_the_partial_transcript() {
     let (reg, _host) = load_task_host();
     let err = exec_tool(&reg, TASK_TOOL, task_input(SCENARIO_PARTIAL_ERROR, None)).unwrap_err();
     assert_eq!(
@@ -665,8 +675,8 @@ async fn interrupted_prompt_reports_the_partial_transcript() {
     );
 }
 
-#[tokio::test]
-async fn plain_path_returns_text_without_local_tools() {
+#[test]
+fn plain_path_returns_text_without_local_tools() {
     let (reg, _host) = load_task_host();
     let out = exec_tool(&reg, TASK_TOOL, task_input(SCENARIO_PLAIN, None)).unwrap();
     assert_eq!(out, PLAIN_TEXT);
@@ -678,8 +688,8 @@ async fn plain_path_returns_text_without_local_tools() {
     assert_eq!(snap["closed"], json!(1));
 }
 
-#[tokio::test]
-async fn no_summary_nudges_then_recovers() {
+#[test]
+fn no_summary_nudges_then_recovers() {
     let (reg, _host) = load_task_host();
     let out = exec_tool(
         &reg,
@@ -696,8 +706,8 @@ async fn no_summary_nudges_then_recovers() {
     assert_eq!(snap["closed"], json!(1));
 }
 
-#[tokio::test]
-async fn no_summary_errors_after_nudges() {
+#[test]
+fn no_summary_errors_after_nudges() {
     let (reg, _host) = load_task_host();
     let err = exec_tool(&reg, TASK_TOOL, task_input(SCENARIO_NO_SUMMARY, None)).unwrap_err();
     assert_eq!(err, SUMMARY_MISSING_ERROR);
@@ -708,8 +718,8 @@ async fn no_summary_errors_after_nudges() {
 }
 
 /// Spy counters catch a leaked permit even when gc would silently reclaim it.
-#[tokio::test]
-async fn raising_prompt_does_not_leak_semaphore_permit() {
+#[test]
+fn raising_prompt_does_not_leak_semaphore_permit() {
     let (reg, _host) = load_task_host();
     let err = exec_tool(&reg, TASK_TOOL, task_input(SCENARIO_RAISE, None)).unwrap_err();
     assert!(err.contains(RAISE_MSG), "got: {err}");
@@ -728,8 +738,8 @@ async fn raising_prompt_does_not_leak_semaphore_permit() {
     assert_eq!(out, PLAIN_TEXT);
 }
 
-#[tokio::test]
-async fn background_input_is_on_by_default_and_can_be_turned_off() {
+#[test]
+fn background_input_is_on_by_default_and_can_be_turned_off() {
     let advertised = |reg: &ToolRegistry| {
         reg.get(TASK_TOOL).unwrap().tool.schema()["properties"]["background"].is_object()
     };
@@ -739,8 +749,8 @@ async fn background_input_is_on_by_default_and_can_be_turned_off() {
     assert!(!advertised(&load_task_host_with_opts(off).0));
 }
 
-#[tokio::test]
-async fn background_without_a_chat_session_runs_blocking() {
+#[test]
+fn background_without_a_chat_session_runs_blocking() {
     let (reg, _host) = load_background_host();
     let out = exec_tool(&reg, TASK_TOOL, background_input(SCENARIO_PLAIN, None)).unwrap();
     assert!(out.starts_with(FOREGROUND_NOTE_HEAD), "{out}");
@@ -793,8 +803,8 @@ fn reply_text(done: ToolDoneEvent) -> String {
     text
 }
 
-#[tokio::test]
-async fn a_moved_task_keeps_its_slot_and_the_next_task_waits_visibly() {
+#[test]
+fn a_moved_task_keeps_its_slot_and_the_next_task_waits_visibly() {
     let mut opts = serde_json::Map::new();
     opts.insert("max_concurrent".into(), json!(1));
     let (reg, host) = load_task_host_with_opts(opts);
@@ -910,8 +920,8 @@ impl maki_providers::provider::Provider for FixedReply {
 /// `[agent.runs] enabled` with the Lua `task` plugin loaded: both tools are
 /// registered, `task` delegates to the native hub, and the two do not disturb
 /// each other.
-#[tokio::test]
-async fn native_and_legacy_task_enabled() {
+#[test]
+fn native_and_legacy_task_enabled() {
     use maki_agent::runs::{RunsCtx, SystemClock, UnitHub, UnitLimits};
 
     let reg = Arc::new(ToolRegistry::new());
@@ -938,62 +948,67 @@ async fn native_and_legacy_task_enabled() {
         self_run: hub.main(),
         hub: Arc::clone(&hub),
     });
-    let run = |name: &'static str, input: Value| {
-        let reg = Arc::clone(&reg);
-        let ctx = ctx.clone();
-        async move {
-            let inv = reg.get(name).unwrap().tool.parse(&input).unwrap();
-            inv.execute(&ctx).await.output.map(|out| match out {
-                ToolOutput::Plain(s) | ToolOutput::Markdown(s) => s.text,
-                other => panic!("unexpected output: {other:?}"),
-            })
-        }
-    };
+    // The host's own runtime drives the tool calls: the native run the tool
+    // spawns is scheduled on it, so the test must not block that runtime
+    // from the inside.
+    runtime().block_on(async {
+        let run = |name: &'static str, input: Value| {
+            let reg = Arc::clone(&reg);
+            let ctx = ctx.clone();
+            async move {
+                let inv = reg.get(name).unwrap().tool.parse(&input).unwrap();
+                inv.execute(&ctx).await.output.map(|out| match out {
+                    ToolOutput::Plain(s) | ToolOutput::Markdown(s) => s.text,
+                    other => panic!("unexpected output: {other:?}"),
+                })
+            }
+        };
 
-    // With runs on, `task` delegates to a native one-shot run (the Lua
-    // session stubs of the prelude are not used, so the text is the provider's).
-    let delegated = run(TASK_TOOL, task_input(SCENARIO_PLAIN, None))
+        // With runs on, `task` delegates to a native one-shot run (the Lua
+        // session stubs of the prelude are not used, so the text is the provider's).
+        let delegated = run(TASK_TOOL, task_input(SCENARIO_PLAIN, None))
+            .await
+            .unwrap();
+        assert_eq!(delegated, "native says hi");
+
+        let started = run(
+            "spawn",
+            json!({"kind": "agent", "description": "reader", "prompt": "say hi", "one_shot": true}),
+        )
         .await
         .unwrap();
-    assert_eq!(delegated, "native says hi");
+        let handle = started.split_whitespace().nth(1).unwrap().to_owned();
+        assert!(
+            handle.starts_with("ag-") && !handle.starts_with("toolu_"),
+            "{handle}"
+        );
+        // The model's wait keeps to commands, so an agent is awaited the way a
+        // plugin does: on the hub.
+        let id = hub.resolve(hub.main(), &handle).unwrap();
+        let views = (hub.wait(
+            hub.main(),
+            &[id],
+            maki_agent::runs::WaitMode::All,
+            std::time::Duration::from_secs(30),
+            &CancelToken::none(),
+        ))
+        .await;
+        let summary = &views[0].result.as_ref().unwrap().summary;
+        assert!(summary.contains("native says hi"), "{summary}");
+        assert!(
+            views[0].state.label().contains("completed"),
+            "{}",
+            views[0].state.label()
+        );
 
-    let started = run(
-        "spawn",
-        json!({"kind": "agent", "description": "reader", "prompt": "say hi", "one_shot": true}),
-    )
-    .await
-    .unwrap();
-    let handle = started.split_whitespace().nth(1).unwrap().to_owned();
-    assert!(
-        handle.starts_with("ag-") && !handle.starts_with("toolu_"),
-        "{handle}"
-    );
-    // The model's wait keeps to commands, so an agent is awaited the way a
-    // plugin does: on the hub.
-    let id = hub.resolve(hub.main(), &handle).unwrap();
-    let views = (hub.wait(
-        hub.main(),
-        &[id],
-        maki_agent::runs::WaitMode::All,
-        std::time::Duration::from_secs(30),
-        &CancelToken::none(),
-    ))
-    .await;
-    let summary = &views[0].result.as_ref().unwrap().summary;
-    assert!(summary.contains("native says hi"), "{summary}");
-    assert!(
-        views[0].state.label().contains("completed"),
-        "{}",
-        views[0].state.label()
-    );
-
-    // And `task` still delegates fine after a native run existed.
-    assert_eq!(
-        run(TASK_TOOL, task_input(SCENARIO_PLAIN, None))
-            .await
-            .unwrap(),
-        "native says hi"
-    );
+        // And `task` still delegates fine after a native run existed.
+        assert_eq!(
+            run(TASK_TOOL, task_input(SCENARIO_PLAIN, None))
+                .await
+                .unwrap(),
+            "native says hi"
+        );
+    });
 }
 
 // With `[agent.runs] enabled` the task tool is a native one-shot run: the
@@ -1097,8 +1112,8 @@ mod delegated {
             })
     }
 
-    #[tokio::test]
-    async fn task_runs_as_a_native_one_shot_agent_when_runs_are_enabled() {
+    #[test]
+    fn task_runs_as_a_native_one_shot_agent_when_runs_are_enabled() {
         let s = setup(vec![reply(ANSWER)]);
         let out = run_task(
             &s,
@@ -1117,8 +1132,8 @@ mod delegated {
 
     /// `load_source` runs with every permission, so a manifest that forgets
     /// `agent` (needed by `maki.run.wait`) only shows up with a real load.
-    #[tokio::test]
-    async fn manifest_grants_the_permissions_delegation_needs() {
+    #[test]
+    fn manifest_grants_the_permissions_delegation_needs() {
         let manifest: toml::Table = include_str!("../../plugins/task/plugin.toml")
             .parse()
             .unwrap();
@@ -1136,8 +1151,8 @@ mod delegated {
     /// timeout: the task tool asks for the session maximum, so a task the
     /// model knows to be long keeps running instead of being cut off with
     /// partial output.
-    #[tokio::test]
-    async fn the_delegated_task_asks_for_the_session_maximum() {
+    #[test]
+    fn the_delegated_task_asks_for_the_session_maximum() {
         let s = setup_with_limits(
             MockProvider::new(vec![reply(ANSWER)]),
             UnitLimits {
@@ -1156,8 +1171,8 @@ mod delegated {
     }
 
     /// The model can still cap a subagent it expects to overrun.
-    #[tokio::test]
-    async fn the_delegated_task_takes_a_timeout_from_the_caller() {
+    #[test]
+    fn the_delegated_task_takes_a_timeout_from_the_caller() {
         let s = setup_with_limits(
             MockProvider::new(vec![reply(ANSWER)]),
             UnitLimits {
@@ -1176,8 +1191,8 @@ mod delegated {
         assert_eq!(views[0].timeout_secs, 600);
     }
 
-    #[tokio::test]
-    async fn a_failing_native_run_is_a_task_error() {
+    #[test]
+    fn a_failing_native_run_is_a_task_error() {
         // No scripted response: the provider assert fails the run, which the
         // task reports as an error rather than success.
         let s = setup(vec![]);
@@ -1185,8 +1200,8 @@ mod delegated {
         assert!(out.is_err(), "{out:?}");
     }
 
-    #[tokio::test]
-    async fn cancelling_the_task_stops_the_native_run() {
+    #[test]
+    fn cancelling_the_task_stops_the_native_run() {
         let (trigger, token) = maki_agent::cancel::CancelToken::new();
         let trigger = std::sync::Mutex::new(Some(trigger));
         let mut provider = MockProvider::new(vec![reply(ANSWER)]);
@@ -1211,8 +1226,8 @@ mod delegated {
     /// from being spawned. A cancelled run that keeps its slot makes every
     /// later task queue behind a dead run, and a cancelled run that stays
     /// live keeps the parent's child count up.
-    #[tokio::test]
-    async fn a_cancelled_task_leaves_the_next_task_free_to_spawn() {
+    #[test]
+    fn a_cancelled_task_leaves_the_next_task_free_to_spawn() {
         let (trigger, token) = maki_agent::cancel::CancelToken::new();
         let trigger = std::sync::Mutex::new(Some(trigger));
         let mut provider = MockProvider::new(vec![reply(ANSWER), reply(ANSWER)]);

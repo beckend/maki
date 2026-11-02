@@ -2563,6 +2563,9 @@ impl App {
             Sending::AuthRetry | Sending::Nothing => vec![],
             Sending::Exit => self.quit(),
             Sending::Shell(prefix) => self.run_shell_line(prefix),
+            // A native run's tab takes the text through the hub, so the run
+            // sees it: a finished run is revived by the message.
+            Sending::Message if self.run_tab_takes_input() => self.send_to_run_tab(sub),
             Sending::Message if self.is_main_chat() => self.submit_or_queue(sub.into()),
             Sending::Message => self.queue_for_subagent(sub.into()),
         }
@@ -3095,7 +3098,14 @@ impl App {
     ) -> usize {
         let id = &subagent.parent_tool_use_id;
         let known = match plugin {
-            None => self.chat_index.get(id.as_str()).copied(),
+            // The index is only a routing cache: it is wiped at the end of
+            // every turn, so a run that outlives its turn is found by the
+            // task it belongs to.
+            None => self
+                .chat_index
+                .get(id.as_str())
+                .copied()
+                .or_else(|| self.chat_of_task(id).ok()),
             Some(_) => self.chat_of_task(id).ok(),
         };
         if let Some(idx) = known {

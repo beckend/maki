@@ -46,6 +46,17 @@ local examples = {
   },
 }
 
+-- Standalone runs render markdown on the Rust side (format = "markdown").
+-- This mirrors it for restore, batch children and a row that had to wait.
+local function result_body(output, is_error, ctx)
+  local tol = ctx:tool_output_lines()
+  return ToolView.restore_markdown(output, is_error, {
+    max_lines = (tol and tol.task) or DEFAULT_OUTPUT_LINES,
+    keep = "head",
+    max_line_bytes = output_limits.DEFAULT_MAX_LINE_BYTES,
+  })
+end
+
 -- The native path: the hub runs the subagent, so the model sees one run and
 -- the transcript lives with it. `Runner` owns the session path; this only
 -- speaks the hub's language.

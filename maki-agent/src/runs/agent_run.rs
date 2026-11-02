@@ -156,6 +156,10 @@ impl Provider for Script {
                 }),
                 Step::Drop => Err(AgentError::Cancelled),
                 Step::Block(release) => {
+                    // A blocking wait, on purpose: the runner is stuck inside
+                    // the provider call, so a cancel cannot reach it. The
+                    // test that uses it runs on a multi-thread runtime, so
+                    // the blocked worker does not starve the rest.
                     let _ = release.recv();
                     Ok(reply("late"))
                 }
@@ -1788,7 +1792,12 @@ mod admit {
         let spawn_kid = tool_use(
             "t1",
             "spawn",
-            json!({"kind": "agent", "description": "kid", "name": "kid", "prompt": CHILD}),
+            json!({
+                "kind": "agent", "description": "kid", "name": "kid", "prompt": CHILD,
+                // The child's notice would start a new turn in the parent,
+                // and this script does not answer one.
+                "notify": "never",
+            }),
         );
         let wait_kid = tool_use("t2", "wait", json!({"ids": ["kid"]}));
         let script = Script::new(vec![
@@ -1804,11 +1813,16 @@ mod admit {
         ]);
         let rig = rig_with(&script, one_slot());
         let parent = spawn(&rig, PARENT, json!({})).await;
-        // With one slot the child can only run once the parent's wait gave it up.
+        // The model's wait does not wait for an agent, so the parent's turn
+        // ends and the queued child takes the slot it was holding.
         await_requests(&script, CHILD, 1).await;
         let view = settle(&rig, parent.id).await;
         assert_eq!(view.result.unwrap().summary, "parent done");
         assert_eq!(script.requests(PARENT), 3);
+        // The child ran to the end, so the pool is empty again.
+        let kids = rig.hub.list(parent.id, Scope::Children);
+        assert_eq!(kids.len(), 1);
+        settle(&rig, kids[0].id).await;
         rig.hub
             .stop(rig.hub.main(), &[parent.id], StopOpts::default());
         settle(&rig, parent.id).await;
@@ -3359,7 +3373,9 @@ mod chaos {
         assert_eq!(run.term.as_ref().unwrap().reason, "killed");
     }
 
-    #[tokio::test]
+    /// The runner blocks a worker thread inside the provider call, so the
+    /// test needs more than one of them.
+    #[tokio::test(flavor = "multi_thread")]
     async fn runner_ignoring_cancel_is_force_settled_once() {
         let (release, blocked) = std::sync::mpsc::channel::<()>();
         let script = Script::new(vec![(CHILD, vec![Step::Block(blocked)])]);

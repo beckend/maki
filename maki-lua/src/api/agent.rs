@@ -1819,6 +1819,9 @@ impl SessionCancellation {
             self.registry.remove(&self.ui_id);
         }
         self.end_mailbox();
+        // The session is over, so its addressable id stops resolving: a
+        // handle that is gone must not keep the id alive.
+        self.mailbox.end();
         if let Some(adoption) = &self.adoption {
             adoption.release();
         }

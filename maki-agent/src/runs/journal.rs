@@ -595,7 +595,7 @@ fn kill_orphan(_: u32, _: u64, _: Duration) {}
 mod tests {
     use std::process::{Child, Command};
 
-    use maki_storage::runs::JournalOptions;
+    use maki_storage::runs::{JournalError, JournalOptions};
 
     use super::*;
     use crate::runs::inbox::{DeliveryKind, MessageId};
@@ -611,14 +611,29 @@ mod tests {
                 ..ShellOptions::default()
             },
         );
-        let journal = RunJournal::open_in(dir.to_owned(), JournalOptions::default()).unwrap();
+        let journal = open_journal(dir);
         hub.attach_journal(Arc::new(journal));
         hub
     }
 
+    /// A lock that a child process inherited is held until that child execs,
+    /// so opening the journal waits a moment for it rather than failing.
+    fn open_journal(dir: &std::path::Path) -> RunJournal {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match RunJournal::open_in(dir.to_owned(), JournalOptions::default()) {
+                Ok(journal) => return journal,
+                Err(JournalError::Locked) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(e) => panic!("the journal could not be opened: {e}"),
+            }
+        }
+    }
+
     /// What a dead process left: spawn records with no `term`.
     fn crashed_journal(dir: &std::path::Path, records: Vec<JournalRecord>) {
-        let journal = RunJournal::open_in(dir.to_owned(), JournalOptions::default()).unwrap();
+        let journal = open_journal(dir);
         for rec in records {
             journal.append(rec);
         }

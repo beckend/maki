@@ -8784,8 +8784,10 @@ maki.api.register_tool({
 })
 "#;
 
-#[tokio::test]
-async fn ctx_promote_hands_a_timed_out_job_to_the_run_hub() {
+/// The tool call and the wait both run on the host's runtime, so the test
+/// drives them from outside a runtime of its own.
+#[test]
+fn ctx_promote_hands_a_timed_out_job_to_the_run_hub() {
     use maki_agent::runs::{RunsCtx, Scope, UnitLimits, UnitState, WaitMode};
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
@@ -8814,15 +8816,13 @@ async fn ctx_promote_hands_a_timed_out_job_to_the_run_hub() {
     let runs = hub.list(hub.main(), Scope::All);
     assert_eq!(runs.len(), 1);
     let id = runs[0].id;
-    let views = hub
-        .wait(
-            hub.main(),
-            &[id],
-            WaitMode::All,
-            Duration::from_secs(30),
-            &maki_agent::cancel::CancelToken::none(),
-        )
-        .await;
+    let views = runtime().block_on(hub.wait(
+        hub.main(),
+        &[id],
+        WaitMode::All,
+        Duration::from_secs(30),
+        &maki_agent::cancel::CancelToken::none(),
+    ));
     assert!(
         matches!(views[0].state, UnitState::Done(_)),
         "{:?}",

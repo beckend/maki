@@ -701,7 +701,7 @@ fn forward_job_events(
     let _ = std::thread::Builder::new()
         .name("job-adopt".into())
         .spawn(move || {
-            while let Some(event) = source.try_recv() {
+            while let Some(event) = source.recv() {
                 let (out, done) = match event {
                     JobEvent::Stdout(line) | JobEvent::Stderr(line) => {
                         let mut bytes = line.text.into_bytes();

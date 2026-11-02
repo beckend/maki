@@ -247,6 +247,10 @@ mod tests {
     const THINKING: &str = "high";
     const UI_FAILURE: &str = "Model is not allowed by policy: anthropic/claude-opus-4-6";
 
+    /// The tier assignments live in a process-global registry, so the tests
+    /// that write one and the tests that read a tier must not overlap.
+    static TIER_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     /// Assignments live in a process-global registry, so a test that needs one
     /// writes it and hands back the pair used to clear it afterwards. `unset`
     /// only removes a matching spec, hence the spec is returned with the dir.
@@ -376,6 +380,7 @@ mod tests {
     /// plugin can hand the spec straight to `set`.
     #[tokio::test]
     async fn tier_returns_the_assigned_model() {
+        let _guard = TIER_LOCK.lock().await;
         let (lua, tier, spec) = assign_tier(SPEC, ModelTier::Strong);
         let (val, err) = eval(&lua, "return model.tier('strong')").await;
         clear_tier(tier, spec);
@@ -389,6 +394,7 @@ mod tests {
     /// get, flagged so a plugin can tell it from a real pick.
     #[tokio::test]
     async fn tier_without_an_assignment_falls_back_to_the_default() {
+        let _guard = TIER_LOCK.lock().await;
         let (val, err) = eval(
             &lua_with_model(None),
             "return model.tier('weak', 'anthropic')",
@@ -402,6 +408,7 @@ mod tests {
 
     #[tokio::test]
     async fn tier_with_nothing_to_resolve_answers_nil() {
+        let _guard = TIER_LOCK.lock().await;
         let (val, err) = eval(&lua_with_model(None), "return model.tier('compaction')").await;
         assert_eq!((val, err), (Json::Null, None));
     }
@@ -419,6 +426,7 @@ mod tests {
     /// silent `nil`: the user did pick something, it just no longer resolves.
     #[tokio::test]
     async fn tier_with_a_stale_assignment_returns_an_error_pair() {
+        let _guard = TIER_LOCK.lock().await;
         let (lua, tier, spec) = assign_tier("no-such-provider/nope", ModelTier::Weak);
         let (val, err) = eval(&lua, "return model.tier('weak')").await;
         clear_tier(tier, spec);

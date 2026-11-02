@@ -3415,7 +3415,7 @@ mod tests {
                 runs.spawn_per_minute,
                 runs.default_timeout_secs
             ),
-            (4, 8, 4, 16, 10, 1800)
+            (4, 8, 4, 16, 10, 86_400)
         );
     }
 

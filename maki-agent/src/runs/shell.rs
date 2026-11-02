@@ -934,6 +934,8 @@ async fn pump(
         }
         let keep = n.min((cap - logged) as usize);
         let mut data = data;
+        // Only what fits under the cap goes into the log.
+        data.truncate(keep);
         if keep < n {
             data.extend_from_slice(
                 format!("\n[log limit of {cap} bytes reached; further output discarded]\n")

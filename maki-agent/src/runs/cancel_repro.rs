@@ -366,7 +366,8 @@ async fn the_freed_slot_goes_to_the_live_run_not_the_dead_one() {
     let script = Script::new(vec![
         ("FIRST-TASK", vec![Step::Hang]),
         ("SECOND-TASK", vec![Step::Hang]),
-        ("THIRD-TASK", vec![Step::Reply(reply("three"))]),
+        // The live run keeps working, so it keeps the slot it is given.
+        ("THIRD-TASK", vec![Step::Hang]),
     ]);
     let rig = rig_with(&script, one_agent());
     let main = rig.hub.main();
@@ -655,15 +656,21 @@ async fn a_cancelled_wait_by_a_slot_holding_parent_keeps_the_pool_sane() {
     let kids = rig.hub.list(parent.id, Scope::Children);
     assert_eq!(kids.len(), 1);
     let kid = kids[0].id;
-    // The parent is waiting for the child: it gave its slot up.
+    // The parent is waiting for the child: it gave its slot up and waits
+    // for the slot to come back.
     let deadline = Instant::now() + Duration::from_secs(10);
-    while rig.hub.slots_in_use() != 1 {
+    while !rig.hub.table().pool.blocked_runs().contains(&parent.id) {
         assert!(
             Instant::now() < deadline,
             "the parent never gave its slot up"
         );
         tokio::time::sleep(Duration::from_millis(2)).await;
     }
+    assert_eq!(
+        rig.hub.slots_in_use(),
+        0,
+        "the waiting parent holds no slot"
+    );
     check_pool(&rig, "while the parent waits");
 
     // The parent's turn is cancelled: the wait returns with the cancel.

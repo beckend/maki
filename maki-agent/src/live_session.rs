@@ -344,6 +344,21 @@ impl SessionMailbox {
         Ok(Self { session_id, live })
     }
 
+    /// The id stops resolving: nothing may address this session any more.
+    /// The registry keeps a weak link, so the id only goes away with the
+    /// last handle; a session that ends while a clone of its mailbox is
+    /// still around says so here.
+    pub fn end(&self) {
+        let weak = Arc::downgrade(&self.live);
+        let mut sessions = lock(&LIVE_SESSIONS);
+        if sessions
+            .get(&self.session_id)
+            .is_some_and(|registered| registered.ptr_eq(&weak))
+        {
+            sessions.remove(&self.session_id);
+        }
+    }
+
     pub fn session_id(&self) -> MakiId {
         self.session_id
     }

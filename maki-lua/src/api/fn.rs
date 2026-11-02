@@ -907,6 +907,14 @@ impl JobEvents {
         Some(event)
     }
 
+    /// The next event, blocking until one arrives or the job is gone. For the
+    /// threads that read a job's events outside the runtime.
+    pub(crate) fn recv(&self) -> Option<JobEvent> {
+        let event = self.rx.recv().ok()?;
+        self.queue.popped(&event);
+        Some(event)
+    }
+
     async fn recv_async(&self) -> Option<JobEvent> {
         let event = self.rx.recv_async().await.ok()?;
         self.queue.popped(&event);

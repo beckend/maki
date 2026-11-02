@@ -654,6 +654,7 @@ mod tests {
     /// nothing is left to start a second turn once the run drained it.
     #[test]
     fn run_notice_wakes_idle_main() {
+        let _runtime = enter_runtime();
         let model_slot = Arc::new(ArcSwap::from_pointee(ModelSlot {
             model: crate::components::test_model(),
             provider: Arc::new(StubProvider),
