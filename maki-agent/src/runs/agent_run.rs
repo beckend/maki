@@ -840,6 +840,7 @@ mod inbox {
         );
         release.send(()).unwrap();
         settle(&rig, ack.id).await;
+        eprintln!("MARK settled");
         let messages = script.messages_of(CHILD, 1);
         let at = messages
             .iter()
@@ -2601,6 +2602,200 @@ mod revive {
             "history restored: {second}"
         );
         assert!(second.contains("follow up please"), "message delivered");
+    }
+
+    /// A remembered run reaches its parent: the session took it back, and the
+    /// parent is the agent that started it.
+    #[tokio::test]
+    async fn a_remembered_run_can_send_to_its_parent() {
+        let script = Script::new(vec![(CHILD, vec![Step::Reply(reply("the answer"))])]);
+        let (rig, _dir) = journaled(&script, UnitLimits::default());
+        let spec = AgentSpec {
+            prompt: String::new(),
+            subagent_type: "general".into(),
+            model_tier: None,
+            thinking: None,
+            output_schema: None,
+            fork: false,
+            one_shot: true,
+            timeout_secs: 600,
+        };
+        let history = vec![text_message(
+            Role::User,
+            &format!("{CHILD} the first question"),
+        )];
+        let id = rig
+            .hub
+            .remember_run("ag-lost01", "lost", spec, rig.hub.main(), history)
+            .unwrap();
+        let plan = rig
+            .hub
+            .revive_plan(rig.hub.main(), id)
+            .unwrap()
+            .expect("a remembered run is revivable");
+        let transcript = rig.hub.load_transcript(plan.handle.as_str()).unwrap();
+        let launch = AgentLaunch::prepare(&rig.ctx, &plan.spec).await.unwrap();
+        rig.hub
+            .revive(
+                rig.hub.main(),
+                plan,
+                launch,
+                transcript,
+                "go on".to_owned(),
+                DeliveryKind::Steer,
+            )
+            .unwrap();
+        // The parent is the agent that started it, and the run reaches it.
+        let to = rig.hub.resolve(id, "parent").unwrap();
+        assert_eq!(to, rig.hub.main());
+        let ack = rig
+            .hub
+            .send(id, to, "the result".to_owned(), DeliveryKind::Steer)
+            .unwrap();
+        assert!(!ack.held);
+    }
+
+    /// A remembered run that is revived twice still reaches its parent: the
+    /// second revive must not leave the run behind.
+    #[tokio::test]
+    async fn a_remembered_run_revived_twice_can_send_to_its_parent() {
+        let script = Script::new(vec![(
+            CHILD,
+            vec![
+                Step::Reply(reply("first answer")),
+                Step::Reply(reply("second answer")),
+            ],
+        )]);
+        let (rig, _dir) = journaled(&script, UnitLimits::default());
+        let spec = AgentSpec {
+            prompt: String::new(),
+            subagent_type: "general".into(),
+            model_tier: None,
+            thinking: None,
+            output_schema: None,
+            fork: false,
+            one_shot: true,
+            timeout_secs: 600,
+        };
+        let history = vec![text_message(
+            Role::User,
+            &format!("{CHILD} the first question"),
+        )];
+        let id = rig
+            .hub
+            .remember_run("ag-lost01", "lost", spec, rig.hub.main(), history)
+            .unwrap();
+        for round in 0..2 {
+            let plan = rig
+                .hub
+                .revive_plan(rig.hub.main(), id)
+                .unwrap()
+                .expect("a remembered run is revivable");
+            let transcript = rig.hub.load_transcript(plan.handle.as_str()).unwrap();
+            let launch = AgentLaunch::prepare(&rig.ctx, &plan.spec).await.unwrap();
+            rig.hub
+                .revive(
+                    rig.hub.main(),
+                    plan,
+                    launch,
+                    transcript,
+                    format!("round {round}"),
+                    DeliveryKind::Steer,
+                )
+                .unwrap();
+            // The run works and reports to its parent.
+            let to = rig.hub.resolve(id, "parent").unwrap();
+            assert_eq!(to, rig.hub.main());
+            rig.hub
+                .send(id, to, format!("the result {round}"), DeliveryKind::Steer)
+                .unwrap();
+            let view = settle(&rig, id).await;
+            assert_eq!(done_reason(&view), DoneReason::Completed);
+        }
+    }
+
+    /// A remembered run reports to its parent with the `send` tool: the tool
+    /// sends as the run, not as the user who resumed it.
+    #[tokio::test]
+    async fn a_remembered_run_sends_its_result_to_its_parent() {
+        let script = Script::new(vec![(
+            CHILD,
+            vec![
+                Step::Reply(tool_use(
+                    "call_1",
+                    "send",
+                    json!({"to": "parent", "message": "the result"}),
+                )),
+                Step::Reply(reply("sent")),
+            ],
+        )]);
+        let (rig, _dir) = journaled(&script, UnitLimits::default());
+        let spec = AgentSpec {
+            prompt: String::new(),
+            subagent_type: "general".into(),
+            model_tier: None,
+            thinking: None,
+            output_schema: None,
+            fork: false,
+            one_shot: true,
+            timeout_secs: 600,
+        };
+        let history = vec![text_message(
+            Role::User,
+            &format!("{CHILD} the first question"),
+        )];
+        let id = rig
+            .hub
+            .remember_run("ag-lost01", "lost", spec, rig.hub.main(), history)
+            .unwrap();
+        let plan = rig
+            .hub
+            .revive_plan(rig.hub.main(), id)
+            .unwrap()
+            .expect("a remembered run is revivable");
+        let transcript = rig.hub.load_transcript(plan.handle.as_str()).unwrap();
+        let launch = AgentLaunch::prepare(&rig.ctx, &plan.spec).await.unwrap();
+        rig.hub
+            .revive(
+                rig.hub.main(),
+                plan,
+                launch,
+                transcript,
+                "go on".to_owned(),
+                DeliveryKind::Steer,
+            )
+            .unwrap();
+        let view = settle(&rig, id).await;
+        assert_eq!(done_reason(&view), DoneReason::Completed);
+        assert!(
+            rig.hub
+                .inbox_of(rig.hub.main())
+                .is_some_and(|inbox| inbox.len() >= 1),
+            "the result reached the parent"
+        );
+    }
+
+    /// A run that was revived while the force-settle timer of its stop was
+    /// still waiting is not ended by that timer: the timer watches the run it
+    /// started for, and the revived run is a different one.
+    #[tokio::test]
+    async fn a_revived_run_is_not_force_settled_by_the_old_timer() {
+        let script = Script::new(vec![(CHILD, vec![Step::Reply(reply("the answer"))])]);
+        let (rig, _dir) = journaled(&script, UnitLimits::default());
+        let ack = spawn(&rig, CHILD, json!({"one_shot": true})).await;
+        settle(&rig, ack.id).await;
+        // The run a stop of this run would watch.
+        let watched = rig.hub.table().agents.get(&ack.id).cloned().unwrap();
+        // The run is revived: a new one takes its place, and it works.
+        revive(&rig, ack.id, "go on").await.unwrap();
+        assert_eq!(rig.hub.get(ack.id).unwrap().state.label(), "running");
+        // The old timer fires and must leave the revived run alone.
+        rig.hub.force_settle_run(ack.id, &watched);
+        assert_eq!(
+            rig.hub.get(ack.id).unwrap().state.label(),
+            "running",
+            "the force settle of the stopped run ended the revived one"
+        );
     }
 
     /// The user typing in a run's tab is the UI's path into the hub: the

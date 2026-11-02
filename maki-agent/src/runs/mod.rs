@@ -1535,7 +1535,7 @@ impl UnitHub {
         for (id, run) in plan.cancel {
             let left = run.cancel_run();
             self.messages_dropped(&left, "recipient_stopped");
-            self.watch_for_force_settle(id);
+            self.watch_for_force_settle(id, run);
         }
         outcomes
     }
@@ -1631,8 +1631,10 @@ impl UnitHub {
 
     /// A run that ignores its cancel is settled `killed` after a deadline and
     /// its driver dropped, so a stuck runner cannot hold up a stop or the
-    /// shutdown.
-    fn watch_for_force_settle(self: &Arc<Self>, id: UnitId) {
+    /// shutdown. The timer watches the run it was started for: a run that was
+    /// revived in the meantime is a different one, and a force settle must
+    /// not end it.
+    fn watch_for_force_settle(self: &Arc<Self>, id: UnitId, run: Arc<AgentRun>) {
         let hub = Arc::downgrade(self);
         let clock = Arc::clone(&self.clock);
         // A dedicated thread, not the shared smol executor: a runner that
@@ -1647,7 +1649,7 @@ impl UnitHub {
                     .expect("the runtime starts")
                     .block_on(clock.sleep_until(clock.now() + agent::FORCE_SETTLE_AFTER));
                 if let Some(hub) = hub.upgrade() {
-                    hub.force_settle(id);
+                    hub.force_settle_run(id, &run);
                 }
             });
         if let Err(e) = spawned {
@@ -1671,6 +1673,32 @@ impl UnitHub {
         if let Some(run) = run {
             run.abort();
         }
+    }
+
+    /// The force settle of the run a timer watches. The run that took the
+    /// place of the watched one is not the watched one: it belongs to whoever
+    /// revived it, and it ends on its own.
+    fn force_settle_run(&self, id: UnitId, watched: &Arc<AgentRun>) {
+        let mut table = self.table();
+        let Some(run) = table
+            .agents
+            .get(&id)
+            .cloned()
+            .filter(|run| Arc::ptr_eq(run, watched))
+        else {
+            return;
+        };
+        let terminal = Terminal {
+            reason: DoneReason::Killed,
+            exit_code: None,
+            detail: Some("forced".to_owned()),
+            result: UnitResult::default(),
+        };
+        self.settle_locked(&mut table, id, terminal, 0);
+        self.release(table);
+        self.flush_notices();
+        self.settled.notify(usize::MAX);
+        run.abort();
     }
 
     /// Returns the current view of `ids` once they are settled (`Done` or
