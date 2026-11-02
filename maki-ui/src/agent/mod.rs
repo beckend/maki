@@ -179,7 +179,7 @@ impl AgentHandles {
         tokio::spawn(async move {
             if let Err(e) = deliver_to_run(&runs, seed.as_deref(), &handle, text).await {
                 events.try_send(AgentEvent::Notice {
-                    text: format!("could not message {handle}: {e}"),
+                    text: format!("could not message {handle}: {}", why(&e)),
                 });
             }
         });
@@ -369,6 +369,20 @@ fn spawn_agent_internal(
         model_policy,
         mailbox,
         task,
+    }
+}
+
+/// What a refusal to revive a run says, in words a user can act on. The
+/// hub's codes name the reason; the tab needs the reason spelled out.
+fn why(error: &str) -> String {
+    match error {
+        "RECIPIENT_TERMINAL" => {
+            "its history was not kept, so there is nothing to continue from".to_owned()
+        }
+        "UNKNOWN_RUN" => "it is not one of this session's runs any more".to_owned(),
+        "NOT_REACHABLE" => "it cannot be reached from here".to_owned(),
+        "NOT_AGENT" => "it is a command, not an agent".to_owned(),
+        other => other.to_owned(),
     }
 }
 
