@@ -961,7 +961,9 @@ mod tests {
 
     #[test_case(ToolAudience::MAIN, &["send", "runs", "spawn", "stop", "wait"] ; "main")]
     #[test_case(ToolAudience::GENERAL_SUB, &["send", "runs", "spawn", "stop", "wait"] ; "general_sub")]
-    #[test_case(ToolAudience::RESEARCH_SUB, &["send", "runs", "wait"] ; "research_sub")]
+    // A research child may spawn its own children and stop what it started:
+    // the delegation surface is the same for every audience that has one.
+    #[test_case(ToolAudience::RESEARCH_SUB, &["send", "runs", "spawn", "stop", "wait"] ; "research_sub")]
     #[test_case(ToolAudience::INTERPRETER, &[] ; "interpreter")]
     fn native_run_tools_per_audience(audience: ToolAudience, expected: &[&str]) {
         let mut names: Vec<String> = crate::runs::native_run_tools(audience)
