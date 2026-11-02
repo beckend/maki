@@ -19,7 +19,7 @@ use crate::cancel::CancelToken;
 
 /// The hub's own timeout never fires on the manual clock, so a run that
 /// never settles would hang the test. This waits with a wall-clock bound.
-fn settle_bounded(rig: &Rig, id: UnitId, within: Duration) -> UnitView {
+async fn settle_bounded(rig: &Rig, id: UnitId, within: Duration) -> UnitView {
     let deadline = Instant::now() + within;
     loop {
         let view = rig.hub.get(id).unwrap();
@@ -32,7 +32,7 @@ fn settle_bounded(rig: &Rig, id: UnitId, within: Duration) -> UnitView {
             view.handle,
             view.state.label()
         );
-        std::thread::sleep(Duration::from_millis(2));
+        tokio::time::sleep(Duration::from_millis(2)).await;
     }
 }
 
@@ -69,7 +69,7 @@ async fn stop_a_running_agent_then_spawn_another() {
 
     let outcomes = rig.hub.stop(main, &[first.id], StopOpts::default());
     assert_eq!(outcomes[0].status, Ok(StopStatus::Requested));
-    let view = settle_bounded(&rig, first.id, Duration::from_secs(10));
+    let view = settle_bounded(&rig, first.id, Duration::from_secs(10)).await;
     assert_eq!(done_reason(&view), DoneReason::Killed);
     assert_eq!(
         rig.hub.slots_in_use(),
@@ -83,7 +83,7 @@ async fn stop_a_running_agent_then_spawn_another() {
         "the new run must not queue behind a dead one"
     );
     await_requests(&script, "SECOND-TASK", 1).await;
-    let view = settle_bounded(&rig, second.id, Duration::from_secs(10));
+    let view = settle_bounded(&rig, second.id, Duration::from_secs(10)).await;
     assert!(
         matches!(view.state, UnitState::Done(_) | UnitState::Idle),
         "the new run must settle, got {}",
@@ -134,9 +134,9 @@ async fn stop_a_queued_agent_then_spawn_another() {
 
     // Freeing the slot must hand it to the live queued run.
     rig.hub.stop(main, &[first.id], StopOpts::default());
-    settle_bounded(&rig, first.id, Duration::from_secs(10));
+    settle_bounded(&rig, first.id, Duration::from_secs(10)).await;
     await_requests(&script, "THIRD-TASK", 1).await;
-    let view = settle_bounded(&rig, third.id, Duration::from_secs(10));
+    let view = settle_bounded(&rig, third.id, Duration::from_secs(10)).await;
     assert!(
         matches!(view.state, UnitState::Done(_) | UnitState::Idle),
         "the queued run must run once a slot frees, got {}",
@@ -185,7 +185,7 @@ async fn cancel_the_wait_then_stop_then_spawn_another() {
     .await;
     assert_eq!(settled.len(), 1);
 
-    let view = settle_bounded(&rig, first.id, Duration::from_secs(10));
+    let view = settle_bounded(&rig, first.id, Duration::from_secs(10)).await;
     assert_eq!(done_reason(&view), DoneReason::Killed);
     assert_eq!(rig.hub.slots_in_use(), 0, "the slot came back");
 
@@ -195,7 +195,7 @@ async fn cancel_the_wait_then_stop_then_spawn_another() {
         "the new run must not queue behind the cancelled one"
     );
     await_requests(&script, "SECOND-TASK", 1).await;
-    let view = settle_bounded(&rig, second.id, Duration::from_secs(10));
+    let view = settle_bounded(&rig, second.id, Duration::from_secs(10)).await;
     assert!(
         matches!(view.state, UnitState::Done(_) | UnitState::Idle),
         "the new run must settle, got {}",
@@ -239,7 +239,7 @@ async fn five_cancels_in_a_row_keep_the_capacity() {
         ))
         .await;
         rig.hub.stop(main, &[first.id], StopOpts::default());
-        let view = settle_bounded(&rig, first.id, Duration::from_secs(10));
+        let view = settle_bounded(&rig, first.id, Duration::from_secs(10)).await;
         assert_eq!(done_reason(&view), DoneReason::Killed, "round {round}");
         assert_eq!(
             rig.hub.slots_in_use(),
@@ -254,7 +254,7 @@ async fn five_cancels_in_a_row_keep_the_capacity() {
             "round {round}: the new run must not queue"
         );
         await_requests(&script, routes[round + 1], 1).await;
-        let view = settle_bounded(&rig, next.id, Duration::from_secs(10));
+        let view = settle_bounded(&rig, next.id, Duration::from_secs(10)).await;
         assert!(
             matches!(view.state, UnitState::Done(_) | UnitState::Idle),
             "round {round}: the new run must settle, got {}",
@@ -300,7 +300,7 @@ async fn five_cancels_with_one_slot_keep_the_pool_free() {
         ))
         .await;
         rig.hub.stop(main, &[first.id], StopOpts::default());
-        let view = settle_bounded(&rig, first.id, Duration::from_secs(10));
+        let view = settle_bounded(&rig, first.id, Duration::from_secs(10)).await;
         assert_eq!(done_reason(&view), DoneReason::Killed, "round {round}");
         assert_eq!(
             rig.hub.slots_in_use(),
@@ -318,7 +318,7 @@ async fn five_cancels_with_one_slot_keep_the_pool_free() {
             "round {round}: the new run must not queue"
         );
         await_requests(&script, routes[round + 1], 1).await;
-        let view = settle_bounded(&rig, next.id, Duration::from_secs(10));
+        let view = settle_bounded(&rig, next.id, Duration::from_secs(10)).await;
         assert!(
             matches!(view.state, UnitState::Done(_) | UnitState::Idle),
             "round {round}: the new run must settle, got {}",
@@ -349,7 +349,7 @@ async fn a_cancelled_run_is_not_a_live_child() {
     ))
     .await;
     rig.hub.stop(main, &[first.id], StopOpts::default());
-    let view = settle_bounded(&rig, first.id, Duration::from_secs(10));
+    let view = settle_bounded(&rig, first.id, Duration::from_secs(10)).await;
     assert_eq!(done_reason(&view), DoneReason::Killed);
     let live = rig
         .hub
@@ -378,7 +378,7 @@ async fn the_freed_slot_goes_to_the_live_run_not_the_dead_one() {
 
     // Kill the queued one: it must leave the queue for good.
     rig.hub.stop(main, &[second.id], StopOpts::default());
-    let view = settle_bounded(&rig, second.id, Duration::from_secs(10));
+    let view = settle_bounded(&rig, second.id, Duration::from_secs(10)).await;
     assert_eq!(done_reason(&view), DoneReason::Killed);
     assert!(
         rig.hub.get(second.id).unwrap().queue.is_none(),
@@ -389,7 +389,7 @@ async fn the_freed_slot_goes_to_the_live_run_not_the_dead_one() {
     assert!(matches!(third.state, UnitState::Queued));
     // Kill the running one: the slot must go to the live queued run.
     rig.hub.stop(main, &[first.id], StopOpts::default());
-    settle_bounded(&rig, first.id, Duration::from_secs(10));
+    settle_bounded(&rig, first.id, Duration::from_secs(10)).await;
     await_requests(&script, "THIRD-TASK", 1).await;
     assert!(
         rig.hub.table().pool.holds(third.id),
@@ -459,7 +459,7 @@ async fn the_plugin_path_after_a_cancel_still_spawns() {
     ))
     .await;
     eprintln!("stop said: {stopped:?}");
-    let view = settle_bounded(&rig, first_id, Duration::from_secs(10));
+    let view = settle_bounded(&rig, first_id, Duration::from_secs(10)).await;
     assert_eq!(done_reason(&view), DoneReason::Killed);
     assert_eq!(rig.hub.slots_in_use(), 0, "the slot came back");
 
@@ -488,7 +488,7 @@ async fn the_plugin_path_after_a_cancel_still_spawns() {
         .hub
         .resolve(rig.hub.main(), &second.handle)
         .expect("the handle resolves");
-    let view = settle_bounded(&rig, second_id, Duration::from_secs(10));
+    let view = settle_bounded(&rig, second_id, Duration::from_secs(10)).await;
     assert!(
         matches!(view.state, UnitState::Done(_) | UnitState::Idle),
         "the new run must settle, got {}",
@@ -567,7 +567,7 @@ async fn a_cancel_leaves_no_pool_ghost() {
     ))
     .await;
     rig.hub.stop(main, &[first.id], StopOpts::default());
-    let view = settle_bounded(&rig, first.id, Duration::from_secs(10));
+    let view = settle_bounded(&rig, first.id, Duration::from_secs(10)).await;
     assert_eq!(done_reason(&view), DoneReason::Killed);
     check_pool(&rig, "after the cancel");
     assert_eq!(rig.hub.slots_in_use(), 0);
@@ -607,9 +607,9 @@ async fn a_cancelled_parent_cascade_frees_every_slot() {
     assert_eq!(rig.hub.slots_in_use(), 2, "parent and child hold a slot");
 
     rig.hub.stop(main, &[parent.id], StopOpts::default());
-    let view = settle_bounded(&rig, parent.id, Duration::from_secs(10));
+    let view = settle_bounded(&rig, parent.id, Duration::from_secs(10)).await;
     assert_eq!(done_reason(&view), DoneReason::Killed);
-    let view = settle_bounded(&rig, kid, Duration::from_secs(10));
+    let view = settle_bounded(&rig, kid, Duration::from_secs(10)).await;
     assert_eq!(done_reason(&view), DoneReason::Killed);
     assert_eq!(rig.hub.slots_in_use(), 0, "every slot came back");
     check_pool(&rig, "after the cascade");
@@ -619,7 +619,7 @@ async fn a_cancelled_parent_cascade_frees_every_slot() {
     let rig2 = rig_with(&script2, UnitLimits::default());
     let next = spawn(&rig2, "NEXT-TASK", json!({})).await;
     await_requests(&script2, "NEXT-TASK", 1).await;
-    let view = settle_bounded(&rig2, next.id, Duration::from_secs(10));
+    let view = settle_bounded(&rig2, next.id, Duration::from_secs(10)).await;
     assert!(
         matches!(view.state, UnitState::Done(_) | UnitState::Idle),
         "the new run must settle, got {}",
@@ -668,9 +668,9 @@ async fn a_cancelled_wait_by_a_slot_holding_parent_keeps_the_pool_sane() {
 
     // The parent's turn is cancelled: the wait returns with the cancel.
     rig.hub.stop(main, &[parent.id], StopOpts::default());
-    let view = settle_bounded(&rig, parent.id, Duration::from_secs(10));
+    let view = settle_bounded(&rig, parent.id, Duration::from_secs(10)).await;
     assert_eq!(done_reason(&view), DoneReason::Killed);
-    let view = settle_bounded(&rig, kid, Duration::from_secs(10));
+    let view = settle_bounded(&rig, kid, Duration::from_secs(10)).await;
     assert_eq!(done_reason(&view), DoneReason::Killed);
     assert_eq!(rig.hub.slots_in_use(), 0, "every slot came back");
     check_pool(&rig, "after the cancelled wait");
@@ -709,7 +709,7 @@ async fn eight_cancels_do_not_use_up_the_child_budget() {
             .wait(main, &[id], WaitMode::All, Duration::from_secs(600), &token))
         .await;
         rig.hub.stop(main, &[id], StopOpts::default());
-        let view = settle_bounded(&rig, id, Duration::from_secs(10));
+        let view = settle_bounded(&rig, id, Duration::from_secs(10)).await;
         assert_eq!(done_reason(&view), DoneReason::Killed, "round {n}");
     }
     let live = rig

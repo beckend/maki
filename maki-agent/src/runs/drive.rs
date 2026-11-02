@@ -268,12 +268,6 @@ mod headless {
 
     /// An agent whose notice is quiet: it does not wake `main`, so the join
     /// has to deliver it with a closing turn.
-    fn quiet_agent(rig: &Rig) -> UnitId {
-        let mut req = tests::request(RunKind::Agent, "work");
-        req.notify = Some(NoticePolicy::Quiet);
-        rig.hub.spawn(rig.hub.main(), req).unwrap().id
-    }
-
     fn finish(rig: &Rig, id: UnitId) {
         let terminal = Terminal {
             reason: DoneReason::Completed,

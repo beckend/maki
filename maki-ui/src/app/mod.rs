@@ -1221,6 +1221,15 @@ impl App {
         if matches!(sending, Sending::Nothing) {
             return Err(NOTHING_TO_SEND_ERR.to_string());
         }
+        // A native run.s tab takes the text through the hub, so the run sees it.
+        if self.run_tab_takes_input() && matches!(sending, Sending::Message) {
+            let text = sent_text(self.input_box.buffer.value()).to_owned();
+            let sub = Submission {
+                text,
+                images: Vec::new(),
+            };
+            return Ok(self.send_to_run_tab(sub));
+        }
         self.send_input(sending, sight, caller)
     }
 

@@ -3140,7 +3140,7 @@ mod chaos {
                         revived.insert(id);
                     }
                 }
-                _ => std::thread::yield_now(),
+                _ => tokio::task::yield_now().await,
             }
             assert!(
                 rig.hub.slots_in_use() <= usize::from(MAX_AGENTS),
@@ -3294,16 +3294,16 @@ mod chaos {
             script.watch(name, &rig.hub, ack.id);
             ids.push(ack.id);
         }
-        let started = |n: usize| {
+        let started = async |n: usize| {
             for _ in 0..50_000_000u64 {
                 if script.order().len() >= n {
                     return;
                 }
-                std::thread::yield_now();
+                tokio::task::yield_now().await;
             }
             panic!("only {} of {n} agents started", script.order().len());
         };
-        started(SLOTS);
+        started(SLOTS).await;
         // Give any wrongly admitted fifth agent a chance to show up.
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(script.order().len(), SLOTS, "queued agents ran early");
@@ -3314,7 +3314,7 @@ mod chaos {
         for step in 0..N - SLOTS {
             let route = script.order()[step].clone();
             gates[index_of(&route)].send(()).unwrap();
-            started(SLOTS + step + 1);
+            started(SLOTS + step + 1).await;
             assert!(rig.hub.slots_in_use() <= SLOTS);
         }
         for gate in &gates {

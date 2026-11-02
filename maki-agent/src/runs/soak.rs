@@ -47,11 +47,11 @@ fn shell(command: &str) -> SpawnRequest {
     .unwrap()
 }
 
-fn until(what: &str, mut f: impl FnMut() -> bool) {
+async fn until(what: &str, mut f: impl FnMut() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(60);
     while !f() {
         assert!(Instant::now() < deadline, "timed out waiting for {what}");
-        std::thread::sleep(Duration::from_millis(10));
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
 
@@ -86,7 +86,7 @@ async fn many_spawns_and_stops_leak_nothing_and_stay_bounded() {
                     // At the shell cap: stop what is running and retry.
                     let ids: Vec<_> = live(&hub).iter().map(|u| u.id).collect();
                     hub.stop(hub.main(), &ids, StopOpts::default());
-                    std::thread::sleep(Duration::from_millis(5));
+                    tokio::time::sleep(Duration::from_millis(5)).await;
                 }
             }
         };
@@ -101,13 +101,14 @@ async fn many_spawns_and_stops_leak_nothing_and_stay_bounded() {
     assert_eq!(spawned, SPAWNS);
     let ids: Vec<_> = live(&hub).iter().map(|u| u.id).collect();
     hub.stop(hub.main(), &ids, StopOpts::default());
-    until("every run settled", || live(&hub).is_empty());
+    until("every run settled", || live(&hub).is_empty()).await;
 
     let groups = pgids(&journal);
     assert!(groups.len() >= SPAWNS / 2, "{} proc records", groups.len());
     until("no process group left", || {
         groups.iter().all(|&g| !shell::group_exists(g))
-    });
+    })
+    .await;
     assert!(hub.table().pending_notices.is_empty());
     assert_eq!(hub.notices_in_flight.load(Ordering::SeqCst), 0);
     let shown = hub.list(hub.main(), Scope::All).len();
@@ -142,11 +143,13 @@ async fn dropping_the_hub_leaves_no_live_process_group() {
     }
     until("every proc record", || {
         pgids(&journal).len() == MAX_SHELLS as usize
-    });
+    })
+    .await;
     let groups = pgids(&journal);
     assert!(groups.iter().all(|&g| shell::group_exists(g)));
     drop(hub);
     until("no process group left", || {
         groups.iter().all(|&g| !shell::group_exists(g))
-    });
+    })
+    .await;
 }
