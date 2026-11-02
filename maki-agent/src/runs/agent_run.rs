@@ -2544,6 +2544,52 @@ mod revive {
         assert!(second.contains("follow up please"), "message delivered");
     }
 
+    /// The user typing in a run's tab is the UI's path into the hub: the
+    /// revive is asked for the user, not for a run.
+    #[tokio::test]
+    async fn the_user_can_revive_a_finished_agent() {
+        let script = Script::new(vec![(
+            CHILD,
+            vec![
+                Step::Reply(reply("first answer")),
+                Step::Reply(reply("second answer")),
+            ],
+        )]);
+        let (rig, _dir) = journaled(&script, UnitLimits::default());
+        let ack = spawn(&rig, CHILD, json!({"one_shot": true})).await;
+        assert_eq!(
+            done_reason(&settle(&rig, ack.id).await),
+            DoneReason::Completed
+        );
+        let user = rig.hub.user();
+        let plan = rig
+            .hub
+            .revive_plan(user, ack.id)
+            .unwrap()
+            .expect("a finished agent is revivable");
+        let transcript = rig.hub.load_transcript(plan.handle.as_str()).unwrap();
+        let launch = AgentLaunch::prepare(&rig.ctx, &plan.spec).await.unwrap();
+        let sent = rig
+            .hub
+            .revive(
+                user,
+                plan,
+                launch,
+                transcript,
+                "resume please".to_owned(),
+                DeliveryKind::Steer,
+            )
+            .unwrap();
+        assert_eq!(sent.state, "revived");
+        let view = settle(&rig, ack.id).await;
+        assert_eq!(view.result.unwrap().summary, "second answer");
+        let second = seen_text(&script, CHILD).remove(1);
+        assert!(
+            second.contains("resume please"),
+            "message delivered: {second}"
+        );
+    }
+
     #[tokio::test]
     async fn missing_transcript_is_not_revivable() {
         let script = Script::new(vec![(CHILD, vec![Step::Hang])]);
