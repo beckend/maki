@@ -234,13 +234,16 @@ child is told to send you its result with `send` before it finishes, and you are
 it ends. kind "shell" starts a command that keeps running while you continue. You
 are notified when a run finishes; do not poll or sleep. Start independent runs together
 in one assistant message and continue useful work while they run. Use `wait` only when
-you are blocked on a result and have nothing else to do, `send` to talk to a
+you are blocked on a command's result and have nothing else to do (it waits for
+commands, not for agents), `send` to talk to a
 run, `stop` to end it, `runs` to look. Only a limited number of agents work at once;
 the rest show as queued with a position and start in order. A full queue returns
 QUEUE_FULL: wait for runs to finish. A timeout_secs above the session maximum is
 lowered to it, and timeout_secs 0 asks for that maximum outright, so a long task is
 not cut off at the default. An agent's clock starts when it starts working. Not available to agents at the maximum depth: you
-get DEPTH_LIMIT and must do the work yourself.
+get DEPTH_LIMIT and must do the work yourself. The result comes to you: a sub-agent
+sends it with `send` and its end wakes you, so never wait for one, never sleep on one
+and never poll one. Keep working instead; the result is delivered to you.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
@@ -295,15 +298,17 @@ file). Reading a finished run's result marks it received, so its notice is dropp
 
 ### `wait` <span class="badge badge-optin">opt-in</span> {#wait}
 
-Block until runs have finished their work or a timeout expires. Use only when you cannot
-proceed without the result; otherwise keep working, you will be notified. mode "all" (default)
-returns when every listed run is done or idle (finished its turn), "any" when the first is.
-A timeout is not an error: you get the current states and the runs keep going. Results you
-receive here are not repeated as notices.
+Block until commands have finished their work or a timeout expires. Use only when you cannot
+    proceed without the result; otherwise keep working, you will be notified. mode "all" (default)
+    returns when every listed command is done, "any" when the first is.
+    A timeout is not an error: you get the current states and the commands keep going. Results you
+    receive here are not repeated as notices.
+    Only commands are waited for. An agent is not: it reports with send and its end sends a
+    notice, so waiting for one would hold your turn for nothing.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `ids` | array | yes |  |
+| `ids` | array | yes | Command handles to wait for (sh-...). Agents are not waited for: they report with send. |
 | `mode` | string | no |  |
 | `timeout_secs` | integer | no | Default 60. |
 

@@ -5917,7 +5917,9 @@ detail?, exit_code?, summary?, truncated?, structured?, full_text_path? }`.
 (required), `mode` (`"all"` or `"any"`), `timeout_secs` (1 to 600). A wait
 that times out returns the runs as they stand (`settled` is false for those
 still going); a cancel of the calling task returns `(nil, err)` and leaves
-the runs running. Needs the `agent` permission.
+the runs running. A plugin waits for whatever it started; the model's
+`wait` tool is the one that keeps to commands, since an agent reports with
+send and its end sends a notice. Needs the `agent` permission.
 
 Requires the `agent` [plugin permission](#plugin-permissions).
 
@@ -8999,8 +9001,8 @@ function M.cut_middle(text, max_lines, max_bytes)
 --- Close {view} on the marker and build the tool reply. {out} is everything
 --- the tool streamed, already truncated; empty means the view still shows a
 --- placeholder to drop. {reason} is a cancel-hook reason ("cancelled" |
---- "timeout").
-function M.cut(view, out, reason, timeout_secs)
+--- "timeout" | "stopped"). {started_at} is the `os.time()` the tool began at.
+function M.cut(view, out, reason, timeout_secs, started_at)
 
 --- Like `cut` for a timed-out command that was handed to the run hub instead
 --- of being killed. Not an error: the process is alive and owns {handle}.
