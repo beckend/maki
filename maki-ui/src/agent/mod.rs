@@ -34,9 +34,15 @@ pub(crate) use maki_agent::ModelSlot;
 /// Why a tab's agent loop is replaced.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Respawn {
-    /// The tab's own session moved on (rewind, `/new`). Its meta lags behind
-    /// the mailbox then, so the receipts it lists are not lost work.
+    /// The tab's own session moved on (`/new`). Its meta lags behind the
+    /// mailbox then, so the receipts it lists are not lost work. The session
+    /// is gone, so its runs go with it.
     Restart,
+    /// A rewind: the parent's transcript goes back to an earlier turn, but
+    /// the session is the same one, so its runs stay. A sub-agent that the
+    /// rewind keeps goes on working; only the runs whose receipts the rewind
+    /// drops are stopped.
+    Rewind,
     /// A stored session was loaded into the tab. The receipts it left
     /// unanswered come back as lost notices, ahead of its restored queue.
     Load,
@@ -92,6 +98,7 @@ impl AgentHandles {
             lua_handle,
             model_policy,
             false,
+            None,
         )
     }
 
@@ -133,14 +140,19 @@ impl AgentHandles {
 
     pub(crate) fn cancel_subagent(&self, tool_use_id: String) {
         // A native run's tab is keyed by its handle, and it stops through the
-        // hub, which also stops what it started.
+        // hub. Only that run goes: what it started moves up to its own parent
+        // and goes on working, since the user stopped the run in front of them
+        // and not the work below it.
         if let Some(runs) = self.mailbox.seed().and_then(|seed| seed.runs.clone())
             && let Ok(id) = runs.hub.resolve(runs.hub.main(), &tool_use_id)
         {
             runs.hub.stop(
                 runs.hub.main(),
                 &[id],
-                maki_agent::runs::StopOpts::default(),
+                maki_agent::runs::StopOpts {
+                    detach: true,
+                    ..Default::default()
+                },
             );
             return;
         }
@@ -187,8 +199,20 @@ impl AgentHandles {
 
     /// Respawn or shutdown: this loop is done, whatever it was in the middle of.
     pub(crate) fn cancel_all(&self) {
+        self.cancel_loop();
+        self.shutdown_runs();
+    }
+
+    /// The loop's own work: the run in flight and the legacy subagents of the
+    /// turn. A native run lives on the hub and outlives the loop.
+    fn cancel_loop(&self) {
         self.cancels.cancel_all();
         self.subagent_cancels.cancel_all();
+    }
+
+    /// The session's runs: the hub's own shutdown, which stops every run and
+    /// settles it. Only the session going away does this.
+    fn shutdown_runs(&self) {
         if let Some(runs) = self.mailbox.seed().and_then(|seed| seed.runs.clone()) {
             runs.hub.shutdown();
         }
@@ -234,6 +258,16 @@ impl AgentHandles {
         // thing that makes the old loop's in-flight envelopes stale. It lives
         // here so no caller can respawn without it.
         app.run_id += 1;
+        // A rewind rewrites the parent's transcript, not the session: the hub
+        // and the runs on it stay, so a sub-agent the rewind keeps goes on
+        // working. A new session or a loaded one brings its own runs, so the
+        // old hub goes down with the old loop.
+        let keep_runs = reason == Respawn::Rewind;
+        let runs = if keep_runs {
+            self.mailbox.seed().and_then(|seed| seed.runs.clone())
+        } else {
+            None
+        };
         let new = spawn_agent_internal(
             (self.agent_tx.clone(), self.agent_rx.clone()),
             model_slot,
@@ -255,6 +289,7 @@ impl AgentHandles {
             lua_handle,
             Arc::clone(&self.model_policy),
             true,
+            runs,
         );
         let old = mem::replace(self, new);
         // Repoint the app at the new queue before dropping `old`, otherwise the app keeps
@@ -266,7 +301,12 @@ impl AgentHandles {
             app.restore_lost_background();
         }
         app.flush_restored_queue();
-        old.cancel_all();
+        if keep_runs {
+            // The hub stays: its runs are the session's, not the loop's.
+            old.cancel_loop();
+        } else {
+            old.cancel_all();
+        }
     }
 
     pub(crate) fn is_finished(&self) -> bool {
@@ -313,6 +353,7 @@ fn spawn_agent_internal(
     lua_handle: EventHandle,
     model_policy: Arc<ModelPolicy>,
     reload_auth: bool,
+    runs: Option<maki_agent::runs::RunsCtx>,
 ) -> AgentHandles {
     let (answer_tx, answer_rx) = flume::unbounded::<String>();
     let (queue_tx, queue_rx) = shared_queue::queue();
@@ -343,6 +384,7 @@ fn spawn_agent_internal(
         lua_handle,
         Arc::clone(&subagent_cancels),
         Arc::clone(&model_policy),
+        runs,
     );
 
     let provider = Arc::clone(&model_slot.load().provider);
@@ -931,6 +973,127 @@ mod tests {
             }
         }
         assert_eq!(observed, restored);
+    }
+
+    /// A hub with the runs on it, and the loop that owns it.
+    fn spawn_with_runs() -> (
+        AgentHandles,
+        Arc<ArcSwap<ModelSlot>>,
+        Arc<PermissionManager>,
+    ) {
+        let model_slot = Arc::new(ArcSwap::from_pointee(ModelSlot {
+            model: crate::components::test_model(),
+            provider: Arc::new(StubProvider),
+        }));
+        let permissions = Arc::new(PermissionManager::new(
+            PermissionsConfig::default(),
+            PathBuf::from("/tmp"),
+            ProjectConfig::for_project(Path::new("/tmp")),
+            Arc::default(),
+        ));
+        let mut config = AgentConfig::default();
+        config.runs.enabled = true;
+        let handles = AgentHandles::spawn(
+            &model_slot,
+            Resumed::fresh(),
+            config,
+            ToolOutputLines::default(),
+            &permissions,
+            maki_providers::Timeouts::default(),
+            EventHandle::disconnected_for_test(),
+            None,
+            McpConfigErrors::new(PathBuf::new()),
+            Arc::new(ModelPolicy::default()),
+        );
+        (handles, model_slot, permissions)
+    }
+
+    fn runs_config() -> AgentConfig {
+        let mut config = AgentConfig::default();
+        config.runs.enabled = true;
+        config
+    }
+
+    /// A rewind rewrites the parent's transcript, not the session: the runs on
+    /// the hub go on working. A respawn that took a fresh hub would leave them
+    /// behind, and the old hub's shutdown would kill every one of them.
+    #[test]
+    fn a_rewind_keeps_the_runs_of_the_session() {
+        let _runtime = enter_runtime();
+        let (mut handles, model_slot, permissions) = spawn_with_runs();
+        let runs = handles
+            .mailbox
+            .seed()
+            .and_then(|seed| seed.runs.clone())
+            .expect("runs are enabled");
+        let req: maki_agent::runs::SpawnRequest = serde_json::from_value(serde_json::json!({
+            "kind": "shell", "description": "sleeper", "command": "sleep 20"
+        }))
+        .unwrap();
+        let ack = runs.hub.spawn(runs.hub.main(), req).unwrap();
+        let mut app = crate::app::tests::test_app();
+
+        handles.respawn(
+            Vec::new(),
+            &model_slot,
+            runs_config(),
+            ToolOutputLines::default(),
+            &permissions,
+            &mut app,
+            EventHandle::disconnected_for_test(),
+            Respawn::Rewind,
+        );
+
+        let kept = handles
+            .mailbox
+            .seed()
+            .and_then(|seed| seed.runs.clone())
+            .expect("runs are enabled");
+        assert!(
+            Arc::ptr_eq(&runs.hub, &kept.hub),
+            "the rewind must keep the hub of the session"
+        );
+        let view = runs.hub.get(ack.id).expect("the run is still known");
+        assert!(
+            !view.state.is_done(),
+            "the run must go on working: {:?}",
+            view.state
+        );
+    }
+
+    /// A new session brings its own runs: the old hub goes down with the old
+    /// loop, and the new loop gets a hub of its own.
+    #[test]
+    fn a_new_session_takes_the_runs_with_it() {
+        let _runtime = enter_runtime();
+        let (mut handles, model_slot, permissions) = spawn_with_runs();
+        let runs = handles
+            .mailbox
+            .seed()
+            .and_then(|seed| seed.runs.clone())
+            .expect("runs are enabled");
+        let mut app = crate::app::tests::test_app();
+
+        handles.respawn(
+            Vec::new(),
+            &model_slot,
+            runs_config(),
+            ToolOutputLines::default(),
+            &permissions,
+            &mut app,
+            EventHandle::disconnected_for_test(),
+            Respawn::Restart,
+        );
+
+        let fresh = handles
+            .mailbox
+            .seed()
+            .and_then(|seed| seed.runs.clone())
+            .expect("runs are enabled");
+        assert!(
+            !Arc::ptr_eq(&runs.hub, &fresh.hub),
+            "a new session must not share the hub of the old one"
+        );
     }
 
     /// A monitor can prompt before the user sends anything, so the seed has to

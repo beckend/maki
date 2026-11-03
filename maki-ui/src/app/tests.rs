@@ -5074,7 +5074,7 @@ fn rewind_to_middle_truncates_and_populates_input() {
     assert_eq!(app.input_box.buffer.value(), "second prompt");
     assert_eq!(app.run_id, old_run_id);
 
-    let Action::RestartAgent(ref history) = actions[0] else {
+    let Action::RewindAgent(ref history) = actions[0] else {
         panic!("{RESTART_EXPECTED}");
     };
     assert_eq!(history.len(), 2);
@@ -5139,7 +5139,42 @@ fn rewind_to_first_turn_clears_everything() {
     assert_eq!(app.state.token_usage.output, 200);
     assert_eq!(app.state.context_size, 0);
     assert_eq!(app.chats[0].context_size, 0);
-    assert!(matches!(&actions[0], Action::RestartAgent(_)));
+    assert!(matches!(&actions[0], Action::RewindAgent(_)));
+}
+
+/// A rewind rewrites the parent's transcript, not the session: a native run
+/// keeps its tab and goes on working. Only the runs whose receipts the rewind
+/// drops are stopped.
+#[test]
+fn a_rewind_keeps_a_native_run_tab() {
+    const HANDLE: &str = "ag-k3x9ab";
+    let mut app = build_rewind_app();
+    let native = |event| {
+        subagent_msg_with_run_id(event, HANDLE, Some("reader"), maki_agent::BACKGROUND_RUN_ID)
+    };
+    app.update(native(AgentEvent::RunStarted {
+        handle: HANDLE.into(),
+        name: "reader".into(),
+        kind: "agent".into(),
+        parent: None,
+        depth: 1,
+        one_shot: false,
+    }));
+    assert!(app.chat_of_task(HANDLE).is_ok(), "the run has a tab");
+
+    let actions = app.rewind_to(rewind_to_second_turn());
+
+    assert!(
+        matches!(&actions[0], Action::RewindAgent(_)),
+        "{RESTART_EXPECTED}"
+    );
+    let kept = app
+        .chat_of_task(HANDLE)
+        .expect("the run keeps its tab across the rewind");
+    assert!(
+        !app.chats[kept].is_finished(),
+        "the run keeps working after the rewind"
+    );
 }
 
 #[test_case(Duration::ZERO,          true  ; "keeps_fresh_error")]
@@ -10167,6 +10202,45 @@ fn double_esc_in_finished_subagent_noop() {
     assert!(actions.is_empty());
 }
 
+/// The stop in a run's tab ends that run alone: what it started stays, since
+/// the stop left it running.
+#[test]
+fn stopping_a_native_run_leaves_the_work_it_started_alone() {
+    const HANDLE: &str = "ag-k3x9ab";
+    let mut app = streaming_app();
+    let native = |event| {
+        subagent_msg_with_run_id(event, HANDLE, Some("reader"), maki_agent::BACKGROUND_RUN_ID)
+    };
+    app.update(native(AgentEvent::RunStarted {
+        handle: HANDLE.into(),
+        name: "reader".into(),
+        kind: "agent".into(),
+        parent: None,
+        depth: 1,
+        one_shot: false,
+    }));
+    // The work the reader started, with its own tab.
+    start_subagent(&mut app, "kid", "kid");
+    let kid = *app.chat_index.get("kid").expect("the kid has a tab");
+    app.chats[kid].parent = Some(TaskParent::Started(Arc::from(HANDLE)));
+
+    let reader = *app.chat_index.get(HANDLE).expect("the run has a tab");
+    app.active_chat = reader;
+    app.last_esc = Some(Instant::now());
+    let actions = app.update(Msg::Key(key(KeyCode::Esc)));
+
+    assert_eq!(actions.len(), 1);
+    assert!(matches!(
+        &actions[0],
+        Action::CancelSubagent { tool_use_id } if tool_use_id == HANDLE
+    ));
+    assert!(app.chats[reader].is_finished(), "the run in front stops");
+    assert!(
+        !app.chats[kid].is_finished(),
+        "the work it started goes on working"
+    );
+}
+
 #[test]
 fn subagent_cancel_then_navigate_back_main_unaffected() {
     let mut app = app_with_active_subagent();
@@ -10822,10 +10896,13 @@ const RESTART_MATCHES_SESSION: &str =
 const MIRROR_SURVIVED: &str = "a history the agent did not produce must drop the mirror with it";
 
 fn restart_history(actions: Vec<Action>) -> Vec<Message> {
-    let Ok([Action::RestartAgent(history)]) = <[Action; 1]>::try_from(actions) else {
+    let Ok([action]) = <[Action; 1]>::try_from(actions) else {
         panic!("{ONE_RESTART}");
     };
-    history
+    match action {
+        Action::RestartAgent(history) | Action::RewindAgent(history) => history,
+        _ => panic!("{ONE_RESTART}"),
+    }
 }
 
 /// A tab mid-conversation with the agent's mirror attached, the only state in
@@ -11551,7 +11628,7 @@ fn rewind_stops_the_tasks_whose_receipt_it_drops(turn_index: usize, stops: bool)
         cancelled, stops,
         "the stop names the task's plugin, its tab is gone by then"
     );
-    assert!(matches!(actions.last(), Some(Action::RestartAgent(_))));
+    assert!(matches!(actions.last(), Some(Action::RewindAgent(_))));
     assert_eq!(app.chat_of_task(RECEIPT_TURN_ID).is_ok(), !stops);
     assert_eq!(
         app.chats[MAIN_CHAT].has_background_badge(RECEIPT_TURN_ID),

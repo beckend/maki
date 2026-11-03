@@ -83,14 +83,20 @@ impl AgentLoop {
         lua_handle: EventHandle,
         subagent_cancels: Arc<CancelMap<String>>,
         model_policy: Arc<ModelPolicy>,
+        // The hub of the session this loop takes over, when the session stays
+        // and only the transcript changes (a rewind). The runs on it keep
+        // working; a fresh hub would leave them behind.
+        runs: Option<maki_agent::runs::RunsCtx>,
     ) -> Self {
         let mcp = mcp_handle.map(|h| McpSession::new(h, &resumed.history));
-        let runs = maki_agent::runs::start_session(
-            &config.runs,
-            EventSender::new(agent_tx.clone(), 0),
-            resumed.id.id(),
-            true,
-        );
+        let runs = runs.or_else(|| {
+            maki_agent::runs::start_session(
+                &config.runs,
+                EventSender::new(agent_tx.clone(), 0),
+                resumed.id.id(),
+                true,
+            )
+        });
         let seed = mailbox.publish_seed(
             AgentSeed::new(
                 resumed.id,

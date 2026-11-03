@@ -17,7 +17,7 @@ use maki_storage::id::MakiId;
 use serde::Serialize;
 use strum::IntoStaticStr;
 
-use crate::app::{App, MAIN_CHAT};
+use crate::app::{App, MAIN_CHAT, is_native_run};
 use crate::chat::{CANCELLED_TEXT, Chat, DONE_TEXT, ERROR_TEXT, LOST_TEXT};
 use crate::components::tool_display::without_timeout;
 use crate::components::{
@@ -697,6 +697,7 @@ impl App {
         }
         let chat = &mut self.chats[idx];
         let live = !chat.is_finished();
+        let native = is_native_run(chat);
         let action = match &chat.plugin {
             Some(plugin) if live => Action::CancelPluginTask {
                 id: id.to_owned(),
@@ -707,7 +708,13 @@ impl App {
             },
             _ => return Err(format!("{NOT_RUNNING_ERR}{id}")),
         };
-        self.end_task(id, BackgroundOutcome::Cancelled);
+        // A native run's children move up to its own parent when it stops, so
+        // they go on working: only the run in front of the user ends here.
+        if native {
+            self.end_task_alone(id, BackgroundOutcome::Cancelled);
+        } else {
+            self.end_task(id, BackgroundOutcome::Cancelled);
+        }
         Ok(action)
     }
 
@@ -718,13 +725,23 @@ impl App {
     /// because the tab and its final result may be gone before the call
     /// honours the stop.
     pub(crate) fn end_task(&mut self, id: &str, outcome: BackgroundOutcome) {
+        self.end_task_with(id, outcome, true);
+    }
+
+    /// Ends task `id` and nothing else: what it started stays, because the
+    /// stop left it running.
+    fn end_task_alone(&mut self, id: &str, outcome: BackgroundOutcome) {
+        self.end_task_with(id, outcome, false);
+    }
+
+    fn end_task_with(&mut self, id: &str, outcome: BackgroundOutcome, cascade: bool) {
         let (ending, text) = tab_ending(outcome);
         for chat in &mut self.chats {
             let Some(task) = chat.task_id() else {
                 continue;
             };
             let started_by_it =
-                matches!(&chat.parent, Some(TaskParent::Started(call)) if **call == *id);
+                cascade && matches!(&chat.parent, Some(TaskParent::Started(call)) if **call == *id);
             if (**task == *id || started_by_it) && !chat.is_finished() {
                 self.permission_prompt.drop_subagent(task);
                 chat.end_early(ending, text);

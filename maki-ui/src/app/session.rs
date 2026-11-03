@@ -27,7 +27,7 @@ use maki_storage::sessions::{
 use crate::{AppSession, OpenSession};
 
 use super::session_state::{SessionState, rules_to_stored, stored_to_rules};
-use super::{App, MAIN_CHAT, Mode, PlanState, Sending, Status};
+use super::{App, MAIN_CHAT, Mode, PlanState, Sending, Status, is_native_run};
 
 /// The shortest gap between two writes that carry only UI state.
 const SOFT_SAVE_DELAY: Duration = Duration::from_millis(1000);
@@ -769,10 +769,12 @@ impl App {
         session.update_title_if_default();
         self.state.context_size = context_size;
 
-        // A tool task still running belongs to a turn that is over.
+        // A tool task still running belongs to a turn that is over. A native
+        // run does not: it outlives the turn that started it, so a rewind
+        // that keeps it keeps its tab.
         self.reset_ui_chrome_keeping(|chat| {
             chat.task_id().is_some_and(|id| !dropped.contains(id))
-                && (chat.plugin.is_some() || chat.is_finished())
+                && (chat.plugin.is_some() || chat.is_finished() || is_native_run(chat))
         });
         self.deleted_tasks = deleted;
         self.deleted_tasks
@@ -785,7 +787,7 @@ impl App {
 
         self.restore_input(&entry.prompt_text, turn_writers(&entry.prompt_text));
 
-        actions.push(Action::RestartAgent(self.install_local_history()));
+        actions.push(Action::RewindAgent(self.install_local_history()));
         actions
     }
 

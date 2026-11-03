@@ -678,6 +678,52 @@ async fn stop_cascades_children_first() {
     assert_eq!(order, [handles.0, handles.1], "child settles before parent");
 }
 
+/// A stop that detaches leaves the children running: the user stopped the run
+/// in front of them, not the work below it. The child moves up to the run
+/// that stopped its parent, so it has an owner left.
+#[tokio::test]
+async fn a_detached_stop_leaves_the_children_running() {
+    let spawn_child = tool_use(
+        "t1",
+        "spawn",
+        json!({"kind": "agent", "description": "kid", "prompt": CHILD}),
+    );
+    let script = Script::new(vec![
+        (PARENT, vec![Step::Reply(spawn_child), Step::Hang]),
+        (CHILD, vec![Step::Hang]),
+    ]);
+    let rig = rig(&script);
+    let parent = spawn(&rig, PARENT, json!({})).await;
+    await_requests(&script, PARENT, 2).await;
+    let kids = rig.hub.list(parent.id, Scope::Children);
+    assert_eq!(kids.len(), 1);
+    let kid = kids[0].id;
+
+    let outcomes = rig.hub.stop(
+        rig.hub.main(),
+        &[parent.id],
+        StopOpts {
+            detach: true,
+            ..Default::default()
+        },
+    );
+    assert_eq!(outcomes[0].status, Ok(StopStatus::Requested));
+    let view = settle(&rig, parent.id).await;
+    assert_eq!(done_reason(&view), DoneReason::Killed);
+
+    let kid_view = rig.hub.get(kid).unwrap();
+    assert!(
+        !kid_view.state.is_done(),
+        "the child must go on working: {:?}",
+        kid_view.state
+    );
+    assert_eq!(
+        kid_view.parent,
+        rig.hub.main(),
+        "the child moves up to the run that stopped its parent"
+    );
+}
+
 #[tokio::test]
 async fn stopped_agent_makes_no_more_requests() {
     let script = Script::new(vec![(CHILD, vec![Step::Reply(reply("one")), Step::Hang])]);

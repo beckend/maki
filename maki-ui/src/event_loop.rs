@@ -2022,6 +2022,7 @@ impl<'t> EventLoop<'t> {
                 self.emit_task_stopped(idx, &id, Some(&plugin));
             }
             Action::RestartAgent(history) => self.respawn_agent(idx, history, Respawn::Restart),
+            Action::RewindAgent(history) => self.respawn_agent(idx, history, Respawn::Rewind),
             Action::OpenFork(open) => self.open_fork(idx, *open),
             Action::ChangeModel(spec) => {
                 if let Err(e) = self.change_model(&spec) {

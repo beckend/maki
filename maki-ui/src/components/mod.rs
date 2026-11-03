@@ -240,6 +240,9 @@ pub enum Action {
     /// The history under this runtime changed (reset, load, rewind), so the
     /// agent has to be respawned on it.
     RestartAgent(Vec<Message>),
+    /// The same, for a rewind: the session stays, so the runs on it stay too.
+    /// Only the runs whose receipts the rewind drops are stopped.
+    RewindAgent(Vec<Message>),
     /// A copy of this session, to run beside it and take the focus.
     OpenFork(Box<OpenSession>),
     ChangeModel(String),
