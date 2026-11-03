@@ -679,6 +679,13 @@ lifetime is the session. A parent's `stop` and the cascade call the child's trig
 main run cancels the main turn only. Esc in a run's tab, `/stop <name>` and quit call
 `hub.stop`. Legacy Lua `task` runs keep the old per-run map.
 
+The double Esc is scoped to the view it is used in. In the main chat it ends the main turn, and
+the runs of the session keep working: a rewind (the picker's Esc opens it) rewrites the parent's
+transcript, so the respawn behind it keeps the hub and the runs on it, and only the runs whose
+receipts the rewind drops are stopped (`maki-ui/src/app/session.rs:rewind_to`). In a run's tab it
+stops that run alone: the hub is stopped with `detach`, so the work it started moves up to its
+own parent and goes on. Quit (Ctrl-C) is the one that ends everything: it shuts the hub down.
+
 ### 4.6 Acks
 
 Two stages, visible through `runs(id)`:
@@ -993,8 +1000,8 @@ shell is rejected (`NOT_AGENT`). Hard `stop` keeps the cascade semantics above.
 
 | Event | Effect on runs |
 |---|---|
-| Esc on the main run | cancels the main turn only. Background runs continue. They notify when done and the main agent wakes per the wake budget. |
-| Esc in a run's tab | `hub.stop(run, cascade)`; agent tab only; Esc again = hard `forced` settle immediately |
+| Esc on the main run | cancels the main turn only. Background runs continue. They notify when done and the main agent wakes per the wake budget. A rewind keeps the hub, so the runs it keeps go on working. |
+| Esc in a run's tab | `hub.stop(run, detach)`: that run alone, and the work it started moves up to its own parent. Esc again = hard `forced` settle immediately |
 | `/stop <name\|all>` (new command, 8.1) | `hub.stop`; `all` stops every run owned by the session root |
 | `/new` | the old session's hub does `shutdown()` (cascade stop, 5 s deadline), then a fresh hub with a fresh root token. Runs do not migrate sessions. |
 | session switch (`/resume`, session picker) | same as `/new` for the session being left; its runs settle `Done(Killed)` (detail `session_closed`) so the journal is clean and a resume shows them stopped, not lost |

@@ -141,6 +141,8 @@ Stopping a bash task kills its process group and keeps the output so far. Who st
 
 `Esc` in the main chat stops foreground work only. With tasks running, the flash says so: `Press esc again to stop... 1 task in background`.
 
+`Esc` twice in a task's tab stops that task alone. What it started goes on working: a native run's children move up to its own parent, so a task the user stopped in front of them does not take its own workers down with it. `Ctrl+C` is the one that ends everything: the session's runs go down with it.
+
 ## Results
 
 A finished task reaches the model as a message that starts with `Background bash <id> (<summary>) finished:`, or `failed:`, followed by the output a foreground call would have returned. The transcript shows a short line with the call's description and a dot in the color of the outcome. Click the line to unfold the output:
