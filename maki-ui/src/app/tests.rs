@@ -5175,6 +5175,10 @@ fn a_rewind_keeps_a_native_run_tab() {
         !app.chats[kept].is_finished(),
         "the run keeps working after the rewind"
     );
+    assert!(
+        app.runs.find(HANDLE).is_some(),
+        "the picker has to show the run that goes on working"
+    );
 }
 
 #[test_case(Duration::ZERO,          true  ; "keeps_fresh_error")]

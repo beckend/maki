@@ -312,12 +312,14 @@ impl App {
     /// as done that keeps streaming and that Esc can no longer reach.
     pub(super) fn reset_ui_chrome(&mut self) {
         let session = self.state.session.id;
-        self.reset_ui_chrome_keeping(|chat| chat.is_live_plugin_task_of(session));
+        self.reset_ui_chrome_keeping(|chat| chat.is_live_plugin_task_of(session), false);
     }
 
     /// [`Self::reset_ui_chrome`] that keeps every task tab {keep} accepts, as
-    /// it is. The main chat always goes.
-    fn reset_ui_chrome_keeping(&mut self, keep: impl Fn(&Chat) -> bool) {
+    /// it is. The main chat always goes. `runs_stay` says the session's runs
+    /// are still there: a rewind keeps them, a new session does not, and the
+    /// picker has to show the ones that go on working.
+    fn reset_ui_chrome_keeping(&mut self, keep: impl Fn(&Chat) -> bool, runs_stay: bool) {
         // Brings the main draft back to the box before the chats holding it go.
         self.set_active_chat(MAIN_CHAT);
         self.chats
@@ -334,7 +336,9 @@ impl App {
         self.active_chat = MAIN_CHAT;
         self.chat_index.clear();
         self.deleted_tasks.clear();
-        self.runs.clear();
+        if !runs_stay {
+            self.runs.clear();
+        }
         self.status = Status::Idle;
         self.clear_exit_request();
         self.queue.clear();
@@ -772,10 +776,13 @@ impl App {
         // A tool task still running belongs to a turn that is over. A native
         // run does not: it outlives the turn that started it, so a rewind
         // that keeps it keeps its tab.
-        self.reset_ui_chrome_keeping(|chat| {
-            chat.task_id().is_some_and(|id| !dropped.contains(id))
-                && (chat.plugin.is_some() || chat.is_finished() || is_native_run(chat))
-        });
+        self.reset_ui_chrome_keeping(
+            |chat| {
+                chat.task_id().is_some_and(|id| !dropped.contains(id))
+                    && (chat.plugin.is_some() || chat.is_finished() || is_native_run(chat))
+            },
+            true,
+        );
         self.deleted_tasks = deleted;
         self.deleted_tasks
             .extend(dropped.iter().map(|id| id.to_string()));
