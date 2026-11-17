@@ -454,9 +454,15 @@ impl ProvidersConfig {
 /// The `providers.toml` we already read, or where a fresh one goes; one file
 /// under the config dir is both.
 fn providers_file_path() -> PathBuf {
-    paths::config_dir()
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .join(PROVIDERS_FILE)
+    paths::find_config_path(PROVIDERS_FILE).unwrap_or_else(|| {
+        // The dir follows the environment, not the path the process cached at
+        // startup: a test that moves `XDG_CONFIG_HOME` must not write into
+        // the config it was moved away from.
+        paths::xdg_config_dir_live()
+            .or_else(|| paths::config_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(PROVIDERS_FILE)
+    })
 }
 
 pub fn set_registered_providers(rows: Vec<&'static BuiltInProvider>) {

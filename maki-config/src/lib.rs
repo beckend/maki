@@ -89,6 +89,24 @@ pub const MIN_CONNECT_TIMEOUT_SECS: u64 = 1;
 pub const MIN_LOW_SPEED_TIMEOUT_SECS: u64 = 1;
 pub const MIN_STREAM_TIMEOUT_SECS: u64 = 10;
 
+pub const DEFAULT_RUNS_MAX_DEPTH: u32 = 2;
+pub const DEFAULT_RUNS_MAX_CHILDREN: u32 = 8;
+pub const DEFAULT_RUNS_SESSION_MAX: u32 = 64;
+pub const DEFAULT_RUNS_MAX_AGENTS: u32 = 4;
+pub const DEFAULT_RUNS_MAX_SHELLS: u32 = 8;
+pub const DEFAULT_RUNS_MAX_SHELLS_PER_OWNER: u32 = 4;
+pub const DEFAULT_RUNS_MAX_QUEUE: u32 = 16;
+pub const DEFAULT_RUNS_SPAWN_PER_MINUTE: u32 = 10;
+pub const DEFAULT_RUNS_AGENT_TIMEOUT_SECS: u64 = 86_400;
+pub const DEFAULT_RUNS_MAX_TIMEOUT_SECS: u64 = 86_400;
+pub const MIN_RUNS_MAX_DEPTH: u32 = 1;
+pub const MIN_RUNS_LIMIT: u32 = 1;
+pub const MIN_RUNS_TIMEOUT_SECS: u64 = 1;
+pub const DEFAULT_RUNS_PERMISSION_TIMEOUT_SECS: u64 = 120;
+pub const DEFAULT_RUNS_MAX_RETAINED: u32 = 64;
+pub const DEFAULT_RUNS_MAX_IDLE: u32 = 16;
+pub const DEFAULT_RUNS_IDLE_TIMEOUT_SECS: u64 = 1800;
+
 pub const MIN_RETRY_BASE_MS: u64 = 1;
 pub const MIN_RETRY_MAX_MS: u64 = 1;
 
@@ -815,6 +833,65 @@ pub struct AgentFileConfig {
     pub stale_read_check: Option<bool>,
     pub rtk: Option<bool>,
     pub shell: Option<ShellPreference>,
+    #[merge(nested)]
+    pub runs: RunsFileConfig,
+}
+
+#[derive(Deserialize, Default, Debug, Merge)]
+#[serde(default, deny_unknown_fields)]
+pub struct RunsFileConfig {
+    pub enabled: Option<bool>,
+    pub max_depth: Option<u32>,
+    pub max_children_per_run: Option<u32>,
+    pub session_max_runs: Option<u32>,
+    pub siblings: Option<bool>,
+    pub max_agents: Option<u32>,
+    pub max_shells: Option<u32>,
+    pub max_shells_per_owner: Option<u32>,
+    pub max_queue: Option<u32>,
+    pub spawn_per_minute: Option<u32>,
+    pub default_timeout_secs: Option<u64>,
+    pub max_timeout_secs: Option<u64>,
+    pub permission_timeout_secs: Option<u64>,
+    pub unattended_permissions: Option<UnattendedMode>,
+    pub max_retained: Option<u32>,
+    pub max_idle: Option<u32>,
+    pub idle_timeout_secs: Option<u64>,
+}
+
+/// What a background run's permission prompt gets when nobody can answer it
+/// (`maki -p`, an SDK client with no handler).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnattendedMode {
+    /// Deny the call.
+    #[default]
+    Deny,
+    /// Allow it when the session runs with `--yolo`, deny it otherwise.
+    AllowUnderYolo,
+}
+
+/// The pre-rename spelling of `allow_under_yolo`, still accepted.
+const DEPRECATED_INHERIT_YOLO: &str = "inherit_yolo";
+
+impl<'de> Deserialize<'de> for UnattendedMode {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(d)?;
+        match value.as_str() {
+            "deny" => Ok(Self::Deny),
+            "allow_under_yolo" => Ok(Self::AllowUnderYolo),
+            DEPRECATED_INHERIT_YOLO => {
+                warn!(
+                    "unattended_permissions = \"inherit_yolo\" is deprecated, use \"allow_under_yolo\""
+                );
+                Ok(Self::AllowUnderYolo)
+            }
+            other => Err(serde::de::Error::unknown_variant(
+                other,
+                &["deny", "allow_under_yolo"],
+            )),
+        }
+    }
 }
 
 #[derive(Deserialize, Default, Debug, Merge)]
@@ -1449,6 +1526,9 @@ pub struct AgentConfig {
     )]
     pub shell: ShellPreference,
 
+    #[config(skip, default = "RunsConfig::default()")]
+    pub runs: RunsConfig,
+
     #[config(skip, default = "None")]
     pub max_turns: Option<u32>,
 
@@ -1482,10 +1562,116 @@ impl AgentConfig {
             stale_read_check: file.stale_read_check.unwrap_or(true),
             rtk: file.rtk.unwrap_or(true),
             shell: file.shell.unwrap_or_default(),
+            runs: RunsConfig::from_file(file.runs),
             max_turns: None,
             allowed_tools: Vec::new(),
             disabled_tools: Vec::new(),
             instructions: InstructionsConfig::default(),
+        }
+    }
+}
+
+/// Background runs (`spawn`, `send`, `runs`, `wait`, `stop`). Off by default.
+#[derive(Debug, Clone, ConfigSection, Serialize)]
+#[config(section = "agent.runs")]
+pub struct RunsConfig {
+    #[config(
+        default = false,
+        desc = "Register the `spawn`, `send`, `runs`, `wait` and `stop` tools for background agents and shell jobs"
+    )]
+    pub enabled: bool,
+
+    #[config(default = DEFAULT_RUNS_MAX_DEPTH, min = MIN_RUNS_MAX_DEPTH, desc = "Deepest agent nesting (the main agent is 0); an agent at this depth cannot spawn agents")]
+    pub max_depth: u32,
+
+    #[config(default = DEFAULT_RUNS_MAX_CHILDREN, min = MIN_RUNS_LIMIT, desc = "Most runs one run may have in flight at once; a finished run that stays available does not use it up")]
+    pub max_children_per_run: u32,
+
+    #[config(default = DEFAULT_RUNS_SESSION_MAX, min = MIN_RUNS_LIMIT, desc = "Most runs one session may start in total")]
+    pub session_max_runs: u32,
+
+    #[config(
+        default = false,
+        desc = "Let runs with the same parent message each other with `send`. Off: a run reaches only its parent, its children and `main`"
+    )]
+    pub siblings: bool,
+
+    #[config(default = DEFAULT_RUNS_MAX_AGENTS, min = MIN_RUNS_LIMIT, desc = "Agent runs that may work at once; more start queued, first come first served. A run waiting in `wait` does not count")]
+    pub max_agents: u32,
+
+    #[config(default = DEFAULT_RUNS_MAX_SHELLS, min = MIN_RUNS_LIMIT, desc = "Shell runs that may be running at once in the session")]
+    pub max_shells: u32,
+
+    #[config(default = DEFAULT_RUNS_MAX_SHELLS_PER_OWNER, min = MIN_RUNS_LIMIT, desc = "Shell runs one run may have running at once")]
+    pub max_shells_per_owner: u32,
+
+    #[config(default = DEFAULT_RUNS_MAX_QUEUE, min = MIN_RUNS_LIMIT, desc = "Agent runs that may wait for a free slot; a further `spawn` fails with QUEUE_FULL")]
+    pub max_queue: u32,
+
+    #[config(default = DEFAULT_RUNS_SPAWN_PER_MINUTE, min = MIN_RUNS_LIMIT, desc = "Runs one run may start per rolling minute")]
+    pub spawn_per_minute: u32,
+
+    #[config(default = DEFAULT_RUNS_AGENT_TIMEOUT_SECS, min = MIN_RUNS_TIMEOUT_SECS, desc = "Wall clock limit of an agent run (seconds) unless `spawn` sets `timeout_secs`; counted from when it starts working. A delegated child works unattended, so the default is the session maximum rather than a short leash")]
+    pub default_timeout_secs: u64,
+
+    #[config(default = DEFAULT_RUNS_MAX_TIMEOUT_SECS, min = MIN_RUNS_TIMEOUT_SECS, desc = "Largest `timeout_secs` a `spawn` may ask for (seconds); larger values are lowered to it")]
+    pub max_timeout_secs: u64,
+
+    #[config(default = DEFAULT_RUNS_PERMISSION_TIMEOUT_SECS, min = MIN_RUNS_TIMEOUT_SECS, desc = "How long a run's permission prompt waits for the user (seconds) before it is denied; the run gives up its slot meanwhile")]
+    pub permission_timeout_secs: u64,
+
+    #[config(
+        default = UnattendedMode::Deny,
+        ty = "string",
+        default_doc = "deny",
+        desc = "A run's permission prompt when nobody can answer (`maki -p`): `deny`, or `allow_under_yolo` to allow it under `--yolo` (`inherit_yolo` is a deprecated alias)"
+    )]
+    pub unattended_permissions: UnattendedMode,
+
+    #[config(default = DEFAULT_RUNS_MAX_RETAINED, min = MIN_RUNS_LIMIT, desc = "Finished runs kept in memory; older ones leave a tombstone and can still be revived by `send` while their transcript exists")]
+    pub max_retained: u32,
+
+    #[config(default = DEFAULT_RUNS_MAX_IDLE, min = MIN_RUNS_LIMIT, desc = "Idle agents kept in memory; the least recently active leaves silently and is revived by `send`")]
+    pub max_idle: u32,
+
+    #[config(default = DEFAULT_RUNS_IDLE_TIMEOUT_SECS, min = MIN_RUNS_TIMEOUT_SECS, desc = "How long an agent may stay idle in memory (seconds) before it leaves silently; `send` revives it")]
+    pub idle_timeout_secs: u64,
+}
+
+impl RunsConfig {
+    fn from_file(file: RunsFileConfig) -> Self {
+        Self {
+            enabled: file.enabled.unwrap_or(false),
+            max_depth: file.max_depth.unwrap_or(DEFAULT_RUNS_MAX_DEPTH),
+            max_children_per_run: file
+                .max_children_per_run
+                .unwrap_or(DEFAULT_RUNS_MAX_CHILDREN),
+            session_max_runs: file.session_max_runs.unwrap_or(DEFAULT_RUNS_SESSION_MAX),
+            siblings: file.siblings.unwrap_or(false),
+            max_agents: file.max_agents.unwrap_or(DEFAULT_RUNS_MAX_AGENTS),
+            max_shells: file.max_shells.unwrap_or(DEFAULT_RUNS_MAX_SHELLS),
+            max_shells_per_owner: file
+                .max_shells_per_owner
+                .unwrap_or(DEFAULT_RUNS_MAX_SHELLS_PER_OWNER),
+            max_queue: file.max_queue.unwrap_or(DEFAULT_RUNS_MAX_QUEUE),
+            spawn_per_minute: file
+                .spawn_per_minute
+                .unwrap_or(DEFAULT_RUNS_SPAWN_PER_MINUTE),
+            default_timeout_secs: file
+                .default_timeout_secs
+                .unwrap_or(DEFAULT_RUNS_AGENT_TIMEOUT_SECS),
+            max_timeout_secs: file
+                .max_timeout_secs
+                .unwrap_or(DEFAULT_RUNS_MAX_TIMEOUT_SECS),
+            permission_timeout_secs: file
+                .permission_timeout_secs
+                .unwrap_or(DEFAULT_RUNS_PERMISSION_TIMEOUT_SECS),
+            unattended_permissions: file.unattended_permissions.unwrap_or_default(),
+            max_retained: file.max_retained.unwrap_or(DEFAULT_RUNS_MAX_RETAINED),
+            max_idle: file.max_idle.unwrap_or(DEFAULT_RUNS_MAX_IDLE),
+            idle_timeout_secs: file
+                .idle_timeout_secs
+                .unwrap_or(DEFAULT_RUNS_IDLE_TIMEOUT_SECS),
         }
     }
 }
@@ -2175,6 +2361,7 @@ impl Config {
     pub fn validate(&self) -> Result<(), ConfigError> {
         self.ui.validate()?;
         self.agent.validate()?;
+        self.agent.runs.validate()?;
         self.provider.validate()?;
         self.storage.validate()?;
         Ok(())
@@ -2988,6 +3175,72 @@ mod tests {
         assert_eq!(
             config.storage.max_log_bytes,
             DEFAULT_MAX_LOG_BYTES_MB * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn runs_are_off_by_default_and_merge_per_key() {
+        let defaults = RawConfig::default().into_config(&[]).unwrap().agent.runs;
+        assert!(!defaults.enabled);
+        assert_eq!(defaults.max_depth, DEFAULT_RUNS_MAX_DEPTH);
+
+        let mut base: RawConfig =
+            toml::from_str("[agent.runs]\nenabled = true\nmax_depth = 3\n").unwrap();
+        base.merge(toml::from_str("[agent.runs]\nmax_depth = 1\n").unwrap());
+        let runs = base.into_config(&[]).unwrap().agent.runs;
+        assert!(runs.enabled);
+        assert_eq!(runs.max_depth, 1);
+    }
+
+    #[test_case("allow_under_yolo" ; "new_name")]
+    #[test_case("inherit_yolo" ; "deprecated_alias")]
+    fn unattended_permissions_accepts_new_name_and_old_alias(value: &str) {
+        let raw: RawConfig = toml::from_str(&format!(
+            "[agent.runs]\nunattended_permissions = \"{value}\"\n"
+        ))
+        .unwrap();
+        assert_eq!(
+            raw.agent.runs.unattended_permissions,
+            Some(UnattendedMode::AllowUnderYolo)
+        );
+    }
+
+    #[test]
+    fn unattended_permissions_rejects_unknown_value() {
+        let err = toml::from_str::<RawConfig>("[agent.runs]\nunattended_permissions = \"nope\"\n");
+        assert!(err.is_err());
+    }
+
+    #[test_case("session_max_runs" ; "session_max_runs")]
+    #[test_case("max_agents" ; "max_agents")]
+    #[test_case("max_shells" ; "max_shells")]
+    #[test_case("max_shells_per_owner" ; "max_shells_per_owner")]
+    #[test_case("max_queue" ; "max_queue")]
+    #[test_case("spawn_per_minute" ; "spawn_per_minute")]
+    #[test_case("default_timeout_secs" ; "default_timeout_secs")]
+    #[test_case("max_timeout_secs" ; "max_timeout_secs")]
+    #[test_case("permission_timeout_secs" ; "permission_timeout_secs")]
+    #[test_case("max_retained" ; "max_retained")]
+    #[test_case("max_idle" ; "max_idle")]
+    #[test_case("idle_timeout_secs" ; "idle_timeout_secs")]
+    fn zero_rejected(key: &str) {
+        let raw: RawConfig = toml::from_str(&format!("[agent.runs]\n{key} = 0\n")).unwrap();
+        assert!(raw.into_config(&[]).unwrap().validate().is_err());
+    }
+
+    #[test]
+    fn runs_limit_defaults_match_the_design() {
+        let runs = RawConfig::default().into_config(&[]).unwrap().agent.runs;
+        assert_eq!(
+            (
+                runs.max_agents,
+                runs.max_shells,
+                runs.max_shells_per_owner,
+                runs.max_queue,
+                runs.spawn_per_minute,
+                runs.default_timeout_secs
+            ),
+            (4, 8, 4, 16, 10, 86_400)
         );
     }
 
