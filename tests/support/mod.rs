@@ -32,16 +32,32 @@ pub const DEADLINE: Duration = Duration::from_secs(30);
 /// The init.lua that turns the native runs on.
 pub const RUNS_INIT: &str = "maki.setup({ agent = { runs = { enabled = true } } })\n";
 
-const API_KEY_SUFFIX: &str = "_API_KEY";
 const BIND_FAILED: &str = "cannot bind the loopback provider";
+const CACHE_DIR: &str = "cache";
+const CONFIG_DIR: &str = "config";
 const CONTENT_LENGTH: &str = "content-length";
+const DATA_DIR: &str = "data";
+const HOME: &str = "HOME";
+const JOURNAL: &str = "journal.ndjson";
 const LOOPBACK: &str = "127.0.0.1:0";
 const LOG_EXTENSION: &str = "log";
+const PATH: &str = "PATH";
 const POLL: Duration = Duration::from_millis(20);
 const RUNS_DIR: &str = "runs";
 const SESSION_EXTENSION: &str = "jsonl";
 const SESSIONS_DIR: &str = "sessions";
-const STATE_HOME: &str = "XDG_STATE_HOME";
+const STATE_DIR: &str = "state";
+const TEMP_DIR: &str = "tmp";
+const TEMPDIR_FAILED: &str = "cannot create the sandbox";
+const TMP_DIR: &str = "TMPDIR";
+/// The variables that name the directories a user keeps, and the directory
+/// each one gets under the home of the sandbox.
+const USER_DIRS: &[(&str, &str)] = &[
+    ("XDG_CONFIG_HOME", CONFIG_DIR),
+    ("XDG_STATE_HOME", STATE_DIR),
+    ("XDG_DATA_HOME", DATA_DIR),
+    ("XDG_CACHE_HOME", CACHE_DIR),
+];
 
 /// A provider on loopback that answers every request from one script and
 /// keeps what the client sent.
@@ -179,10 +195,129 @@ pub fn text_sse(text: &str) -> String {
     out
 }
 
-/// A home of its own: nothing of the machine's is read, and nothing outside
-/// the temp dir is written.
-pub fn isolated_home() -> TempDir {
-    maki_providers::test_support::isolated_home()
+/// A home of its own: the child gets the directories below through its own
+/// environment, so two tests never share a state dir, the child never sees
+/// the machine's own directories or credentials, and the process the test
+/// runs in keeps the environment it had.
+pub struct Sandbox {
+    root: TempDir,
+}
+
+impl Sandbox {
+    /// The environment the spawned binary gets: the directories of this
+    /// sandbox, the mock's origin and the mock's key, and nothing else.
+    pub fn child_env(&self, provider: &MockProvider) -> Vec<(String, String)> {
+        let mut env = vec![
+            (
+                HOME.to_owned(),
+                self.root.path().to_string_lossy().into_owned(),
+            ),
+            (
+                TMP_DIR.to_owned(),
+                self.dir(TEMP_DIR).to_string_lossy().into_owned(),
+            ),
+        ];
+        for (var, dir) in USER_DIRS {
+            env.push((
+                (*var).to_owned(),
+                self.dir(dir).to_string_lossy().into_owned(),
+            ));
+        }
+        env.push((
+            maki_config::providers::base_url_env_var(MOCK_SLUG),
+            provider.base_url().to_owned(),
+        ));
+        env.push((MOCK_KEY_ENV.to_owned(), MOCK_KEY.to_owned()));
+        env
+    }
+
+    /// The state directory the binary keeps its sessions and its runs in.
+    pub fn state_dir(&self) -> PathBuf {
+        self.dir(STATE_DIR)
+    }
+
+    /// The directories holding a session's runs: `<state>/runs/<session>`.
+    pub fn run_dirs(&self) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let Ok(apps) = fs::read_dir(self.state_dir()) else {
+            return out;
+        };
+        for app in apps.flatten() {
+            let runs = app.path().join(RUNS_DIR);
+            let Ok(sessions) = fs::read_dir(&runs) else {
+                continue;
+            };
+            for session in sessions.flatten() {
+                out.push(session.path());
+            }
+        }
+        out
+    }
+
+    /// The log of every run under the state directory of the sandbox.
+    pub fn run_logs(&self) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        for dir in self.run_dirs() {
+            let Ok(entries) = fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().is_some_and(|ext| ext == LOG_EXTENSION) {
+                    out.push(path);
+                }
+            }
+        }
+        out
+    }
+
+    /// The transcripts of every session under the state directory of the
+    /// sandbox.
+    pub fn session_files(&self) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let Ok(apps) = fs::read_dir(self.state_dir()) else {
+            return out;
+        };
+        for app in apps.flatten() {
+            let sessions = app.path().join(SESSIONS_DIR);
+            let Ok(entries) = fs::read_dir(&sessions) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().is_some_and(|ext| ext == SESSION_EXTENSION) {
+                    out.push(path);
+                }
+            }
+        }
+        out
+    }
+
+    /// The journal of every session under the state directory of the sandbox.
+    pub fn run_journals(&self) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        for dir in self.run_dirs() {
+            let journal = dir.join(JOURNAL);
+            if journal.exists() {
+                out.push(journal);
+            }
+        }
+        out
+    }
+
+    fn dir(&self, dir: &str) -> PathBuf {
+        self.root.path().join(dir)
+    }
+}
+
+/// A sandbox of its own: a home, and the directories under it.
+pub fn sandbox() -> Sandbox {
+    let root = TempDir::new().expect(TEMPDIR_FAILED);
+    for (_, dir) in USER_DIRS {
+        fs::create_dir_all(root.path().join(dir)).expect(TEMPDIR_FAILED);
+    }
+    fs::create_dir_all(root.path().join(TEMP_DIR)).expect(TEMPDIR_FAILED);
+    Sandbox { root }
 }
 
 /// A directory the binary can run in, and the project config that turns the
@@ -193,88 +328,6 @@ pub fn project() -> TempDir {
     fs::create_dir_all(&config).expect("the project config dir");
     fs::write(config.join("init.lua"), RUNS_INIT).expect("the project init.lua");
     dir
-}
-
-/// The environment the spawned binary gets: the mock's origin and key, and
-/// none of the machine's provider keys.
-pub fn child_env(provider: &MockProvider) -> Vec<(String, String)> {
-    vec![
-        (
-            maki_config::providers::base_url_env_var(MOCK_SLUG),
-            provider.base_url().to_owned(),
-        ),
-        (MOCK_KEY_ENV.to_owned(), MOCK_KEY.to_owned()),
-    ]
-}
-
-/// The directories holding a session's runs: `<state>/runs/<session>`.
-pub fn run_dirs() -> Vec<PathBuf> {
-    let state_home = PathBuf::from(std::env::var(STATE_HOME).expect("the isolated state home"));
-    let mut out = Vec::new();
-    let Ok(apps) = fs::read_dir(&state_home) else {
-        return out;
-    };
-    for app in apps.flatten() {
-        let runs = app.path().join(RUNS_DIR);
-        let Ok(sessions) = fs::read_dir(&runs) else {
-            continue;
-        };
-        for session in sessions.flatten() {
-            out.push(session.path());
-        }
-    }
-    out
-}
-
-/// The log of every run under the isolated state home.
-pub fn run_logs() -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    for dir in run_dirs() {
-        let Ok(entries) = fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().is_some_and(|ext| ext == LOG_EXTENSION) {
-                out.push(path);
-            }
-        }
-    }
-    out
-}
-
-/// The transcripts of every session under the isolated state home.
-pub fn session_files() -> Vec<PathBuf> {
-    let state_home = PathBuf::from(std::env::var(STATE_HOME).expect("the isolated state home"));
-    let mut out = Vec::new();
-    let Ok(apps) = fs::read_dir(&state_home) else {
-        return out;
-    };
-    for app in apps.flatten() {
-        let sessions = app.path().join(SESSIONS_DIR);
-        let Ok(entries) = fs::read_dir(&sessions) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().is_some_and(|ext| ext == SESSION_EXTENSION) {
-                out.push(path);
-            }
-        }
-    }
-    out
-}
-
-/// The journal of every session under the isolated state home.
-pub fn run_journals() -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    for dir in run_dirs() {
-        let journal = dir.join("journal.ndjson");
-        if journal.exists() {
-            out.push(journal);
-        }
-    }
-    out
 }
 
 /// Waits for `condition` to hold, polling until the deadline.
@@ -309,8 +362,8 @@ pub struct Binary {
 }
 
 impl Binary {
-    /// Starts the binary with `args`, in `cwd`, with `env` added to the
-    /// environment it inherits.
+    /// Starts the binary with `args`, in `cwd`, and with `env` as its whole
+    /// environment.
     pub fn spawn(args: &[String], cwd: &Path, env: &[(String, String)]) -> Self {
         Self::start(args, cwd, env, false)
     }
@@ -323,13 +376,13 @@ impl Binary {
     fn start(args: &[String], cwd: &Path, env: &[(String, String)], stdin: bool) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_maki"));
         command.args(args).current_dir(cwd);
-        for (key, _) in std::env::vars_os() {
-            if key
-                .to_str()
-                .is_some_and(|key| key.ends_with(API_KEY_SUFFIX))
-            {
-                command.env_remove(key);
-            }
+        // The child gets the environment the test hands it and nothing of the
+        // machine the test runs on: no credential, no directory, no setting
+        // of its own. The path to the tools stays, since a run is a shell
+        // command.
+        command.env_clear();
+        if let Some(path) = std::env::var_os(PATH) {
+            command.env(PATH, path);
         }
         for (key, value) in env {
             command.env(key, value);

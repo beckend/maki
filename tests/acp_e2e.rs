@@ -31,10 +31,10 @@ fn request(id: i64, method: &str, params: Value) -> String {
 
 #[test]
 fn the_acp_server_answers_a_prompt_over_ndjson() {
-    let _home = support::isolated_home();
+    let sandbox = support::sandbox();
     let project = support::project();
     let provider = MockProvider::serve(|_index, _body| support::text_sse(ANSWER));
-    let mut binary = Binary::with_stdin(&args(), project.path(), &support::child_env(&provider));
+    let mut binary = Binary::with_stdin(&args(), project.path(), &sandbox.child_env(&provider));
 
     binary.write_line(&request(
         1,

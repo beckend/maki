@@ -69,19 +69,19 @@ fn provider_for(command: &'static str) -> MockProvider {
 
 #[test]
 fn a_run_started_through_the_binary_keeps_its_log() {
-    let _home = support::isolated_home();
+    let sandbox = support::sandbox();
     let project = support::project();
     let provider = provider_for(PRINT_COMMAND);
 
     let outcome = Binary::spawn(
         &args(&[], JOIN_TIMEOUT, PROMPT),
         project.path(),
-        &support::child_env(&provider),
+        &sandbox.child_env(&provider),
     )
     .finish();
 
     assert_eq!(outcome.code, Some(0), "stderr: {}", outcome.stderr);
-    let logs = support::run_logs();
+    let logs = sandbox.run_logs();
     assert_eq!(logs.len(), 1, "one run log: {logs:?}");
     let log = fs::read_to_string(&logs[0]).expect("the run log");
     assert!(
@@ -103,14 +103,14 @@ fn a_run_started_through_the_binary_keeps_its_log() {
 
 #[test]
 fn a_run_that_outlives_the_join_timeout_is_stopped() {
-    let _home = support::isolated_home();
+    let sandbox = support::sandbox();
     let project = support::project();
     let provider = provider_for(SLEEP_COMMAND);
 
     let outcome = Binary::spawn(
         &args(&[], SHORT_JOIN_TIMEOUT, PROMPT),
         project.path(),
-        &support::child_env(&provider),
+        &sandbox.child_env(&provider),
     )
     .finish();
 
@@ -126,30 +126,30 @@ fn a_run_that_outlives_the_join_timeout_is_stopped() {
 
 #[test]
 fn a_run_survives_the_death_of_its_session_and_comes_back() {
-    let _home = support::isolated_home();
+    let sandbox = support::sandbox();
     let project = support::project();
     let first = provider_for(SLEEP_COMMAND);
 
     let binary = Binary::spawn(
         &args(&[], JOIN_TIMEOUT, PROMPT),
         project.path(),
-        &support::child_env(&first),
+        &sandbox.child_env(&first),
     );
     // The run started and the session reached the disk, so the next start can
     // continue it and find the journal it left.
     assert!(
-        support::wait_for(|| !support::run_logs().is_empty()),
+        support::wait_for(|| !sandbox.run_logs().is_empty()),
         "the run started"
     );
     assert!(
-        support::wait_for(|| !support::session_files().is_empty()),
+        support::wait_for(|| !sandbox.session_files().is_empty()),
         "the session reached the disk"
     );
     let outcome = binary.kill();
     assert_ne!(outcome.code, Some(0), "the process died hard");
 
     // The journal kept the run, so the next start knows about it.
-    let journals = support::run_journals();
+    let journals = sandbox.run_journals();
     assert_eq!(journals.len(), 1, "one journal: {journals:?}");
     let journal = fs::read_to_string(&journals[0]).expect("the journal");
     assert!(
@@ -168,7 +168,7 @@ fn a_run_survives_the_death_of_its_session_and_comes_back() {
     let outcome = Binary::spawn(
         &args(&["--continue"], JOIN_TIMEOUT, LIST_PROMPT),
         project.path(),
-        &support::child_env(&second),
+        &sandbox.child_env(&second),
     )
     .finish();
 
@@ -193,6 +193,6 @@ fn a_run_survives_the_death_of_its_session_and_comes_back() {
         "the journal settled the run: {journal}"
     );
     // The log of the run the dead process started is still there.
-    let logs = support::run_logs();
+    let logs = sandbox.run_logs();
     assert_eq!(logs.len(), 1, "the run log survived: {logs:?}");
 }
