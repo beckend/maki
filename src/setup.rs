@@ -208,6 +208,9 @@ pub fn install_panic_log_hook() {
             panic.location = location.as_deref().unwrap_or("<unknown>"),
             "panic occurred"
         );
+        if std::thread::current().name() == Some("main") {
+            maki_agent::runs::shutdown_all();
+        }
         prev(info);
     }));
 }

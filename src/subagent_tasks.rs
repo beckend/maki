@@ -290,6 +290,7 @@ mod tests {
                 name: DESCRIPTION.into(),
                 prompt: Some(PROMPT.into()),
                 model: None,
+                subagent_type: None,
                 opts: None,
                 answer_tx: None,
                 control: Arc::clone(control),

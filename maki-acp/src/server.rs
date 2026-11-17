@@ -1008,7 +1008,12 @@ fn start_event_pump(
                                 );
                                 continue;
                             };
-                            let title = format!("{}: {scope}", info.name);
+                            // A background run is named by its handle too.
+                            let title = if info.parent_tool_use_id.starts_with("ag-") {
+                                format!("{} ({}): {scope}", info.name, info.parent_tool_use_id)
+                            } else {
+                                format!("{}: {scope}", info.name)
+                            };
                             (info.parent_tool_use_id, title, Some(answer_tx))
                         }
                         None => (id, scope, None),
@@ -1577,6 +1582,7 @@ mod tests {
             name: SUBAGENT_NAME.to_owned(),
             prompt: None,
             model: None,
+            subagent_type: None,
             opts: None,
             answer_tx,
             control: Arc::default(),

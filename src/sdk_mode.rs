@@ -1140,6 +1140,11 @@ impl EventPump {
             | AgentEvent::Nudge
             | AgentEvent::Notice { .. }
             | AgentEvent::PromptProgress { .. }
+            | AgentEvent::RunStarted { .. }
+            | AgentEvent::RunStateChanged { .. }
+            | AgentEvent::RunNotice { .. }
+            | AgentEvent::RunFinished { .. }
+            | AgentEvent::PermissionWithdrawn { .. }
             | AgentEvent::StreamClosed => {}
             // A later kept message overwrites this with its own answer, so the
             // reason is the result only when every message was dropped.
@@ -1964,6 +1969,7 @@ mod tests {
                 name: id.into(),
                 prompt: None,
                 model: None,
+                subagent_type: None,
                 opts: None,
                 answer_tx: None,
                 control: Arc::default(),

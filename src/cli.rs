@@ -103,6 +103,15 @@ pub struct Cli {
     #[arg(long)]
     pub verbose: bool,
 
+    /// Seconds --print waits for background runs before stopping them
+    /// (default 600, or MAKI_JOIN_TIMEOUT_SECS)
+    #[arg(long, value_name = "SECS")]
+    pub join_timeout: Option<u64>,
+
+    /// Do not print run transition lines on stderr in --print mode
+    #[arg(long)]
+    pub quiet_runs: bool,
+
     /// Resume the most recent session in this directory
     #[arg(short = 'c', long = "continue")]
     pub continue_session: bool,
@@ -320,7 +329,7 @@ impl Cli {
     /// `--verbose` stay out, because Claude Code wrappers pass them on every
     /// path. `every_visible_flag_is_placed` makes each new flag pick a side,
     /// and the matrix in `site/docs/content/cli/_index.md` is a copy by hand.
-    fn scoped_flags(&self) -> [ScopedFlag; 5] {
+    fn scoped_flags(&self) -> [ScopedFlag; 6] {
         let host_prompt = self.host_prompt();
         [
             ScopedFlag {
@@ -346,6 +355,11 @@ impl Cli {
             ScopedFlag {
                 name: "image",
                 set: !self.images.is_empty(),
+                paths: &[RunPath::Print],
+            },
+            ScopedFlag {
+                name: "join-timeout",
+                set: self.join_timeout.is_some(),
                 paths: &[RunPath::Print],
             },
         ]
@@ -608,6 +622,7 @@ mod tests {
         "fork-session",
         "include-partial-messages",
         "background-timeout",
+        "quiet-runs",
     ];
 
     #[test_case("Read", "read")]
@@ -688,6 +703,9 @@ mod tests {
     #[test_case(&["--max-turns", "3"], Some("max-turns") ; "tui_max_turns")]
     #[test_case(&["-p", "--permission-mode", "plan"], Some("permission-mode") ; "print_permission_mode")]
     #[test_case(&["--image", "a.png"], Some("image") ; "tui_image")]
+    #[test_case(&["--join-timeout", "30"], Some("join-timeout") ; "tui_join_timeout")]
+    #[test_case(&["-p", "--join-timeout", "30"], None ; "print_join_timeout")]
+    #[test_case(&["-p", "--input-format", "stream-json", "--join-timeout", "30"], Some("join-timeout") ; "sdk_join_timeout")]
     fn run_path_flag_check(args: &[&str], rejected: Option<&'static str>) {
         let checked = parse(args).check_run_path_flags();
 
