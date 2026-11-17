@@ -200,8 +200,13 @@ impl Manager {
     /// A revision another process is reading keeps its shared lock, and the
     /// exclusive lock here fails rather than waits, so a live session's
     /// directory is skipped instead of deleted out from under it.
+    ///
+    /// The wait is bounded: a child that inherited the lock file keeps it
+    /// until it execs, and a git of another package is such a child. The
+    /// retrying take lets that window pass without turning a live reader into
+    /// a deleted directory.
     fn prune_package(&self, name: &str, current: &str, failures: &mut Vec<ManagerError>) {
-        let _package_guard = match Lock::acquire(&paths::package_lock(&self.site, name)) {
+        let _package_guard = match Lock::acquire_retrying(&paths::package_lock(&self.site, name)) {
             Ok(guard) => guard,
             Err(LockError::Held { .. }) => {
                 tracing::debug!(package = name, "package is being changed, skipping prune");
@@ -232,7 +237,7 @@ impl Manager {
             // keep the orphaned inode while the next process locks a fresh file
             // at the same path, and both would think they are alone. An empty
             // file per dead revision is the cheaper problem.
-            match Lock::acquire(&paths::revision_lock(&self.site, name, revision)) {
+            match Lock::acquire_retrying(&paths::revision_lock(&self.site, name, revision)) {
                 Ok(_guard) => {
                     let dir = paths::revision_dir(&self.site, name, revision);
                     if let Err(source) = fs::remove_dir_all(&dir) {
@@ -438,8 +443,14 @@ impl Manager {
         Ok(())
     }
 
+    /// Removes a package and every revision of it.
+    ///
+    /// The locks are taken with the bounded retry: a child that inherited the
+    /// lock file keeps it until it execs, and the git of another package is
+    /// such a child, so a lock that is only held for that window must not
+    /// read as a live session.
     fn remove_files(&self, name: &str) -> Result<(), ManagerError> {
-        let _package_guard = Lock::acquire(&paths::package_lock(&self.site, name))?;
+        let _package_guard = Lock::acquire_retrying(&paths::package_lock(&self.site, name))?;
         let (dirs, failures) = self.package_dirs(name);
         if let Some(failure) = failures.into_iter().next() {
             return Err(failure);
@@ -447,7 +458,9 @@ impl Manager {
         let revision_guards = dirs
             .revisions
             .iter()
-            .map(|revision| Lock::acquire(&paths::revision_lock(&self.site, name, revision)))
+            .map(|revision| {
+                Lock::acquire_retrying(&paths::revision_lock(&self.site, name, revision))
+            })
             .collect::<Result<Vec<_>, _>>()?;
         let root = paths::package_root(&self.site, name);
         let trash = paths::package_trash(&self.site, name);

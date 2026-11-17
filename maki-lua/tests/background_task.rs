@@ -5,6 +5,7 @@
 mod common;
 
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::mpsc::sync_channel;
 use std::thread;
 
@@ -246,7 +247,6 @@ fn a_background_task_returns_a_receipt_and_its_reply_arrives_as_the_notice() {
     // The call id names the session the events are routed to, and the
     // registry behind it is process-wide, so it carries the chat's own id.
     let call_id = format!("{CALL_ID}-{}", chat.id);
-    let second_call_id = format!("{SECOND_CALL_ID}-{}", chat.id);
     let parked = Parked::new(RESULT);
     let (_run, run_token) = CancelToken::new();
     let (mut ctx, _events) = call_ctx(&host.reg, chat.id, &run_token, &call_id);
@@ -317,6 +317,14 @@ fn a_background_task_waiting_for_a_slot_returns_its_receipt_at_once() {
     }
 }
 
+/// The one registry at a time, in the process.
+///
+/// A plugin load replaces the tools of its plugin name, so two cases that
+/// load the same plugin into the shared registry take turns at it: the load
+/// that comes last owns the tools, and a call then runs in the Lua state of
+/// the other case, whose task tab is the one its prompt reaches.
+static GLOBAL_REGISTRY: Mutex<()> = Mutex::new(());
+
 /// A ctx session has its own answer channel, so its prompt reaches the user.
 /// One opened inside another subagent is denied instead, because the answer
 /// would go to the outer one. The subagent dispatches through the global
@@ -324,6 +332,7 @@ fn a_background_task_waiting_for_a_slot_returns_its_receipt_at_once() {
 #[test_case(false ; "top_level_session_asks_the_user")]
 #[test_case(true ; "nested_session_is_denied_as_unattended")]
 fn a_subagent_asks_for_permission_only_where_the_answer_comes_back(nested: bool) {
+    let _registry = GLOBAL_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
     let reg = Arc::clone(ToolRegistry::global_arc());
     let mut host = Host::task(Arc::clone(&reg));
     host.host.load_source(GUARDED_PLUGIN, GUARDED_SRC).unwrap();
@@ -393,7 +402,6 @@ fn ctx_background_needs_the_agent_permission(agent: bool) {
     // The call id names the session the events are routed to, and the
     // registry behind it is process-wide, so it carries the chat's own id.
     let call_id = format!("{CALL_ID}-{}", chat.id);
-    let second_call_id = format!("{SECOND_CALL_ID}-{}", chat.id);
     let (_run, run_token) = CancelToken::new();
     let (ctx, _events) = call_ctx(&host.reg, chat.id, &run_token, &call_id);
 
@@ -423,7 +431,6 @@ fn a_background_deadline_needs_the_agent_permission(agent: bool) {
     // The call id names the session the events are routed to, and the
     // registry behind it is process-wide, so it carries the chat's own id.
     let call_id = format!("{CALL_ID}-{}", chat.id);
-    let second_call_id = format!("{SECOND_CALL_ID}-{}", chat.id);
     let (_run, run_token) = CancelToken::new();
     let (ctx, _events) = call_ctx(&host.reg, chat.id, &run_token, &call_id);
 
@@ -447,7 +454,6 @@ fn ctx_background_refuses_a_subagents_call() {
     // The call id names the session the events are routed to, and the
     // registry behind it is process-wide, so it carries the chat's own id.
     let call_id = format!("{CALL_ID}-{}", chat.id);
-    let second_call_id = format!("{SECOND_CALL_ID}-{}", chat.id);
     let subagent = SessionMailbox::register(MakiId::generate());
     let (_run, run_token) = CancelToken::new();
     let (mut ctx, _events) = call_ctx(&host.reg, chat.id, &run_token, &call_id);
@@ -475,7 +481,6 @@ fn ctx_background_refuses_a_call_nested_in_another_tool() {
     // The call id names the session the events are routed to, and the
     // registry behind it is process-wide, so it carries the chat's own id.
     let call_id = format!("{CALL_ID}-{}", chat.id);
-    let second_call_id = format!("{SECOND_CALL_ID}-{}", chat.id);
     let (_run, run_token) = CancelToken::new();
     let (mut ctx, _events) = call_ctx(&host.reg, chat.id, &run_token, &call_id);
     ctx.tool_use_id = None;
@@ -512,7 +517,6 @@ fn a_message_reaches_a_running_background_task_at_its_next_turn() {
     // The call id names the session the events are routed to, and the
     // registry behind it is process-wide, so it carries the chat's own id.
     let call_id = format!("{CALL_ID}-{}", chat.id);
-    let second_call_id = format!("{SECOND_CALL_ID}-{}", chat.id);
     let parked = Parked::new(RESULT);
     let (_run, run_token) = CancelToken::new();
     let (mut ctx, _events) = call_ctx(&host.reg, chat.id, &run_token, &call_id);
@@ -587,7 +591,6 @@ fn an_interrupt_cuts_a_background_tasks_turn_and_it_goes_on() {
     // The call id names the session the events are routed to, and the
     // registry behind it is process-wide, so it carries the chat's own id.
     let call_id = format!("{CALL_ID}-{}", chat.id);
-    let second_call_id = format!("{SECOND_CALL_ID}-{}", chat.id);
     let parked = Parked::new(RESULT);
     let (_run, run_token) = CancelToken::new();
     let (mut ctx, _events) = call_ctx(&host.reg, chat.id, &run_token, &call_id);
@@ -624,7 +627,6 @@ fn a_message_is_refused_by_a_task_the_user_just_stopped() {
     // The call id names the session the events are routed to, and the
     // registry behind it is process-wide, so it carries the chat's own id.
     let call_id = format!("{CALL_ID}-{}", chat.id);
-    let second_call_id = format!("{SECOND_CALL_ID}-{}", chat.id);
     let parked = Parked::new(RESULT);
     let (_run, run_token) = CancelToken::new();
     let (mut ctx, _events) = call_ctx(&host.reg, chat.id, &run_token, &call_id);
@@ -674,7 +676,6 @@ fn a_task_moved_without_allow_background_has_no_message_tool_and_still_reports()
     // The call id names the session the events are routed to, and the
     // registry behind it is process-wide, so it carries the chat's own id.
     let call_id = format!("{CALL_ID}-{}", chat.id);
-    let second_call_id = format!("{SECOND_CALL_ID}-{}", chat.id);
     let parked = Parked::new(RESULT);
     let (_run, run_token) = CancelToken::new();
     let (mut ctx, _events) = call_ctx(&host.reg, chat.id, &run_token, &call_id);
@@ -719,7 +720,6 @@ fn the_tasks_of_a_moved_batch_are_reached_by_the_batchs_id_or_their_own() {
     // The call id names the session the events are routed to, and the
     // registry behind it is process-wide, so it carries the chat's own id.
     let call_id = format!("{CALL_ID}-{}", chat.id);
-    let second_call_id = format!("{SECOND_CALL_ID}-{}", chat.id);
     let parked = Parked::new(RESULT);
     let (_run, run_token) = CancelToken::new();
     let (mut ctx, _events) = call_ctx(&host.reg, chat.id, &run_token, &call_id);
