@@ -1,5 +1,5 @@
 pub mod agent_autocmd;
-mod api;
+pub mod api;
 mod background;
 pub mod chunks;
 pub mod docs;

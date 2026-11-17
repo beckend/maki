@@ -4348,7 +4348,7 @@ impl LuaRuntime {
                 });
                 (
                     tool,
-                    ToolSource {
+                    ToolSource::Lua {
                         plugin: Arc::clone(&name),
                     },
                 )
@@ -6416,8 +6416,8 @@ mod tests {
         assert_eq!(offered, FINAL_DRAIN_BUDGET);
     }
 
-    #[test]
-    fn from_lua_value_plain_string() {
+    #[tokio::test]
+    async fn from_lua_value_plain_string() {
         let lua = test_lua();
         let val = LuaValue::String(lua.create_string("ok").unwrap());
         let reply = ToolCallReply::from_lua_value(&lua, &val);
@@ -6426,8 +6426,8 @@ mod tests {
         assert!(reply.header.is_none());
     }
 
-    #[test]
-    fn from_lua_value_table_with_body_and_header() {
+    #[tokio::test]
+    async fn from_lua_value_table_with_body_and_header() {
         let lua = test_lua();
         let body_handle = lua.create_userdata(make_buf_handle("body line")).unwrap();
         let hdr_handle = lua.create_userdata(make_buf_handle("hdr line")).unwrap();
@@ -6441,8 +6441,8 @@ mod tests {
         assert_eq!(reply.header.unwrap().first_line_text(), "hdr line");
     }
 
-    #[test]
-    fn from_lua_value_missing_llm_output_still_extracts_body() {
+    #[tokio::test]
+    async fn from_lua_value_missing_llm_output_still_extracts_body() {
         let lua = test_lua();
         let t = lua.create_table().unwrap();
         t.set("body", lua.create_userdata(make_buf_handle("x")).unwrap())
@@ -6452,8 +6452,8 @@ mod tests {
         assert!(reply.snapshot.is_some());
     }
 
-    #[test]
-    fn task_scope_clears_bufs_on_drop() {
+    #[tokio::test]
+    async fn task_scope_clears_bufs_on_drop() {
         let lua = Lua::new();
         let scope = TaskScope::new(&lua, task_cell(None));
         let handle = Arc::clone(scope.handle());
@@ -6463,8 +6463,8 @@ mod tests {
         assert!(lock_cell(&handle).bufs.live_buf().is_none());
     }
 
-    #[test]
-    fn task_scope_clears_only_its_jobs_on_drop() {
+    #[tokio::test]
+    async fn task_scope_clears_only_its_jobs_on_drop() {
         let lua = Lua::new();
         let scope = TaskScope::new(&lua, task_cell(None));
         let task_owner = JobOwner::Task(lock_cell(scope.handle()).id);
@@ -6637,8 +6637,8 @@ mod tests {
         TaskCell::new(CancelToken::none(), None, live)
     }
 
-    #[test]
-    fn with_live_ctx_follows_task_live_field() {
+    #[tokio::test]
+    async fn with_live_ctx_follows_task_live_field() {
         let lua = Lua::new();
 
         let (tx, _rx) = unbounded_channel();
@@ -6736,8 +6736,8 @@ mod tests {
     const PACER_LIVE: usize = 3 * MIB;
     const PACER_GARBAGE: usize = MIB;
 
-    #[test]
-    fn gc_pacer_rescans_a_big_live_heap_only_once_it_grows() {
+    #[tokio::test]
+    async fn gc_pacer_rescans_a_big_live_heap_only_once_it_grows() {
         let lua = Lua::new();
         // Luau's own GC would free memory behind the pacer's back. A full
         // collect turns it back on, so it gets stopped again after each one.
@@ -6987,8 +6987,8 @@ mod tests {
             .await;
     }
 
-    #[test]
-    fn extract_restore_reply_userdata_returns_body_only() {
+    #[tokio::test]
+    async fn extract_restore_reply_userdata_returns_body_only() {
         let lua = test_lua();
         let handle = make_buf_handle("restored line");
         let ud = lua.create_userdata(handle).unwrap();
@@ -6998,8 +6998,8 @@ mod tests {
         assert!(reply.header.is_none());
     }
 
-    #[test]
-    fn extract_restore_reply_table_with_body_and_header() {
+    #[tokio::test]
+    async fn extract_restore_reply_table_with_body_and_header() {
         let lua = test_lua();
         let body = lua.create_userdata(make_buf_handle("body")).unwrap();
         let header = lua.create_userdata(make_buf_handle("header")).unwrap();
@@ -7039,8 +7039,8 @@ mod tests {
             .await;
     }
 
-    #[test]
-    fn enqueue_async_task_missing_spawn_queue_errors() {
+    #[tokio::test]
+    async fn enqueue_async_task_missing_spawn_queue_errors() {
         let lua = Lua::new();
         let key = lua
             .create_registry_value(lua.create_function(|_, _: ()| Ok(())).unwrap())
@@ -7049,8 +7049,8 @@ mod tests {
         assert!(err.to_string().contains(SPAWN_QUEUE_NOT_INIT));
     }
 
-    #[test]
-    fn enqueue_async_task_routes_to_inline_spawn_when_set() {
+    #[tokio::test]
+    async fn enqueue_async_task_routes_to_inline_spawn_when_set() {
         let lua = enqueue_test_lua();
         let scope = TaskScope::new(&lua, TaskCell::new(CancelToken::none(), None, None));
         let _active = scope.enter();
@@ -7066,8 +7066,8 @@ mod tests {
         assert_eq!(cell.inline_spawn.as_ref().unwrap().len(), 1);
     }
 
-    #[test]
-    fn enqueue_async_task_works_without_task_ctx() {
+    #[tokio::test]
+    async fn enqueue_async_task_works_without_task_ctx() {
         let lua = enqueue_test_lua();
         enqueue_async_task(&lua, SPAWN_PLUGIN, enqueue_dummy(&lua)).unwrap();
 
@@ -7077,8 +7077,8 @@ mod tests {
         assert!(queued.owner.is_none());
     }
 
-    #[test]
-    fn enqueue_async_task_inherits_cancel_token() {
+    #[tokio::test]
+    async fn enqueue_async_task_inherits_cancel_token() {
         let lua = enqueue_test_lua();
         let (trigger, token) = CancelToken::new();
         let scope = TaskScope::new(&lua, TaskCell::new(token, None, None));
@@ -7098,8 +7098,8 @@ mod tests {
     /// Without this a `run_command` cycle could hop through `maki.async.run`
     /// and start over at depth 0, and a window opened from it would land in
     /// the wrong tab.
-    #[test]
-    fn enqueue_async_task_inherits_lineage() {
+    #[tokio::test]
+    async fn enqueue_async_task_inherits_lineage() {
         let lua = enqueue_test_lua();
         let lineage = Lineage {
             command_depth: 3,
@@ -7157,8 +7157,8 @@ mod tests {
         assert_eq!(lua.globals().get::<bool>(SAW).unwrap(), narrowed);
     }
 
-    #[test]
-    fn enqueue_async_task_uses_fresh_deadline_regardless_of_parent() {
+    #[tokio::test]
+    async fn enqueue_async_task_uses_fresh_deadline_regardless_of_parent() {
         let lua = enqueue_test_lua();
         let parent_deadline = Instant::now() - Duration::from_secs(10);
         let scope = TaskScope::new(
@@ -7178,8 +7178,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn scope_drop_defers_watcher_clear_until_owned_tasks_release() {
+    #[tokio::test]
+    async fn scope_drop_defers_watcher_clear_until_owned_tasks_release() {
         use crate::api::ui::buf::HandlerSlot;
 
         let lua = enqueue_test_lua();
@@ -7297,8 +7297,8 @@ mod tests {
         wake_or_fail(local).await;
     }
 
-    #[test]
-    fn spawned_task_lives_with_its_plugin_not_its_caller() {
+    #[tokio::test]
+    async fn spawned_task_lives_with_its_plugin_not_its_caller() {
         let lua = spawn_test_lua();
         let (trigger, token) = CancelToken::new();
         let mut cell = TaskCell::new(token, Some(Instant::now()), None);
@@ -7496,8 +7496,8 @@ mod tests {
     /// Killing at the first armed safepoint is what froze batch's children
     /// as in-progress after esc; never killing at all would leave a core
     /// spinning, which [`WATCHDOG_TEST_TIMEOUT`] catches.
-    #[test]
-    fn stale_cancelled_handle_aborts_callback_after_the_grace() {
+    #[tokio::test]
+    async fn stale_cancelled_handle_aborts_callback_after_the_grace() {
         let (lua, _watchdog) = watchdog_lua(false);
         lua.set_app_data::<TaskHandle>(cancelled_handle());
 
@@ -7509,8 +7509,8 @@ mod tests {
 
     /// A healthy poke must leave nothing armed, or the first poke after esc
     /// kills instantly instead of granting the grace.
-    #[test]
-    fn kill_grace_is_armed_once_then_renewed_per_execution_slice() {
+    #[tokio::test]
+    async fn kill_grace_is_armed_once_then_renewed_per_execution_slice() {
         let (trigger, token) = CancelToken::new();
         let mut cell = TaskCell::new(token, None, None);
         let start = Instant::now();
@@ -7544,8 +7544,8 @@ mod tests {
 
     /// A doom that lifts (a handler extending its own deadline) must take
     /// its stamp with it, or the next cancel kills with no grace at all.
-    #[test]
-    fn a_lifted_doom_disarms_the_grace() {
+    #[tokio::test]
+    async fn a_lifted_doom_disarms_the_grace() {
         let start = Instant::now();
         let mut cell = TaskCell::new(CancelToken::none(), Some(start), None);
         assert_eq!(
@@ -7771,8 +7771,8 @@ mod tests {
     /// it fires inline, whether a plugin or another hook armed it. The nested
     /// case also pins the lock discipline: `fire_cancel_hooks` must not hold
     /// the cell across a hook.
-    #[test]
-    fn cancel_hook_registered_after_the_cancel_fires_inline() {
+    #[tokio::test]
+    async fn cancel_hook_registered_after_the_cancel_fires_inline() {
         let lua = Lua::new();
         let scope = TaskScope::new(&lua, TaskCell::new(cancelled_token(), None, None));
         let _active = scope.enter();
@@ -7919,8 +7919,8 @@ mod tests {
     /// With a sibling's handle in app_data the hook would repaint the
     /// sibling's bufs. The sibling has to get app_data back once the poll is
     /// over, and its own hooks must not ride someone else's cancel.
-    #[test]
-    fn cancel_hook_runs_under_its_own_task_handle() {
+    #[tokio::test]
+    async fn cancel_hook_runs_under_its_own_task_handle() {
         let lua = Lua::new();
         let (trigger, scope) = live_scope(&lua);
         let (seen_tx, seen_rx) = sync_channel(1);
@@ -8028,8 +8028,8 @@ mod tests {
     /// re-enters `fire_cancel_hooks` from inside itself. That must terminate
     /// and leave nothing unfired; where the new hook lands among the queued
     /// ones is not a promise anyone can lean on.
-    #[test]
-    fn cancel_hook_registered_mid_fire_still_fires_every_hook_once() {
+    #[tokio::test]
+    async fn cancel_hook_registered_mid_fire_still_fires_every_hook_once() {
         let lua = Lua::new();
         let (trigger, scope) = live_scope(&lua);
         let _active = scope.enter();
@@ -8202,8 +8202,8 @@ mod tests {
     /// Esc on an async tool whose deadline also lapsed must say "cancelled",
     /// not "timed out after 0s", and must reply at once: the handler already
     /// returned, so there is nothing left to clean up.
-    #[test]
-    fn dispatch_async_cancel_outranks_deadline_with_no_grace() {
+    #[tokio::test]
+    async fn dispatch_async_cancel_outranks_deadline_with_no_grace() {
         let cell = TaskCell::new(cancelled_token(), Some(Instant::now()), None);
 
         let (result, elapsed) = drive_dispatch(cell);
@@ -8470,8 +8470,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn delivery_scope_refuses_job_ownership() {
+    #[tokio::test]
+    async fn delivery_scope_refuses_job_ownership() {
         let lua = Lua::new();
 
         let delivery = TaskScope::delivery(&lua);
@@ -8486,8 +8486,8 @@ mod tests {
         assert_eq!(job_task_id(&lua), active_task_id(&lua));
     }
 
-    #[test]
-    fn fresh_task_scope_shields_callback_from_stale_cancelled_handle() {
+    #[tokio::test]
+    async fn fresh_task_scope_shields_callback_from_stale_cancelled_handle() {
         let (lua, _watchdog) = watchdog_lua(false);
         lua.set_app_data::<TaskHandle>(cancelled_handle());
 
@@ -8497,9 +8497,8 @@ mod tests {
 
         assert!(result.unwrap());
     }
-
-    #[test]
-    fn shutdown_flag_aborts_callback_even_with_fresh_scope() {
+    #[tokio::test]
+    async fn shutdown_flag_aborts_callback_even_with_fresh_scope() {
         let (lua, _watchdog) = watchdog_lua(true);
 
         let scope = TaskScope::detached(&lua);
@@ -8511,8 +8510,8 @@ mod tests {
 
     /// Shutdown is checked before the task cell, so a reload or a quit
     /// never queues behind the cleanup grace of every cancelled runaway.
-    #[test]
-    fn shutdown_outranks_the_cleanup_grace() {
+    #[tokio::test]
+    async fn shutdown_outranks_the_cleanup_grace() {
         let (lua, _watchdog) = watchdog_lua(true);
         lua.set_app_data::<TaskHandle>(cancelled_handle());
 
@@ -8528,8 +8527,8 @@ mod tests {
     /// JIT-compiled code must still hit the interrupt, and the timeout
     /// path gets the same cleanup grace as the cancel path: a timed-out
     /// handler also has children to settle and a buf to rerender.
-    #[test]
-    fn jit_busy_loop_killed_a_grace_after_the_deadline() {
+    #[tokio::test]
+    async fn jit_busy_loop_killed_a_grace_after_the_deadline() {
         let (lua, _watchdog) = watchdog_lua(false);
         install_compiler(&lua, true);
 
@@ -8587,8 +8586,8 @@ mod tests {
 
     /// Re-decided on every event and call, so without the dedup the user would
     /// see the same gap for as long as it lasts.
-    #[test]
-    fn a_permission_gap_is_shown_once_per_plugin_per_subject() {
+    #[tokio::test]
+    async fn a_permission_gap_is_shown_once_per_plugin_per_subject() {
         let lua = Lua::new();
         let (ui_tx, mut ui_rx) = unbounded_channel();
         lua.set_app_data(HostUi(Some(ui_tx)));

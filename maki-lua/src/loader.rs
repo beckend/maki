@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use include_dir::{Dir, File, include_dir};
 use maki_agent::permissions::{PluginRuleStore, carries_builtin_defaults};
-use maki_agent::tools::ToolRegistry;
+use maki_agent::tools::{ToolRegistry, ToolSource};
 use maki_agent::{Cutter, SessionEndReason};
 use maki_config::{GatedFile, PluginsConfig, ProjectConfig, RawConfig};
 use maki_providers::plugin::{DeclAuthority, keep_granted};
@@ -871,7 +871,7 @@ impl PluginHost {
         let snapshot = self.registry.iter();
         let names: Vec<String> = snapshot
             .iter()
-            .filter(|t| t.source.plugin.as_ref() == plugin)
+            .filter(|t| matches!(&t.source, ToolSource::Lua { plugin: p } if p.as_ref() == plugin))
             .filter(|t| carries_builtin_defaults(t.name()))
             .map(|t| format!("`{}`", t.name()))
             .collect();
@@ -3129,7 +3129,7 @@ mod bundled_manifests {
     use std::collections::{BTreeMap, BTreeSet};
 
     use include_dir::{Dir, DirEntry, File};
-    use maki_agent::tools::{ToolReach, ToolRegistry};
+    use maki_agent::tools::{ToolReach, ToolRegistry, ToolSource};
     use maki_config::{DEFAULT_BUILTINS, PluginsConfig};
     use strum::VariantArray;
     use test_case::test_case;
@@ -3190,12 +3190,15 @@ mod bundled_manifests {
         registry
             .iter()
             .iter()
-            .map(|tool| {
-                (
-                    tool.source.plugin.to_string(),
+            .filter_map(|tool| {
+                let ToolSource::Lua { plugin } = &tool.source else {
+                    return None;
+                };
+                Some((
+                    plugin.to_string(),
                     tool.name().to_owned(),
                     tool.tool.reach(),
-                )
+                ))
             })
             .collect()
     }

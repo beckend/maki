@@ -21,6 +21,13 @@ case("maki_agent_has_expected_functions", function()
   end
 end)
 
+case("maki_run_has_expected_functions", function()
+  assert(type(maki.run) == "table", "maki.run must be a table")
+  for _, fn_name in ipairs({ "enabled", "spawn", "send", "runs", "wait", "stop" }) do
+    eq(type(maki.run[fn_name]), "function", "maki.run." .. fn_name .. " must be a function")
+  end
+end)
+
 case("schema_validator_compiles_and_validates", function()
   local validator, err = maki.json.schema_validator({
     type = "object",

@@ -68,6 +68,11 @@ local schema = {
       type = "object",
       description = "JSON Schema (object) the subagent's final result must match. When set, the result is returned as a validated JSON string.",
     },
+    timeout_secs = {
+      type = "integer",
+      minimum = 0,
+      description = "Wall clock limit for the subagent, in seconds. 0 (the default) asks for the session maximum, so a long task is not cut off. A subagent that hits its limit is stopped and reports only partial output.",
+    },
   },
 }
 
@@ -89,8 +94,8 @@ if opts.allow_background then
 end
 
 Runner.allow_background = opts.allow_background
+Runner.allow_model = opts.allow_model
 Runner.schema = schema
-
 local slots = maki.async.semaphore(opts.max_concurrent)
 
 -- {on_wait} runs only when every slot is taken, right before the call parks
@@ -103,6 +108,14 @@ function Runner.acquire_slot(on_wait)
   on_wait()
   return slots:acquire()
 end
+
+-- The native path in `init.lua` answers with the same wording, so the text
+-- lives in one place.
+Runner.errors = {
+  schema_root = SCHEMA_ROOT_ERROR,
+  structured_missing = STRUCTURED_MISSING_ERROR,
+  summary_missing = SUMMARY_MISSING_ERROR,
+}
 
 local function bounded_errors(errors)
   local out = {}

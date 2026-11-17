@@ -178,8 +178,9 @@ struct JobMeta {
     on_exit: Option<RegistryKey>,
     ceiling: Option<Ceiling>,
     /// Locked while a `jobwait` holds it through its [`WaitLease`], which keeps
-    /// the pumps off the job until the lease drops.
-    events: JobEvents,
+    /// the pumps off the job until the lease drops. `None` while a caller holds
+    /// them for an adoption, see [`JobStore::take_for_adoption`].
+    events: Option<JobEvents>,
     _queue: QueueOwner,
     stdout_tail: VecDeque<String>,
     stderr_tail: VecDeque<String>,
@@ -237,7 +238,11 @@ impl JobMeta {
     }
 
     fn has_pending(&self) -> bool {
-        self.replay_exit.is_some() || !self.events.is_empty()
+        self.replay_exit.is_some()
+            || self
+                .events
+                .as_ref()
+                .is_some_and(|events| !events.is_empty())
     }
 }
 
@@ -437,7 +442,7 @@ impl JobStore {
                 on_stderr,
                 on_exit,
                 ceiling,
-                events,
+                events: Some(events),
                 _queue: queue,
                 stdout_tail: VecDeque::new(),
                 stderr_tail: VecDeque::new(),
@@ -492,11 +497,42 @@ impl JobStore {
         if !job.can_access(task_id, plugin) {
             return None;
         }
+        let events = job.events.as_ref()?;
         Some(WaitLease {
-            rx: Arc::clone(&job.events.rx).try_lock_owned().ok()?,
-            queue: Arc::clone(&job.events.queue),
+            rx: Arc::clone(&events.rx).try_lock_owned().ok()?,
+            queue: Arc::clone(&events.queue),
             _wake: WakePumps(self.changed.clone()),
         })
+    }
+
+    /// Hands a live task-owned job's pid and event stream to a caller that
+    /// takes the process over. Nothing is removed yet: on a refusal the
+    /// caller gives the stream back with [`Self::restore_receiver`], and on
+    /// success it calls [`Self::finish`], which drops the entry without a kill.
+    pub fn take_for_adoption(
+        &mut self,
+        job_id: u32,
+        task_id: Option<u64>,
+    ) -> Option<(u32, JobEvents)> {
+        let job = self.jobs.get_mut(&job_id)?;
+        if job.owner != JobOwner::Task(task_id?)
+            || job.exit_code.is_some()
+            || job.reaped.load(Ordering::Relaxed)
+        {
+            return None;
+        }
+        let events = job.events.take()?;
+        Some((job.pid, events))
+    }
+
+    /// Puts the events of a refused adoption back, so the job goes on as it
+    /// was.
+    pub fn restore_receiver(&mut self, job_id: u32, events: JobEvents) {
+        if let Some(job) = self.jobs.get_mut(&job_id)
+            && job.events.is_none()
+        {
+            job.events = Some(events);
+        }
     }
 
     /// Pop one queued event. Deliberately one at a time: a batch pulled into
@@ -526,7 +562,7 @@ impl JobStore {
         if let Some(code) = job.replay_exit.take() {
             return Some(JobEvent::Exit(code));
         }
-        job.events.try_recv()
+        job.events.as_ref()?.try_recv()
     }
 
     /// Round-robins over the jobs holding events: taking the first match every
@@ -924,6 +960,15 @@ pub(crate) struct JobEvents {
 }
 
 impl JobEvents {
+    /// Waits for the next event. The caller holds the events, so nothing else
+    /// reads them while it waits.
+    pub async fn recv(&self) -> Option<JobEvent> {
+        let mut rx = Arc::clone(&self.rx).lock_owned().await;
+        let event = rx.recv().await?;
+        self.queue.popped(&event);
+        Some(event)
+    }
+
     fn try_recv(&self) -> Option<JobEvent> {
         let event = self.rx.try_lock().ok()?.try_recv().ok()?;
         self.queue.popped(&event);
@@ -1185,7 +1230,7 @@ mod tests {
             on_stderr: None,
             on_exit,
             ceiling: None,
-            events,
+            events: Some(events),
             _queue: queue,
             stdout_tail: VecDeque::new(),
             stderr_tail: VecDeque::new(),
@@ -1302,6 +1347,34 @@ mod tests {
         store.kill(999, Some(1), TEST_PLUGIN);
         assert!(store.lease_events(999, Some(1), TEST_PLUGIN).is_none());
         assert!(store.callback_key(999, &JobEvent::Exit(0)).is_none());
+    }
+
+    /// An adoption takes the job's events with it, and a refusal hands them
+    /// back, so the job goes on as it was.
+    #[test]
+    fn an_adoption_takes_the_events_and_a_refusal_gives_them_back() {
+        let mut store = make_store();
+        let id = start_echo(&mut store);
+
+        assert!(
+            store.take_for_adoption(id, Some(2)).is_none(),
+            "only the task that owns the job may adopt it"
+        );
+
+        let (pid, events) = store
+            .take_for_adoption(id, Some(1))
+            .expect("the job is adoptable");
+        assert!(pid > 0, "the adopter needs the pid to signal the process");
+        assert!(
+            store.lease_events(id, Some(1), TEST_PLUGIN).is_none(),
+            "the events left with the adopter"
+        );
+
+        store.restore_receiver(id, events);
+        assert!(
+            store.lease_events(id, Some(1), TEST_PLUGIN).is_some(),
+            "a refused adoption leaves the job as it was"
+        );
     }
 
     #[test]
@@ -1454,7 +1527,7 @@ mod tests {
                 sender.send(JobEvent::Stdout("spam".into()));
             }
             let mut job = stub_job(task_owner(1), None, None);
-            job.events = events;
+            job.events = Some(events);
             job._queue = queue;
             store.jobs.insert(id, job);
         }
@@ -1812,7 +1885,7 @@ mod tests {
         let mut store = make_store();
         let (mut sender, events, queue) = job_queue(store.changed.clone());
         let mut job = stub_job(plugin_owner(), None, None);
-        job.events = events;
+        job.events = Some(events);
         job._queue = queue;
         job.exit_code = Some(0);
         store.jobs.insert(1, job);
@@ -2171,7 +2244,7 @@ mod tests {
         /// parked on a send.
         fn start_blocked(store: &mut JobStore, owner: JobOwner, cmd: &str) -> u32 {
             let id = store.start(JobSpec::new(owner, cmd)).unwrap();
-            let queue = Arc::clone(&store.jobs[&id].events.queue);
+            let queue = Arc::clone(&store.jobs[&id].events.as_ref().unwrap().queue);
             wait_until(NEVER_FILLED, || is_full(&queue));
             id
         }

@@ -345,7 +345,9 @@ fn register_echo_tool() {
 
     let entry = reg.get("echo_").expect("echo_ tool not registered");
     assert_eq!(entry.tool.name(), "echo_");
-    assert_eq!(entry.source.plugin.as_ref(), "echo_plugin");
+    assert!(
+        matches!(&entry.source, ToolSource::Lua { plugin } if plugin.as_ref() == "echo_plugin")
+    );
     assert_eq!(entry.tool.tool_kind(), None);
 
     let out = exec_tool(&reg, "echo_", serde_json::json!({"msg": "hello"})).unwrap();
@@ -1983,7 +1985,7 @@ fn conflict_from_different_plugin_preserves_original() {
     assert!(matches!(err, PluginError::NameConflict { .. }));
 
     let entry = reg.get("evolving").unwrap();
-    assert_eq!(entry.source.plugin.as_ref(), "keeper");
+    assert!(matches!(&entry.source, ToolSource::Lua { plugin } if plugin.as_ref() == "keeper"));
 }
 
 #[test]
@@ -2729,7 +2731,7 @@ fn call_tool_streams_live_buf_and_annotations() {
     let reg = fresh_registry();
     reg.register(
         Arc::new(UsageTool),
-        ToolSource {
+        ToolSource::Lua {
             plugin: Arc::from("usage_fixture"),
         },
     )
@@ -9108,6 +9110,78 @@ fn a_ctx_session_pays_for_reach_whoever_could_answer(answerable: bool) {
     assert!(text.text.contains("fs_write"), "got: {}", text.text);
 }
 
+const PROMOTE_PLUGIN: &str = r#"
+maki.api.register_tool({
+    name = "promote_test",
+    description = "promotes its job when the deadline hits",
+    schema = { type = "object", properties = {}, additionalProperties = false },
+    audiences = { "main" },
+    handler = function(input, ctx)
+        ctx:set_deadline(1)
+        local parts = {}
+        local job = maki.fn.jobstart("echo started; sleep 2; echo done", {
+            on_stdout = function(_, line) parts[#parts + 1] = line end,
+        })
+        maki.async.on_cancel(function(reason)
+            local handle, err = ctx:promote(job, { command = "sleep-ish", output = table.concat(parts, "\n") })
+            ctx:finish({ llm_output = (handle or ("refused: " .. tostring(err))) .. " reason=" .. reason })
+        end)
+        return nil
+    end,
+})
+"#;
+
+/// The tool call and the wait both run on the host's runtime, so the test
+/// drives them from outside a runtime of its own.
+#[test]
+fn ctx_promote_hands_a_timed_out_job_to_the_run_hub() {
+    use maki_agent::runs::{RunsCtx, Scope, UnitLimits, UnitState, WaitMode};
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source("promote_test", PROMOTE_PLUGIN).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let hub = maki_agent::runs::UnitHub::with_shell_options(
+        UnitLimits::default(),
+        maki_agent::EventSender::new(tx, 0),
+        Arc::new(maki_agent::runs::SystemClock),
+        maki_agent::runs::ShellOptions {
+            dir: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        },
+    );
+    let mut ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
+    ctx.runs = Some(RunsCtx {
+        hub: Arc::clone(&hub),
+        self_run: hub.main(),
+    });
+    let out = exec_with_ctx(&reg, "promote_test", json!({}), &ctx).unwrap();
+    let handle = out.split_whitespace().next().unwrap().to_owned();
+    assert!(handle.starts_with("sh-"), "got: {out}");
+    assert!(out.ends_with("reason=timeout"), "got: {out}");
+
+    let runs = hub.list(hub.main(), Scope::All);
+    assert_eq!(runs.len(), 1);
+    let id = runs[0].id;
+    let views = runtime().block_on(hub.wait(
+        hub.main(),
+        &[id],
+        WaitMode::All,
+        Duration::from_secs(30),
+        &maki_agent::cancel::CancelToken::none(),
+    ));
+    assert!(
+        matches!(views[0].state, UnitState::Done(_)),
+        "{:?}",
+        views[0].state
+    );
+    let log = std::fs::read_to_string(dir.path().join(format!("{handle}.log"))).unwrap();
+    assert_eq!(
+        log, "started\ndone\n",
+        "output before and after the hand-over"
+    );
+}
+
 /// One plugin process serves every tab, so each window and hint has to say
 /// which tab it is for. A background agent's window should never pop up on
 /// the tab the user is looking at.
@@ -9368,4 +9442,13 @@ fn jobwait_drains_a_job_past_its_queue_bound() {
     let out = exec_tool(&reg, "wait_past_bound", json!({})).unwrap();
     let expected = PAST_BOUND_LINES * (PADDED_LINE_BYTES + 1) - 1;
     assert_eq!(out, expected.to_string());
+}
+
+#[test]
+fn ctx_promote_refuses_when_runs_are_off() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source("promote_test", PROMOTE_PLUGIN).unwrap();
+    let out = exec_tool(&reg, "promote_test", json!({})).unwrap();
+    assert_eq!(out, "refused: runs are not enabled reason=timeout");
 }

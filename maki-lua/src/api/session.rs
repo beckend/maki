@@ -2025,12 +2025,14 @@ mod tests {
             tool_use_id: id.into(),
             name: name.into(),
             model: None,
+            subagent_type: None,
             thinking: None,
             fast: false,
             plugin: None,
             cost: None,
             started_at: None,
             ended_at: None,
+            run: None,
         }
     }
 

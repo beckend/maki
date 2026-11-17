@@ -1,6 +1,12 @@
 -- This plugin owns the /tasks picker over the subagents spawned here:
 -- picker.lua registers the command and the keymap when this file is loaded, so
 -- the two cannot be enabled apart and left pointing at each other's absence.
+--
+-- With `[agent.runs] enabled` the subagent is a native one-shot run: the hub
+-- owns its slot (`max_agents`), queue, stop and journal, and `/runs` shows it.
+-- This plugin then only translates the `task` call into `spawn` + `wait` and
+-- the result back. The Lua session path stays for when runs are off, and for
+-- `allow_model`, whose exact model spec the native `spawn` has no field for.
 
 local ToolView = require("maki.tool_view")
 local output_limits = require("maki.output_limits")
@@ -30,6 +36,8 @@ Notes:
 2. The agent's result is not visible to the user. Summarize it in your response.
 3. Each invocation starts fresh - inline any needed context into the prompt.
 4. Tell it to return concise summaries with file:line refs, not full file contents.
+5. A subagent runs until it is done; it is stopped at its time limit and then reports
+   only partial output. The limit is the session maximum unless you set timeout_secs.
 ]]
 
 local examples = {
@@ -51,7 +59,101 @@ local function result_body(output, is_error, ctx)
   })
 end
 
+-- The native path: the hub runs the subagent, so the model sees one run and
+-- the transcript lives with it. `Runner` owns the session path; this only
+-- speaks the hub's language.
+local function delegate(input, ctx, subagent_type)
+  local output_schema = input.output_schema
+  if output_schema then
+    if (output_schema.type or "object") ~= "object" then
+      return { llm_output = Runner.errors.schema_root, is_error = true }
+    end
+    output_schema.type = "object"
+  end
+  local thinking = input.thinking
+  if thinking ~= nil and type(thinking) ~= "string" then
+    thinking = tostring(thinking)
+  end
+  local background = input.background == true
+  -- 0 asks the hub for the session maximum. The default agent timeout is
+  -- 30 minutes, and a subagent that hits it stops with only partial output,
+  -- so a task the model knows to be long must not inherit that cap silently.
+  local timeout_secs = input.timeout_secs
+  if timeout_secs ~= nil then
+    timeout_secs = math.floor(tonumber(timeout_secs) or 0)
+    if timeout_secs < 0 then
+      timeout_secs = 0
+    end
+  else
+    timeout_secs = 0
+  end
+  local run, err = maki.run.spawn(ctx, {
+    kind = "agent",
+    description = input.description,
+    prompt = input.prompt,
+    subagent_type = subagent_type,
+    model_tier = input.model_tier,
+    thinking = thinking,
+    output_schema = output_schema,
+    one_shot = true,
+    notify = background and "wake" or "never",
+    timeout_secs = timeout_secs,
+    -- The blocking path owns the sub-agent: when the user cancels the turn
+    -- the run is stopped with it, so it leaves no slot behind for the next
+    -- sub-agent. A background task must outlive the turn, so it is not
+    -- bound.
+    bind_to_caller = not background,
+  })
+  if err then
+    return { llm_output = "sub-agent error: " .. err, is_error = true }
+  end
+  if background then
+    -- The hub wakes the parent with the result, so the turn can end here.
+    return { llm_output = "started " .. run.handle .. " (" .. run.state .. ")", format = "markdown" }
+  end
+  local view
+  while true do
+    local views, wait_err = maki.run.wait(ctx, { ids = { run.handle }, timeout_secs = 600 })
+    if wait_err then
+      -- The task was cancelled (Esc): the native run would otherwise go on.
+      maki.run.stop(ctx, { ids = { run.handle }, wait_secs = 0 })
+      return { llm_output = "sub-agent error: " .. wait_err, is_error = true }
+    end
+    view = views[1]
+    if view.settled then
+      break
+    end
+  end
+  local text = view.summary or ""
+  if view.done and view.reason ~= "completed" then
+    local detail = view.detail and (": " .. view.detail) or ""
+    if text ~= "" then
+      return {
+        llm_output = "sub-agent interrupted (" .. view.reason .. detail .. "). Partial output:\n" .. text,
+        is_error = true,
+      }
+    end
+    return { llm_output = "sub-agent error: " .. view.reason .. detail, is_error = true }
+  end
+  if output_schema then
+    if view.structured == nil then
+      return { llm_output = Runner.errors.structured_missing, is_error = true }
+    end
+    return { llm_output = maki.json.encode(view.structured), format = "markdown" }
+  end
+  if text == "" then
+    return { llm_output = Runner.errors.summary_missing, is_error = true }
+  end
+  return { llm_output = text, format = "markdown" }
+end
+
 local function handler(input, ctx)
+  -- The native run has no field for an exact model spec, so a call that names
+  -- one keeps the session path.
+  if maki.run.enabled(ctx) and not (Runner.allow_model and input.model) then
+    return delegate(input, ctx, input.subagent_type or "research")
+  end
+
   local prepared, prepare_err = Runner.prepare(input, ctx)
   if prepare_err then
     return { llm_output = prepare_err, is_error = true }

@@ -81,6 +81,37 @@ const SCENARIO_PARKED_SECOND: &str = "parked_second";
 const SCENARIO_SESSION_ERROR: &str = "session_error";
 const SCENARIO_OPEN_PARKED: &str = "open_parked";
 
+/// The stub tool the background path waits on. The native run tools reserve
+/// the name, so the suite that loads both leaves it out.
+const WAIT_STUB: &str = r#"
+maki.api.register_tool({
+  name = "wait",
+  description = "wait until a step is parked and enough acquires and notices happened",
+  schema = {
+    type = "object",
+    properties = {
+      parked = { type = "string" },
+      acquires = { type = "integer" },
+      notices = { type = "integer" },
+    },
+  },
+  audiences = { "main" },
+  handler = function(input)
+    local function ready()
+      return (not input.parked or parked[input.parked] ~= nil)
+        and recorder.acquire_attempts >= (input.acquires or 0)
+        and #recorder.notices >= (input.notices or 0)
+    end
+    while not ready() do
+      maki.async.await(1, function(done)
+        waiters[#waiters + 1] = done
+      end)
+    end
+    return "ready"
+  end,
+})
+"#;
+
 /// Stubs keyed by `opts.name` (the task's `description`). `maki.json` and
 /// `maki.async` stay real so schema validation and semaphore behavior are tested.
 const STUB_PRELUDE: &str = r#"
@@ -260,32 +291,7 @@ maki.session.notify = function(text, opts)
   return true
 end
 
-maki.api.register_tool({
-  name = "wait",
-  description = "wait until a step is parked and enough acquires and notices happened",
-  schema = {
-    type = "object",
-    properties = {
-      parked = { type = "string" },
-      acquires = { type = "integer" },
-      notices = { type = "integer" },
-    },
-  },
-  audiences = { "main" },
-  handler = function(input)
-    local function ready()
-      return (not input.parked or parked[input.parked] ~= nil)
-        and recorder.acquire_attempts >= (input.acquires or 0)
-        and #recorder.notices >= (input.notices or 0)
-    end
-    while not ready() do
-      maki.async.await(1, function(done)
-        waiters[#waiters + 1] = done
-      end)
-    end
-    return "ready"
-  end,
-})
+@WAIT_STUB@
 
 maki.api.register_tool({
   name = "release",
@@ -348,9 +354,28 @@ fn load_background_host() -> (Arc<ToolRegistry>, PluginHost) {
 fn load_task_host_with_opts(
     opts: serde_json::Map<String, serde_json::Value>,
 ) -> (Arc<ToolRegistry>, PluginHost) {
-    let reg = Arc::new(ToolRegistry::new());
+    load_task_host_source(Arc::new(ToolRegistry::new()), opts, true)
+}
+
+/// The same host, over a registry the caller filled: the native run tools are
+/// registered before the task plugin loads, so both are there.
+fn load_task_host_in(
+    reg: Arc<ToolRegistry>,
+    opts: serde_json::Map<String, serde_json::Value>,
+) -> (Arc<ToolRegistry>, PluginHost) {
+    load_task_host_source(reg, opts, false)
+}
+
+/// The native run tools reserve the name `wait`, so a host that loads them
+/// leaves the stub out; the suites that wait on the stub keep it.
+fn load_task_host_source(
+    reg: Arc<ToolRegistry>,
+    opts: serde_json::Map<String, serde_json::Value>,
+    with_wait_stub: bool,
+) -> (Arc<ToolRegistry>, PluginHost) {
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     let prelude = STUB_PRELUDE
+        .replace("@WAIT_STUB@", if with_wait_stub { WAIT_STUB } else { "" })
         .replace("@PLAIN_TEXT@", PLAIN_TEXT)
         .replace("@RECOVERED_TEXT@", RECOVERED_TEXT)
         .replace("@PROMPT_ERR@", PROMPT_ERR_MSG)
@@ -876,4 +901,402 @@ fn a_moved_task_keeps_its_slot_and_the_next_task_waits_visibly() {
         _ => None,
     });
     assert!(final_body.contains(PLAIN_TEXT), "{final_body}");
+}
+
+/// Answers every request with one fixed sentence, standing in for the model
+/// behind a native run.
+struct FixedReply;
+
+impl maki_providers::provider::Provider for FixedReply {
+    fn stream_message<'a>(
+        &'a self,
+        _: &'a maki_providers::Model,
+        _: &'a [maki_providers::Message],
+        _: &'a str,
+        _: &'a Value,
+        _: &'a tokio::sync::mpsc::UnboundedSender<maki_providers::ProviderEvent>,
+        _: maki_providers::RequestOptions,
+        _: Option<&'a maki_storage::id::SessionRef>,
+    ) -> maki_providers::provider::BoxFuture<
+        'a,
+        Result<maki_providers::StreamResponse, maki_providers::AgentError>,
+    > {
+        Box::pin(async {
+            Ok(maki_providers::StreamResponse {
+                message: maki_providers::Message {
+                    role: maki_providers::Role::Assistant,
+                    content: vec![maki_providers::ContentBlock::Text {
+                        text: "native says hi".into(),
+                    }],
+                    ..Default::default()
+                },
+                stop_reason: Some(maki_providers::StopReason::EndTurn),
+                ..Default::default()
+            })
+        })
+    }
+
+    fn list_models(
+        &self,
+    ) -> maki_providers::provider::BoxFuture<
+        '_,
+        Result<Vec<maki_providers::ModelInfo>, maki_providers::AgentError>,
+    > {
+        Box::pin(async { unimplemented!() })
+    }
+}
+
+/// `[agent.runs] enabled` with the Lua `task` plugin loaded: both tools are
+/// registered, `task` delegates to the native hub, and the two do not disturb
+/// each other.
+#[test]
+fn native_and_legacy_task_enabled() {
+    use maki_agent::runs::{RunsCtx, SystemClock, UnitHub, UnitLimits};
+
+    let reg = Arc::new(ToolRegistry::new());
+    let config = maki_config::RunsConfig {
+        enabled: true,
+        ..Default::default()
+    };
+    maki_agent::runs::sync_registration(&reg, &config).unwrap();
+    let (reg, _host) = load_task_host_in(reg, serde_json::Map::new());
+    for name in [TASK_TOOL, "spawn", "wait", "runs", "stop", "send"] {
+        assert!(reg.get(name).is_some(), "{name} not registered");
+    }
+
+    let mut ctx = stub_ctx(&AgentMode::Build);
+    ctx.provider = Arc::new(FixedReply);
+    ctx.registry = Arc::clone(&reg);
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<maki_agent::Envelope>();
+    let hub = UnitHub::new(
+        UnitLimits::default(),
+        maki_agent::EventSender::new(tx, 0),
+        Arc::new(SystemClock),
+    );
+    ctx.runs = Some(RunsCtx {
+        self_run: hub.main(),
+        hub: Arc::clone(&hub),
+    });
+    // The host's own runtime drives the tool calls: the native run the tool
+    // spawns is scheduled on it, so the test must not block that runtime
+    // from the inside.
+    runtime().block_on(async {
+        let run = |name: &'static str, input: Value| {
+            let reg = Arc::clone(&reg);
+            let ctx = ctx.clone();
+            async move {
+                let inv = reg.get(name).unwrap().tool.parse(&input).unwrap();
+                inv.execute(&ctx).await.output.map(|out| match out {
+                    ToolOutput::Plain(s) | ToolOutput::Markdown(s) => s.text,
+                    other => panic!("unexpected output: {other:?}"),
+                })
+            }
+        };
+
+        // With runs on, `task` delegates to a native one-shot run (the Lua
+        // session stubs of the prelude are not used, so the text is the provider's).
+        let delegated = run(TASK_TOOL, task_input(SCENARIO_PLAIN, None))
+            .await
+            .unwrap();
+        assert_eq!(delegated, "native says hi");
+
+        let started = run(
+            "spawn",
+            json!({"kind": "agent", "description": "reader", "prompt": "say hi", "one_shot": true}),
+        )
+        .await
+        .unwrap();
+        let handle = started.split_whitespace().nth(1).unwrap().to_owned();
+        assert!(
+            handle.starts_with("ag-") && !handle.starts_with("toolu_"),
+            "{handle}"
+        );
+        // The model's wait keeps to commands, so an agent is awaited the way a
+        // plugin does: on the hub.
+        let id = hub.resolve(hub.main(), &handle).unwrap();
+        let views = (hub.wait(
+            hub.main(),
+            &[id],
+            maki_agent::runs::WaitMode::All,
+            std::time::Duration::from_secs(30),
+            &CancelToken::none(),
+        ))
+        .await;
+        let summary = &views[0].result.as_ref().unwrap().summary;
+        assert!(summary.contains("native says hi"), "{summary}");
+        assert!(
+            views[0].state.label().contains("completed"),
+            "{}",
+            views[0].state.label()
+        );
+
+        // And `task` still delegates fine after a native run existed.
+        assert_eq!(
+            run(TASK_TOOL, task_input(SCENARIO_PLAIN, None))
+                .await
+                .unwrap(),
+            "native says hi"
+        );
+    });
+}
+
+// With `[agent.runs] enabled` the task tool is a native one-shot run: the
+// plugin spawns it on the hub and waits, instead of opening a Lua session.
+mod delegated {
+    use std::sync::Arc;
+
+    use maki_agent::runs::{RunsCtx, ShellOptions, SystemClock, UnitHub, UnitLimits};
+    use maki_agent::test_support::MockProvider;
+    use maki_agent::tools::ToolRegistry;
+    use maki_agent::tools::test_support::stub_ctx;
+    use maki_agent::{AgentMode, EventSender, ToolOutput};
+    use maki_lua::PluginHost;
+    use maki_providers::{ContentBlock, Message, Role, StopReason, StreamResponse, TokenUsage};
+    use serde_json::{Value, json};
+
+    const ANSWER: &str = "native answer";
+    const TASK_SRC: &str = include_str!("../../plugins/task/init.lua");
+
+    fn reply(text: &str) -> StreamResponse {
+        StreamResponse {
+            message: Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text { text: text.into() }],
+                ..Default::default()
+            },
+            usage: TokenUsage::default(),
+            stop_reason: Some(StopReason::EndTurn),
+            ..Default::default()
+        }
+    }
+
+    struct Setup {
+        reg: Arc<ToolRegistry>,
+        _host: PluginHost,
+        hub: Arc<UnitHub>,
+        provider: Arc<MockProvider>,
+        ctx: maki_agent::tools::ToolContext,
+        _dir: tempfile::TempDir,
+    }
+
+    fn setup(responses: Vec<StreamResponse>) -> Setup {
+        setup_with(MockProvider::new(responses))
+    }
+
+    fn setup_with(provider: MockProvider) -> Setup {
+        setup_with_limits(provider, UnitLimits::default())
+    }
+
+    fn setup_with_limits(provider: MockProvider, limits: UnitLimits) -> Setup {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = Arc::new(ToolRegistry::new());
+        let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+        // The legacy path must not be taken: it would need these stubs, and
+        // fails loudly if it is.
+        let guard = r#"
+            maki.agent.session = function() error("legacy session path taken") end
+        "#;
+        host.load_source_with_opts(
+            "task_delegation",
+            &format!("{guard}\n{TASK_SRC}"),
+            serde_json::Map::new(),
+        )
+        .unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let hub = UnitHub::with_shell_options(
+            limits,
+            EventSender::new(tx, 0),
+            Arc::new(SystemClock),
+            ShellOptions {
+                dir: Some(dir.path().to_path_buf()),
+                ..ShellOptions::default()
+            },
+        );
+        let provider = Arc::new(provider);
+        let mut ctx = stub_ctx(&AgentMode::Build);
+        ctx.provider = provider.clone();
+        ctx.runs = Some(RunsCtx {
+            hub: Arc::clone(&hub),
+            self_run: hub.main(),
+        });
+        Setup {
+            reg,
+            _host: host,
+            hub,
+            provider,
+            ctx,
+            _dir: dir,
+        }
+    }
+
+    fn run_task(s: &Setup, input: Value) -> Result<String, String> {
+        let entry = s.reg.get("task").expect("task registered");
+        let inv = entry.tool.parse(&input).expect("parse");
+        maki_lua::test_support::runtime()
+            .block_on(inv.execute(&s.ctx))
+            .output
+            .map(|out| match out {
+                ToolOutput::Plain(t) | ToolOutput::Markdown(t) => t.text,
+                other => panic!("unexpected output: {other:?}"),
+            })
+    }
+
+    #[test]
+    fn task_runs_as_a_native_one_shot_agent_when_runs_are_enabled() {
+        let s = setup(vec![reply(ANSWER)]);
+        let out = run_task(
+            &s,
+            json!({"description": "find it", "prompt": "look around", "subagent_type": "research"}),
+        )
+        .unwrap();
+        assert_eq!(out, ANSWER);
+        assert_eq!(s.provider.requests.lock().unwrap().len(), 1);
+        // The hub owns the run: it is listed there, finished and one-shot.
+        let views = s.hub.list(s.hub.main(), maki_agent::runs::Scope::All);
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].kind.as_str(), "agent");
+        assert_eq!(views[0].state_label(), "completed");
+        assert_eq!(s.hub.slots_in_use(), 0);
+    }
+
+    /// `load_source` runs with every permission, so a manifest that forgets
+    /// `agent` (needed by `maki.run.wait`) only shows up with a real load.
+    #[test]
+    fn manifest_grants_the_permissions_delegation_needs() {
+        let manifest: toml::Table = include_str!("../../plugins/task/plugin.toml")
+            .parse()
+            .unwrap();
+        let perms = manifest["permissions"].as_table().unwrap();
+        for needed in ["run", "agent"] {
+            assert_eq!(
+                perms.get(needed).and_then(|v| v.as_bool()),
+                Some(true),
+                "{needed}"
+            );
+        }
+    }
+
+    /// The delegated subagent must not inherit the hub's default agent
+    /// timeout: the task tool asks for the session maximum, so a task the
+    /// model knows to be long keeps running instead of being cut off with
+    /// partial output.
+    #[test]
+    fn the_delegated_task_asks_for_the_session_maximum() {
+        let s = setup_with_limits(
+            MockProvider::new(vec![reply(ANSWER)]),
+            UnitLimits {
+                default_timeout: std::time::Duration::from_secs(1800),
+                max_timeout: std::time::Duration::from_secs(7200),
+                ..UnitLimits::default()
+            },
+        );
+        run_task(&s, json!({"description": "x", "prompt": "y"})).unwrap();
+        let views = s.hub.list(s.hub.main(), maki_agent::runs::Scope::All);
+        assert_eq!(views.len(), 1);
+        assert_eq!(
+            views[0].timeout_secs, 7200,
+            "the subagent must get the session maximum, not the 1800s default"
+        );
+    }
+
+    /// The model can still cap a subagent it expects to overrun.
+    #[test]
+    fn the_delegated_task_takes_a_timeout_from_the_caller() {
+        let s = setup_with_limits(
+            MockProvider::new(vec![reply(ANSWER)]),
+            UnitLimits {
+                default_timeout: std::time::Duration::from_secs(1800),
+                max_timeout: std::time::Duration::from_secs(7200),
+                ..UnitLimits::default()
+            },
+        );
+        run_task(
+            &s,
+            json!({"description": "x", "prompt": "y", "timeout_secs": 600}),
+        )
+        .unwrap();
+        let views = s.hub.list(s.hub.main(), maki_agent::runs::Scope::All);
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].timeout_secs, 600);
+    }
+
+    #[test]
+    fn a_failing_native_run_is_a_task_error() {
+        // No scripted response: the provider assert fails the run, which the
+        // task reports as an error rather than success.
+        let s = setup(vec![]);
+        let out = run_task(&s, json!({"description": "x", "prompt": "y"}));
+        assert!(out.is_err(), "{out:?}");
+    }
+
+    #[test]
+    fn cancelling_the_task_stops_the_native_run() {
+        let (trigger, token) = maki_agent::cancel::CancelToken::new();
+        let trigger = std::sync::Mutex::new(Some(trigger));
+        let mut provider = MockProvider::new(vec![reply(ANSWER)]);
+        // Cancel the task while the run's first request is in flight, and keep
+        // the request busy so the run has not finished when the wait sees it.
+        provider.on_request = Some(Box::new(move || {
+            if let Some(t) = trigger.lock().unwrap().take() {
+                t.cancel();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(400));
+        }));
+        let mut s = setup_with(provider);
+        s.ctx.cancel = token;
+        let out = run_task(&s, json!({"description": "x", "prompt": "y"}));
+        let err = out.unwrap_err();
+        assert!(err.contains("cancelled"), "{err}");
+        let views = s.hub.list(s.hub.main(), maki_agent::runs::Scope::All);
+        assert_eq!(views.len(), 1);
+    }
+
+    /// The user's report: a cancelled sub-agent must not stop the next one
+    /// from being spawned. A cancelled run that keeps its slot makes every
+    /// later task queue behind a dead run, and a cancelled run that stays
+    /// live keeps the parent's child count up.
+    #[test]
+    fn a_cancelled_task_leaves_the_next_task_free_to_spawn() {
+        let (trigger, token) = maki_agent::cancel::CancelToken::new();
+        let trigger = std::sync::Mutex::new(Some(trigger));
+        let mut provider = MockProvider::new(vec![reply(ANSWER), reply(ANSWER)]);
+        provider.on_request = Some(Box::new(move || {
+            if let Some(t) = trigger.lock().unwrap().take() {
+                t.cancel();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }));
+        let mut s = setup_with(provider);
+        s.ctx.cancel = token;
+        let out = run_task(&s, json!({"description": "x", "prompt": "y"}));
+        assert!(out.unwrap_err().contains("cancelled"));
+        let views = s.hub.list(s.hub.main(), maki_agent::runs::Scope::All);
+        assert_eq!(views.len(), 1);
+        // The stop is asynchronous: the run settles when its driver sees the
+        // cancel. Give it the time it needs, then look.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let state = s.hub.list(s.hub.main(), maki_agent::runs::Scope::All)[0]
+                .state_label()
+                .to_owned();
+            if state == "killed" || state == "failed" || state == "completed" {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the cancelled run never settled, it stayed {state}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert_eq!(
+            s.hub.slots_in_use(),
+            0,
+            "a stopped run must not hold an agent slot"
+        );
+        // The next task, in a fresh turn with a fresh token, must run.
+        s.ctx.cancel = maki_agent::cancel::CancelToken::none();
+        let out = run_task(&s, json!({"description": "y", "prompt": "z"}));
+        assert_eq!(out.unwrap(), ANSWER);
+        assert_eq!(s.hub.slots_in_use(), 0);
+    }
 }
