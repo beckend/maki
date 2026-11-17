@@ -603,6 +603,9 @@ pub async fn run(params: SdkParams) -> Result<Interrupt> {
         project_config,
         local_tools: Default::default(),
         background: BackgroundMode::from_wait(cli.background_wait()),
+        // The native runs are the client's business: their notices ride the
+        // next prompt, and the session does not wait for them.
+        runs: None,
         stop: stop.clone(),
     })
     .await;

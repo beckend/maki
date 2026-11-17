@@ -25,6 +25,7 @@ use crate::agent::{self, HostPrompt, RunContext, RunContextBuilder};
 use crate::cancel::{CancelMap, CancelToken, CancelTrigger};
 use crate::permissions::{PermissionManager, PluginRuleStore};
 use crate::prompt::ResolvedPrompts;
+use crate::runs::{Joined, UnitHub, WakeSink};
 use crate::session::{Resumed, SessionTrack};
 use crate::template;
 use crate::tools::{
@@ -33,10 +34,12 @@ use crate::tools::{
 use crate::types::EventSender;
 use crate::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentMode, AgentParams, AgentSeed,
-    EventStreamGuard, McpHandle, McpSession, ModelSlot, PermissionsConfig, RunLedger, RunTotals,
-    SessionEvents, SessionMailbox, ToolDeferral, ToolOutputLines, event_stream,
+    EventStreamGuard, InputSource, McpHandle, McpSession, ModelSlot, PermissionsConfig, RunLedger,
+    RunTotals, SessionEvents, SessionMailbox, ToolDeferral, ToolOutputLines, event_stream,
 };
 
+/// Closing turns in a row that may be needed to drain quiet items.
+const MAX_CLOSING_TURNS: u32 = 3;
 const SESSION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const UNREPORTED_HEAD: &str = "background task result(s) never reached the model before";
 const UNREPORTED_TAIL: &str = "Tasks still running are stopped, and resuming this session \
@@ -226,6 +229,14 @@ impl Next {
     }
 }
 
+/// What the native runs ask the session to do next.
+enum Step {
+    /// A notice woke `main`.
+    Wake,
+    /// The join found what is left of the work.
+    Joined(Joined),
+}
+
 /// Where an interactive session's turns come from.
 struct Inputs {
     prompts: UnboundedReceiver<AgentInput>,
@@ -233,6 +244,55 @@ struct Inputs {
     keep_alive: KeepAlive,
     /// Ends the session at once, whatever is still out.
     stop: CancelToken,
+    /// The native runs of the session, when it waits for them.
+    runs: Option<Runs>,
+    /// The mode the last turn ran in, so a turn that only delivers what a run
+    /// left behind runs in it too.
+    mode: AgentMode,
+    /// The knobs a host without toggles puts on every input.
+    defaults: SessionDefaults,
+}
+
+/// The native runs of a session: the hub that holds them, the channel its
+/// wake consumer writes to, and how long the wait for them may take.
+struct Runs {
+    hub: Arc<UnitHub>,
+    wake_rx: flume::Receiver<()>,
+    timeout: Duration,
+    /// Closing turns in a row, so runs that keep quiet notices cannot hold the
+    /// session open for good.
+    closing: u32,
+}
+
+/// What the session does with the native runs it started once its input ends.
+#[derive(Clone, Copy)]
+pub struct RunsWait {
+    /// How long the wait may take before the runs are stopped.
+    pub timeout: Duration,
+    /// Whether a notice may start a turn of `main` while it is idle. A host
+    /// that pairs its own prompt with the turn's end (ACP) leaves this off: a
+    /// wake turn finishing meanwhile would end that prompt early.
+    pub wake_main: bool,
+}
+
+/// Hands the native runs' wakes to the session loop.
+struct ChannelWake(flume::Sender<()>);
+
+impl WakeSink for ChannelWake {
+    fn start_main_run(&self, _preamble: Vec<Message>) {
+        let _ = self.0.send(());
+    }
+}
+
+/// A turn that only delivers what a run left behind.
+fn blank_turn(defaults: SessionDefaults, mode: AgentMode) -> AgentInput {
+    AgentInput::from_defaults(
+        String::new(),
+        mode,
+        Vec::new(),
+        defaults,
+        InputSource::Headless,
+    )
 }
 
 impl Inputs {
@@ -250,14 +310,69 @@ impl Inputs {
                 return Some(Next::Prompt(input));
             }
             if let Some(mode) = iter::from_fn(|| self.modes.try_recv().ok()).last() {
+                self.mode = mode.clone();
                 self.keep_alive.switch_mode(mode);
             }
-            self.keep_alive.next_input().await.map(Next::Woken)
+            if let Some(input) = self.keep_alive.next_input().await {
+                return Some(Next::Woken(input));
+            }
+            // The input is gone and nothing woke: the native runs may still be
+            // out, so the session waits for them before it ends.
+            self.runs_next().await
         };
         tokio::select! {
             biased;
             () = stop.cancelled() => None,
             next = next => next,
+        }
+    }
+
+    /// The next turn the native runs ask for: a turn for a notice that woke
+    /// `main`, a closing turn for what the wake budget kept quiet, or nothing
+    /// when the runs are done and the inbox is empty.
+    async fn runs_next(&mut self) -> Option<Next> {
+        let Some(runs) = &mut self.runs else {
+            return None;
+        };
+        let deadline = runs.hub.deadline_after(runs.timeout);
+        loop {
+            // Past the bound a wake no longer wins: a model that starts a run
+            // in every turn would otherwise keep the session open for good.
+            let step = if runs.hub.deadline_passed(deadline) {
+                Step::Joined(runs.hub.join_until(deadline).await)
+            } else {
+                tokio::select! {
+                    biased;
+                    _ = runs.wake_rx.recv_async() => Step::Wake,
+                    joined = runs.hub.join_until(deadline) => Step::Joined(joined),
+                }
+            };
+            match step {
+                Step::Wake if !runs.hub.main_has_unread() => {
+                    // A closing turn already read what this wake was for.
+                    runs.hub.main_turn_ends();
+                    continue;
+                }
+                Step::Wake => {
+                    runs.closing = 0;
+                    return Some(Next::Woken(blank_turn(self.defaults, self.mode.clone())));
+                }
+                Step::Joined(Joined::Quiet) => return None,
+                Step::Joined(Joined::Pending) if runs.closing < MAX_CLOSING_TURNS => {
+                    runs.closing += 1;
+                    return Some(Next::Woken(blank_turn(self.defaults, self.mode.clone())));
+                }
+                Step::Joined(Joined::Pending) => return None,
+                Step::Joined(Joined::TimedOut { stopped }) => {
+                    eprintln!(
+                        "maki: join timeout of {}s reached, stopped {} run(s): {}",
+                        runs.timeout.as_secs(),
+                        stopped.len(),
+                        stopped.join(", ")
+                    );
+                    return None;
+                }
+            }
         }
     }
 
@@ -443,6 +558,10 @@ pub struct InteractiveParams {
     /// [`BackgroundMode::KeepAlive`] wakes the model on its own, and only once
     /// the input has ended.
     pub background: BackgroundMode,
+    /// What the session does with the native runs it started once its input
+    /// ends. `None` leaves them alone: the session ends when its input does,
+    /// and a notice is delivered with the next prompt.
+    pub runs: Option<RunsWait>,
     /// Firing it cancels the run in flight and ends the session without
     /// waiting for background work. Prompts still queued never run.
     pub stop: CancelToken,
@@ -521,6 +640,20 @@ pub async fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle,
     if let (Some(runs), Some(session)) = (runs.as_ref(), params.resumed.session.as_ref()) {
         crate::runs::remember_session_runs(&runs.hub, session);
     }
+    // The session's own consumer of the runs' notices: a notice that arrives
+    // while `main` is idle starts a turn of its own.
+    let (waker, wake_rx) = match runs
+        .as_ref()
+        .filter(|_| params.runs.is_some_and(|runs| runs.wake_main))
+    {
+        Some(ctx) => {
+            let (wake_tx, wake_rx) = flume::unbounded();
+            let hub = Arc::clone(&ctx.hub);
+            let driver = tokio::spawn(Arc::clone(&hub).drive_main(ChannelWake(wake_tx)));
+            (Some((hub, driver)), Some(wake_rx))
+        }
+        None => (None, None),
+    };
     let session_ref = params.resumed.id.clone();
     let mailbox = open_mailbox(&params.resumed);
 
@@ -574,6 +707,17 @@ pub async fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle,
             modes: mode_rx,
             keep_alive: KeepAlive::new(mailbox.clone(), params.background),
             stop: params.stop.clone(),
+            runs: match (waker.as_ref(), wake_rx, params.runs) {
+                (Some((hub, _)), Some(wake_rx), Some(wait)) => Some(Runs {
+                    hub: Arc::clone(hub),
+                    wake_rx,
+                    timeout: wait.timeout,
+                    closing: 0,
+                }),
+                _ => None,
+            },
+            mode: AgentMode::Build,
+            defaults: params.defaults,
         };
         let mut run_id: u64 = 0;
         let mut listing = Listing::Due;
@@ -604,6 +748,9 @@ pub async fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle,
                         listing = Listing::Due;
                     }
                     None if !next.survives_failed_switch() => {
+                        if let Some((hub, ..)) = &waker {
+                            hub.main_turn_ends();
+                        }
                         run_id += 1;
                         continue;
                     }
@@ -624,6 +771,12 @@ pub async fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle,
                 }));
             }
             let input = next.into_input();
+            inputs.mode = input.mode.clone();
+            // A turn of `main` is open, so a notice that arrives now waits for
+            // it instead of starting a second one.
+            if let Some((hub, ..)) = &waker {
+                hub.main_turn_begins();
+            }
 
             // An ask holds this lock from before its request goes out until
             // its answer lands, so a free lock means nothing queued has a
@@ -681,10 +834,17 @@ pub async fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle,
                 let _ = error_tx.send(AgentEvent::error(e, turn.ledger().totals()));
                 inputs.keep_alive.fail();
             }
+            if let Some((hub, ..)) = &waker {
+                hub.main_turn_ends();
+            }
 
             run_id += 1;
         }
         inputs.warn_if_stopped();
+        if let Some((hub, driver)) = waker {
+            driver.abort();
+            hub.shutdown();
+        }
         Some(track)
     }));
 
@@ -996,6 +1156,7 @@ mod tests {
                 .project_config,
             local_tools: LocalTools::default(),
             background,
+            runs: None,
             stop: CancelToken::none(),
         })
         .await
@@ -1300,6 +1461,9 @@ mod tests {
             modes,
             keep_alive: KeepAlive::new(mailbox.clone(), background),
             stop,
+            runs: None,
+            mode: AgentMode::Build,
+            defaults: SessionDefaults::default(),
         };
         (inputs, prompt_tx, mode_tx)
     }

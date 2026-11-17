@@ -499,6 +499,7 @@ async fn start_session(
             BackgroundMode::Blocking
         },
         // `close_session` ends it, on a stop as on end of input.
+        runs: None,
         stop: CancelToken::none(),
     })
     .await;

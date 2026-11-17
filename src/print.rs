@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use clap::ValueEnum;
 use color_eyre::Result;
 use color_eyre::eyre::{Context, eyre};
-use maki_agent::headless::{self, BackgroundMode, InteractiveHandle, InteractiveParams};
+use maki_agent::headless::{self, BackgroundMode, InteractiveHandle, InteractiveParams, RunsWait};
 use maki_agent::permissions::PluginRuleStore;
 use maki_agent::session::Resumed;
 use maki_agent::tools::QUESTION_TOOL_NAME;
@@ -443,6 +443,12 @@ pub async fn run(params: PrintParams) -> Result<Interrupt> {
         eprintln!("MCP config error: {mcp_config_errors}");
     }
 
+    // How long the run waits for the native runs its prompt started. The
+    // flag wins, then the environment, then the default.
+    let join = resolve_join_timeout(
+        join_timeout,
+        std::env::var(JOIN_TIMEOUT_ENV).ok().as_deref(),
+    );
     let (handle, mut events) = headless::spawn_interactive(InteractiveParams {
         model: model.clone(),
         config,
@@ -463,12 +469,11 @@ pub async fn run(params: PrintParams) -> Result<Interrupt> {
         plugin_rules,
         project_config,
         local_tools: Default::default(),
-        background: BackgroundMode::from_wait(background_wait.or_else(|| {
-            Some(resolve_join_timeout(
-                join_timeout,
-                std::env::var(JOIN_TIMEOUT_ENV).ok().as_deref(),
-            ))
-        })),
+        background: BackgroundMode::from_wait(background_wait.or(Some(join))),
+        runs: Some(RunsWait {
+            timeout: join,
+            wake_main: true,
+        }),
         stop: interrupt.stop(),
     })
     .await;
