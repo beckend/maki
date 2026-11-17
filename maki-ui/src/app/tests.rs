@@ -386,6 +386,7 @@ fn subagent_info_with_tx(
         name: name.into(),
         prompt: None,
         model: None,
+        subagent_type: None,
         opts: None,
         answer_tx,
         control: Arc::default(),
@@ -5593,7 +5594,7 @@ fn rewind_to_middle_truncates_and_populates_input() {
     assert_eq!(app.input_box.buffer.value(), "second prompt");
     assert_eq!(app.run_id, old_run_id);
 
-    let Action::RestartAgent(ref history) = actions[0] else {
+    let Action::RewindAgent(ref history) = actions[0] else {
         panic!("{RESTART_EXPECTED}");
     };
     assert_eq!(history.len(), 2);
@@ -5674,7 +5675,46 @@ fn rewind_to_first_turn_clears_everything() {
     assert_eq!(app.state.token_usage.output, 200);
     assert_eq!(app.state.context_size, 0);
     assert_eq!(app.chats[0].context_size, 0);
-    assert!(matches!(&actions[0], Action::RestartAgent(_)));
+    assert!(matches!(&actions[0], Action::RewindAgent(_)));
+}
+
+/// A rewind rewrites the parent's transcript, not the session: a native run
+/// keeps its tab and goes on working. Only the runs whose receipts the rewind
+/// drops are stopped.
+#[test]
+fn a_rewind_keeps_a_native_run_tab() {
+    const HANDLE: &str = "ag-k3x9ab";
+    let mut app = build_rewind_app();
+    let native = |event| {
+        subagent_msg_with_run_id(event, HANDLE, Some("reader"), maki_agent::BACKGROUND_RUN_ID)
+    };
+    app.update(native(AgentEvent::RunStarted {
+        handle: HANDLE.into(),
+        name: "reader".into(),
+        kind: "agent".into(),
+        parent: None,
+        depth: 1,
+        one_shot: false,
+    }));
+    assert!(app.chat_of_task(HANDLE).is_ok(), "the run has a tab");
+
+    let actions = app.rewind_to(rewind_to_second_turn());
+
+    assert!(
+        matches!(&actions[0], Action::RewindAgent(_)),
+        "{RESTART_EXPECTED}"
+    );
+    let kept = app
+        .chat_of_task(HANDLE)
+        .expect("the run keeps its tab across the rewind");
+    assert!(
+        !app.chats[kept].is_finished(),
+        "the run keeps working after the rewind"
+    );
+    assert!(
+        app.runs.find(HANDLE).is_some(),
+        "the picker has to show the run that goes on working"
+    );
 }
 
 #[test_case(Duration::ZERO,          true  ; "keeps_fresh_error")]
@@ -10875,6 +10915,45 @@ fn double_esc_in_finished_subagent_noop() {
     assert!(actions.is_empty());
 }
 
+/// The stop in a run's tab ends that run alone: what it started stays, since
+/// the stop left it running.
+#[test]
+fn stopping_a_native_run_leaves_the_work_it_started_alone() {
+    const HANDLE: &str = "ag-k3x9ab";
+    let mut app = streaming_app();
+    let native = |event| {
+        subagent_msg_with_run_id(event, HANDLE, Some("reader"), maki_agent::BACKGROUND_RUN_ID)
+    };
+    app.update(native(AgentEvent::RunStarted {
+        handle: HANDLE.into(),
+        name: "reader".into(),
+        kind: "agent".into(),
+        parent: None,
+        depth: 1,
+        one_shot: false,
+    }));
+    // The work the reader started, with its own tab.
+    start_subagent(&mut app, "kid", "kid");
+    let kid = *app.chat_index.get("kid").expect("the kid has a tab");
+    app.chats[kid].parent = Some(TaskParent::Started(Arc::from(HANDLE)));
+
+    let reader = *app.chat_index.get(HANDLE).expect("the run has a tab");
+    app.active_chat = reader;
+    app.last_esc = Some(Instant::now());
+    let actions = app.update(Msg::Key(key(KeyCode::Esc)));
+
+    assert_eq!(actions.len(), 1);
+    assert!(matches!(
+        &actions[0],
+        Action::CancelSubagent { tool_use_id } if tool_use_id == HANDLE
+    ));
+    assert!(app.chats[reader].is_finished(), "the run in front stops");
+    assert!(
+        !app.chats[kid].is_finished(),
+        "the work it started goes on working"
+    );
+}
+
 #[test]
 fn subagent_cancel_then_navigate_back_main_unaffected() {
     let mut app = app_with_active_subagent();
@@ -11548,10 +11627,13 @@ const RESTART_MATCHES_SESSION: &str =
 const MIRROR_SURVIVED: &str = "a history the agent did not produce must drop the mirror with it";
 
 fn restart_history(actions: Vec<Action>) -> Vec<Message> {
-    let Ok([Action::RestartAgent(history)]) = <[Action; 1]>::try_from(actions) else {
+    let Ok([action]) = <[Action; 1]>::try_from(actions) else {
         panic!("{ONE_RESTART}");
     };
-    history
+    match action {
+        Action::RestartAgent(history) | Action::RewindAgent(history) => history,
+        _ => panic!("{ONE_RESTART}"),
+    }
 }
 
 /// A tab mid-conversation with the agent's mirror attached, the only state in
@@ -12325,7 +12407,7 @@ fn rewind_stops_the_tasks_whose_receipt_it_drops(turn_index: usize, stops: bool)
         cancelled, stops,
         "the stop names the task's plugin, its tab is gone by then"
     );
-    assert!(matches!(actions.last(), Some(Action::RestartAgent(_))));
+    assert!(matches!(actions.last(), Some(Action::RewindAgent(_))));
     assert_eq!(app.chat_of_task(RECEIPT_TURN_ID).is_ok(), !stops);
     assert_eq!(
         app.chats[MAIN_CHAT].has_background_badge(RECEIPT_TURN_ID),
@@ -12384,12 +12466,14 @@ fn a_restored_receipt_nobody_answered_reads_lost() {
         tool_use_id: RECEIPT_TURN_ID.into(),
         name: RESEARCH_NAME.into(),
         model: None,
+        subagent_type: None,
         thinking: None,
         fast: false,
         plugin: Some(Arc::from(SLOW_TOOL)),
         cost: None,
         started_at: None,
         ended_at: None,
+        run: None,
     }]);
     session.set_subagent_messages(RECEIPT_TURN_ID.into(), vec![], |_: &Message| Vec::new());
 
@@ -13338,6 +13422,406 @@ fn a_session_opened_under_a_moved_call_works_once_it_runs() {
     assert_eq!(app.chats[tab].task_status(), TaskStatus::Working);
 }
 
+#[test]
+fn native_run_creates_tab_keyed_by_handle() {
+    const HANDLE: &str = "ag-k3x9ab";
+    let mut app = streaming_app();
+    let native = |event| {
+        subagent_msg_with_run_id(event, HANDLE, Some("reader"), maki_agent::BACKGROUND_RUN_ID)
+    };
+    app.update(native(AgentEvent::RunStarted {
+        handle: HANDLE.into(),
+        name: "reader".into(),
+        kind: "agent".into(),
+        parent: None,
+        depth: 1,
+        one_shot: false,
+    }));
+    let idx = *app.chat_index.get(HANDLE).expect("tab keyed by the handle");
+    assert_eq!(app.chats.len(), 2);
+    assert_eq!(app.chats[idx].task_id().map(|id| &**id), Some(HANDLE));
+
+    // A background event is not stale just because the turn counter moved on.
+    app.update(native(AgentEvent::TextDelta {
+        text: "found it".into(),
+    }));
+    assert!(!app.chats[idx].is_finished());
+
+    // The legacy task key space shares the strip without clashing.
+    start_subagent(&mut app, "toolu_legacy", RESEARCH_NAME);
+    assert_eq!(app.chats.len(), 3);
+    assert_ne!(app.chat_index["toolu_legacy"], idx);
+
+    app.update(native(AgentEvent::RunFinished {
+        handle: HANDLE.into(),
+        reason: "completed".into(),
+        detail: None,
+    }));
+    assert!(app.chats[idx].is_finished());
+    assert!(!app.chats[app.chat_index["toolu_legacy"]].is_finished());
+}
+
+/// A run that outlives the turn that started it keeps one chat. The index
+/// that routes a run's events is wiped at the end of every turn, so the next
+/// event of a live run must still find the chat it already has: a second one
+/// would list the same run twice in the picker, and the first would never
+/// end, because its events went to the other.
+#[test]
+fn a_native_run_that_outlives_its_turn_keeps_one_chat() {
+    const HANDLE: &str = "ag-k3x9ab";
+    let mut app = streaming_app();
+    let native = |event| {
+        subagent_msg_with_run_id(event, HANDLE, Some("reader"), maki_agent::BACKGROUND_RUN_ID)
+    };
+    app.update(native(AgentEvent::RunStarted {
+        handle: HANDLE.into(),
+        name: "reader".into(),
+        kind: "agent".into(),
+        parent: None,
+        depth: 1,
+        one_shot: false,
+    }));
+    assert_eq!(app.chats.len(), 2);
+
+    // The turn ends: the routing cache goes with it.
+    app.chat_index.clear();
+
+    app.update(native(AgentEvent::TextDelta {
+        text: "still working".into(),
+    }));
+    assert_eq!(
+        app.chats.len(),
+        2,
+        "the run must not come back as a second chat"
+    );
+    app.sync_subagents();
+    let stored = app.state.session.subagents();
+    assert_eq!(stored.len(), 1, "the run must be stored once: {stored:?}");
+}
+
+#[test]
+fn native_run_is_stored_with_its_state() {
+    const HANDLE: &str = "ag-k3x9ab";
+    let mut app = streaming_app();
+    let native = |event| {
+        subagent_msg_with_run_id(event, HANDLE, Some("reader"), maki_agent::BACKGROUND_RUN_ID)
+    };
+    app.update(native(AgentEvent::RunStarted {
+        handle: HANDLE.into(),
+        name: "reader".into(),
+        kind: "agent".into(),
+        parent: Some("ag-parent".into()),
+        depth: 2,
+        one_shot: true,
+    }));
+    app.sync_subagents();
+    let stored = |app: &App| app.state.session.subagents()[0].run.clone().unwrap();
+    let run = stored(&app);
+    assert_eq!(
+        (
+            run.handle.as_str(),
+            run.parent.as_deref(),
+            run.depth,
+            run.one_shot,
+            run.state.as_str()
+        ),
+        (HANDLE, Some("ag-parent"), 2, true, "running")
+    );
+    app.update(native(AgentEvent::RunFinished {
+        handle: HANDLE.into(),
+        reason: "completed".into(),
+        detail: None,
+    }));
+    app.sync_subagents();
+    assert_eq!(stored(&app).state, "completed");
+}
+
+#[test]
+fn esc_leaves_native_run_tab_running() {
+    const HANDLE: &str = "ag-k3x9ab";
+    let mut app = streaming_app();
+    let native = |event| {
+        subagent_msg_with_run_id(event, HANDLE, Some("reader"), maki_agent::BACKGROUND_RUN_ID)
+    };
+    app.update(native(AgentEvent::RunStarted {
+        handle: HANDLE.into(),
+        name: "reader".into(),
+        kind: "agent".into(),
+        parent: None,
+        depth: 1,
+        one_shot: false,
+    }));
+    let idx = app.chat_index[HANDLE];
+    app.update(Msg::Key(key(KeyCode::Esc)));
+    assert!(!app.chats[idx].is_finished());
+    assert_eq!(app.chat_index.get(HANDLE), Some(&idx));
+    app.update(native(AgentEvent::TextDelta {
+        text: "more".into(),
+    }));
+    assert_eq!(app.chats.len(), 2);
+}
+
+mod run_prompts {
+    use super::*;
+
+    const HANDLE_A: &str = "ag-aaaaaa";
+    const HANDLE_B: &str = "ag-bbbbbb";
+
+    fn ask(handle: &str, name: &str, id: &str, tx: UnboundedSender<String>) -> Msg {
+        Msg::Agent(Box::new(Envelope {
+            event: AgentEvent::PermissionRequest {
+                id: id.into(),
+                tool: ToolKey::native("bash"),
+                scopes: vec!["echo routed".into()],
+                reason: None,
+            },
+            subagent: Some(subagent_info_with_tx(handle, name, Some(tx))),
+            run_id: maki_agent::BACKGROUND_RUN_ID,
+        }))
+    }
+
+    fn event_of(handle: &str, name: &str, event: AgentEvent) -> Msg {
+        subagent_msg_with_run_id(event, handle, Some(name), maki_agent::BACKGROUND_RUN_ID)
+    }
+
+    #[test]
+    fn background_prompt_reaches_ui_with_run_name_and_queues() {
+        let (tx_a, mut rx_a) = unbounded_channel();
+        let (tx_b, mut rx_b) = unbounded_channel();
+        let mut app = streaming_app();
+        app.update(ask(HANDLE_A, "auditor", "same", tx_a));
+        app.update(ask(HANDLE_B, "builder", "same", tx_b));
+        assert_eq!(
+            app.permission_prompt.front_label(),
+            Some("auditor (ag-aaaaaa)")
+        );
+        app.update(Msg::Key(key(KeyCode::Char('y'))));
+        assert_eq!(rx_a.try_recv().unwrap(), allow_once("same"));
+        assert!(rx_b.is_empty(), "the answer applies to that run only");
+        assert_eq!(
+            app.permission_prompt.front_label(),
+            Some("builder (ag-bbbbbb)")
+        );
+        app.update(Msg::Key(key(KeyCode::Esc)));
+        assert_eq!(
+            rx_b.try_recv().unwrap(),
+            TaggedAnswer::new("same", PermissionAnswer::Deny).encode(),
+            "Esc dismisses a run's ask as a denial"
+        );
+        assert!(rx_a.is_empty());
+    }
+
+    #[test]
+    fn a_cancelled_turn_leaves_a_runs_prompt_and_its_answer_route() {
+        let (tx, mut rx) = unbounded_channel();
+        let mut app = streaming_app();
+        app.update(ask(HANDLE_A, "auditor", "t1", tx));
+        app.handle_cancel();
+        assert!(app.permission_prompt.is_open(), "the run is still waiting");
+        app.update(Msg::Key(key(KeyCode::Char('y'))));
+        assert_eq!(rx.try_recv().unwrap(), allow_once("t1"));
+    }
+
+    #[test]
+    fn withdrawn_prompt_leaves_the_screen() {
+        let (tx, _rx) = unbounded_channel();
+        let mut app = streaming_app();
+        app.update(ask(HANDLE_A, "auditor", "t1", tx));
+        app.update(event_of(
+            HANDLE_B,
+            "builder",
+            AgentEvent::PermissionWithdrawn { id: "t1".into() },
+        ));
+        assert!(
+            app.permission_prompt.is_open(),
+            "another run's withdraw is not ours"
+        );
+        app.update(event_of(
+            HANDLE_A,
+            "auditor",
+            AgentEvent::PermissionWithdrawn { id: "t1".into() },
+        ));
+        assert!(!app.permission_prompt.is_open());
+    }
+
+    #[test]
+    fn finished_run_takes_its_prompt_with_it() {
+        let (tx, _rx) = unbounded_channel();
+        let mut app = streaming_app();
+        app.update(event_of(
+            HANDLE_A,
+            "auditor",
+            AgentEvent::RunStarted {
+                handle: HANDLE_A.into(),
+                name: "auditor".into(),
+                kind: "agent".into(),
+                parent: None,
+                depth: 1,
+                one_shot: false,
+            },
+        ));
+        app.update(ask(HANDLE_A, "auditor", "t1", tx));
+        assert!(app.permission_prompt.is_open());
+        app.update(event_of(
+            HANDLE_A,
+            "auditor",
+            AgentEvent::RunFinished {
+                handle: HANDLE_A.into(),
+                reason: "killed".into(),
+                detail: None,
+            },
+        ));
+        assert!(!app.permission_prompt.is_open());
+    }
+}
+
+mod run_prompts_after_main_turn {
+    use super::*;
+
+    #[test]
+    fn a_runs_answer_route_survives_the_main_turn_ending() {
+        let (tx, mut rx) = unbounded_channel();
+        let mut app = streaming_app();
+        app.update(Msg::Agent(Box::new(Envelope {
+            event: AgentEvent::PermissionRequest {
+                id: "t1".into(),
+                tool: ToolKey::native("bash"),
+                scopes: vec!["echo routed".into()],
+                reason: None,
+            },
+            subagent: Some(subagent_info_with_tx("ag-aaaaaa", "auditor", Some(tx))),
+            run_id: maki_agent::BACKGROUND_RUN_ID,
+        })));
+        app.update(agent_msg(done()));
+        app.update(Msg::Key(key(KeyCode::Char('y'))));
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            allow_once("t1"),
+            "answer must reach the run"
+        );
+    }
+}
+
+const RUN_A: &str = "ag-aaaaaa";
+const RUN_B: &str = "ag-bbbbbb";
+
+fn run_event(app: &mut App, handle: &str, name: &str, event: AgentEvent) {
+    app.update(subagent_msg_with_run_id(
+        event,
+        handle,
+        Some(name),
+        maki_agent::BACKGROUND_RUN_ID,
+    ));
+}
+
+fn start_run(app: &mut App, handle: &str, name: &str, parent: Option<&str>, one_shot: bool) {
+    run_event(
+        app,
+        handle,
+        name,
+        AgentEvent::RunStarted {
+            handle: handle.into(),
+            name: name.into(),
+            kind: "agent".into(),
+            parent: parent.map(Into::into),
+            depth: 1,
+            one_shot,
+        },
+    );
+}
+
+fn finish_run(app: &mut App, handle: &str, name: &str, reason: &str) {
+    run_event(
+        app,
+        handle,
+        name,
+        AgentEvent::RunFinished {
+            handle: handle.into(),
+            reason: reason.into(),
+            detail: None,
+        },
+    );
+}
+
+fn start_shell(app: &mut App, handle: &str) {
+    app.update(agent_msg_with_run_id(
+        AgentEvent::RunStarted {
+            handle: handle.into(),
+            name: "build".into(),
+            kind: "shell".into(),
+            parent: None,
+            depth: 1,
+            one_shot: true,
+        },
+        maki_agent::BACKGROUND_RUN_ID,
+    ));
+}
+
+#[test]
+fn status_segment_hidden_at_zero() {
+    let mut app = streaming_app();
+    assert!(!rendered(&mut app).contains("runs "));
+    start_run(&mut app, RUN_A, "reader", None, false);
+    start_shell(&mut app, "sh-cccccc");
+    assert!(rendered(&mut app).contains("[runs 2 running]"));
+    finish_run(&mut app, RUN_A, "reader", "completed");
+    app.update(agent_msg_with_run_id(
+        AgentEvent::RunFinished {
+            handle: "sh-cccccc".into(),
+            reason: "completed".into(),
+            detail: None,
+        },
+        maki_agent::BACKGROUND_RUN_ID,
+    ));
+    assert!(!rendered(&mut app).contains("runs "));
+}
+
+#[test]
+fn permission_badge_shown() {
+    let mut app = streaming_app();
+    start_run(&mut app, RUN_A, "reader", None, false);
+    let (tx, _rx) = unbounded_channel();
+    app.update(Msg::Agent(Box::new(Envelope {
+        event: AgentEvent::PermissionRequest {
+            id: "ask-1".into(),
+            tool: ToolKey::native("bash"),
+            scopes: vec!["ls".into()],
+            reason: None,
+        },
+        subagent: Some(subagent_info_with_tx(RUN_A, "reader", Some(tx))),
+        run_id: maki_agent::BACKGROUND_RUN_ID,
+    })));
+    assert!(rendered(&mut app).contains("[runs 1 running !]"));
+    app.update(Msg::Agent(Box::new(Envelope {
+        event: AgentEvent::PermissionWithdrawn { id: "ask-1".into() },
+        subagent: Some(subagent_info_with_tx(RUN_A, "reader", None)),
+        run_id: maki_agent::BACKGROUND_RUN_ID,
+    })));
+    let screen = rendered(&mut app);
+    assert!(screen.contains("[runs 1 running]"), "{screen}");
+}
+
+#[test]
+fn runs_command_lists_tree_and_enter_focuses_the_tab() {
+    let mut app = streaming_app();
+    start_run(&mut app, RUN_A, "lead", None, false);
+    start_run(&mut app, RUN_B, "helper", Some(RUN_A), false);
+    start_shell(&mut app, "sh-cccccc");
+    type_and_submit(&mut app, "/runs");
+    assert!(app.runs_picker.is_open());
+    let screen = rendered(&mut app);
+    assert!(screen.contains("lead"), "{screen}");
+    assert!(screen.contains("  helper"), "{screen}");
+    assert!(screen.contains("sh-cccccc"), "{screen}");
+    app.update(Msg::Key(key(KeyCode::Down)));
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert!(!app.runs_picker.is_open());
+    assert_eq!(
+        app.chats[app.active_chat].task_id().unwrap().as_ref(),
+        RUN_B
+    );
+}
+
 const OWNER_MISMATCH: &str = "the wrong state holds the keyboard";
 const OWNER_NOT_OPENED: &str = "the later owner has to be open for the earlier one to beat it";
 const OWNER_INPUT_MISMATCH: &str = "the chat input is focused only when the chat owns the keyboard";
@@ -13350,6 +13834,17 @@ fn open_file_picker(app: &mut App) {
     app.file_picker.open(env!("CARGO_MANIFEST_DIR"));
 }
 
+/// The handle a run's log is filed under, the one the log viewer opens.
+const OWNER_RUN_HANDLE: &str = "sh-owner";
+
+fn open_log_viewer(app: &mut App) {
+    app.log_viewer.open(OWNER_RUN_HANDLE, None);
+}
+
+fn open_runs_picker(app: &mut App) {
+    app.runs_picker.open(Vec::new());
+}
+
 /// Exhaustive on purpose: a new owner does not build until it can be opened.
 fn open_owner(app: &mut App, owner: KeyboardOwner) {
     match owner {
@@ -13358,6 +13853,7 @@ fn open_owner(app: &mut App, owner: KeyboardOwner) {
         KeyboardOwner::PackReview => open_pack_review(app),
         KeyboardOwner::PlanForm => open_plan_form(app),
         KeyboardOwner::Help => open_help(app),
+        KeyboardOwner::LogViewer => open_log_viewer(app),
         KeyboardOwner::Usage => open_usage(app),
         KeyboardOwner::Btw => open_btw(app),
         KeyboardOwner::FocusedWindow => open_cursor_float(app),
@@ -13368,6 +13864,7 @@ fn open_owner(app: &mut App, owner: KeyboardOwner) {
         KeyboardOwner::ThemePicker => open_theme(app),
         KeyboardOwner::ModelPicker => open_model_picker(app),
         KeyboardOwner::LoginPicker => open_login_provider_list(app),
+        KeyboardOwner::RunsPicker => open_runs_picker(app),
         KeyboardOwner::McpPicker => open_mcp(app),
         KeyboardOwner::Chat => {}
     }
@@ -13378,6 +13875,7 @@ fn open_owner(app: &mut App, owner: KeyboardOwner) {
 #[test_case(KeyboardOwner::PackReview ; "pack_review")]
 #[test_case(KeyboardOwner::PlanForm ; "plan_form")]
 #[test_case(KeyboardOwner::Help ; "help")]
+#[test_case(KeyboardOwner::LogViewer ; "log_viewer")]
 #[test_case(KeyboardOwner::Usage ; "usage")]
 #[test_case(KeyboardOwner::Btw ; "btw")]
 #[test_case(KeyboardOwner::FocusedWindow ; "focused_window")]
@@ -13388,6 +13886,7 @@ fn open_owner(app: &mut App, owner: KeyboardOwner) {
 #[test_case(KeyboardOwner::ThemePicker ; "theme_picker")]
 #[test_case(KeyboardOwner::ModelPicker ; "model_picker")]
 #[test_case(KeyboardOwner::LoginPicker ; "login_picker")]
+#[test_case(KeyboardOwner::RunsPicker ; "runs_picker")]
 #[test_case(KeyboardOwner::McpPicker ; "mcp_picker")]
 #[test_case(KeyboardOwner::Chat ; "chat")]
 fn each_owner_alone_holds_the_keyboard(owner: KeyboardOwner) {
@@ -13418,7 +13917,8 @@ fn each_owner_alone_holds_the_keyboard(owner: KeyboardOwner) {
 #[test_case(KeyboardOwner::Permission, KeyboardOwner::PackReview ; "permission_over_pack_review")]
 #[test_case(KeyboardOwner::PackReview, KeyboardOwner::PlanForm ; "pack_review_over_plan_form")]
 #[test_case(KeyboardOwner::PlanForm, KeyboardOwner::Help ; "plan_form_over_help")]
-#[test_case(KeyboardOwner::Help, KeyboardOwner::Usage ; "help_over_usage")]
+#[test_case(KeyboardOwner::Help, KeyboardOwner::LogViewer ; "help_over_log_viewer")]
+#[test_case(KeyboardOwner::LogViewer, KeyboardOwner::Usage ; "log_viewer_over_usage")]
 #[test_case(KeyboardOwner::Usage, KeyboardOwner::Btw ; "usage_over_btw")]
 #[test_case(KeyboardOwner::Btw, KeyboardOwner::FocusedWindow ; "btw_over_focused_window")]
 #[test_case(KeyboardOwner::FocusedWindow, KeyboardOwner::Search ; "focused_window_over_search")]
@@ -13428,7 +13928,8 @@ fn each_owner_alone_holds_the_keyboard(owner: KeyboardOwner) {
 #[test_case(KeyboardOwner::RewindPicker, KeyboardOwner::ThemePicker ; "rewind_picker_over_theme_picker")]
 #[test_case(KeyboardOwner::ThemePicker, KeyboardOwner::ModelPicker ; "theme_picker_over_model_picker")]
 #[test_case(KeyboardOwner::ModelPicker, KeyboardOwner::LoginPicker ; "model_picker_over_login_picker")]
-#[test_case(KeyboardOwner::LoginPicker, KeyboardOwner::McpPicker ; "login_picker_over_mcp_picker")]
+#[test_case(KeyboardOwner::LoginPicker, KeyboardOwner::RunsPicker ; "login_picker_over_runs_picker")]
+#[test_case(KeyboardOwner::RunsPicker, KeyboardOwner::McpPicker ; "runs_picker_over_mcp_picker")]
 fn the_earlier_owner_holds_the_keyboard_over_the_next(
     earlier: KeyboardOwner,
     later: KeyboardOwner,
@@ -13442,6 +13943,221 @@ fn the_earlier_owner_holds_the_keyboard_over_the_next(
         app.keyboard_owner(),
         earlier,
         "{OWNER_MISMATCH}: {earlier:?} over {later:?}"
+    );
+}
+
+#[test]
+fn runs_picker_on_a_shell_row_opens_the_log_viewer() {
+    let mut app = streaming_app();
+    start_shell(&mut app, "sh-cccccc");
+    type_and_submit(&mut app, "/runs");
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert_eq!(app.active_chat, 0);
+    assert!(app.log_viewer.is_open());
+    app.update(Msg::Key(key(KeyCode::Esc)));
+    assert!(!app.log_viewer.is_open());
+}
+
+#[test]
+fn stop_command_all() {
+    let mut app = streaming_app();
+    let actions = type_and_submit(&mut app, "/stop all");
+    assert!(actions.is_empty());
+    assert_eq!(app.status_bar.flash_text(), Some(NO_LIVE_RUNS));
+    start_run(&mut app, RUN_A, "reader", None, false);
+    let actions = type_and_submit(&mut app, "/stop all");
+    assert!(matches!(&actions[..], [Action::StopRuns { target }] if target == "all"));
+    let actions = type_and_submit(&mut app, "/stop reader");
+    assert!(matches!(&actions[..], [Action::StopRuns { target }] if target == RUN_A));
+    let actions = type_and_submit(&mut app, "/stop nobody");
+    assert!(actions.is_empty());
+    assert_eq!(app.status_bar.flash_text(), Some("No such run: nobody"));
+    finish_run(&mut app, RUN_A, "reader", "completed");
+    type_and_submit(&mut app, "/stop reader");
+    assert_eq!(app.status_bar.flash_text(), Some(RUN_NOT_LIVE));
+}
+
+#[test]
+fn typing_into_a_finished_run_tab_revives_it() {
+    let mut app = streaming_app();
+    start_run(&mut app, RUN_A, "reader", None, false);
+    finish_run(&mut app, RUN_A, "reader", "completed");
+    let idx = app.chat_index[RUN_A];
+    assert!(app.chats[idx].is_finished());
+    app.set_active_chat(idx);
+    assert!(app.chat_accepts_input());
+    let actions = type_and_submit(&mut app, "one more thing");
+    assert!(matches!(
+        &actions[..],
+        [Action::SendToRun { handle, text }] if handle == RUN_A && text == "one more thing"
+    ));
+    assert_eq!(app.chats[idx].last_message_text(), "one more thing");
+    // The hub's revive announces itself with a state change.
+    run_event(
+        &mut app,
+        RUN_A,
+        "reader",
+        AgentEvent::RunStateChanged {
+            handle: RUN_A.into(),
+            state: "running".into(),
+        },
+    );
+    assert!(!app.chats[idx].is_finished());
+    assert_eq!(app.chats[idx].run.as_ref().unwrap().state, "running");
+    assert!(rendered(&mut app).contains("[runs 1 running]"));
+}
+
+/// A native run works in the background like a plugin's task does: the
+/// status bar says the session is busy while it does, and it stops saying so
+/// when the run ends.
+#[test]
+fn a_working_native_run_counts_as_a_background_task() {
+    let mut app = streaming_app();
+    start_run(&mut app, RUN_A, "reader", None, false);
+    assert_eq!(app.running_background_tasks().count(), 1);
+    assert!(app.is_working(), "the status bar spins while a run works");
+    finish_run(&mut app, RUN_A, "reader", "completed");
+    assert_eq!(app.running_background_tasks().count(), 0);
+}
+
+#[test]
+fn a_completed_one_shot_run_tab_takes_input() {
+    let mut app = streaming_app();
+    start_run(&mut app, RUN_A, "reader", None, true);
+    finish_run(&mut app, RUN_A, "reader", "completed");
+    let idx = app.chat_index[RUN_A];
+    app.set_active_chat(idx);
+    assert!(app.chat_accepts_input());
+    // A finished run is brought back from its transcript by the message.
+    let actions = type_and_submit(&mut app, "one more thing");
+    assert!(matches!(
+        &actions[..],
+        [Action::SendToRun { handle, text }] if handle == RUN_A && text == "one more thing"
+    ));
+}
+
+#[test]
+fn a_revived_run_answers_prompts_on_its_new_route() {
+    let mut app = streaming_app();
+    let (old_tx, old_rx) = unbounded_channel();
+    let (new_tx, mut new_rx) = unbounded_channel();
+    start_run(&mut app, RUN_A, "reader", None, false);
+    app.update(Msg::Agent(Box::new(Envelope {
+        event: AgentEvent::RunStateChanged {
+            handle: RUN_A.into(),
+            state: "running".into(),
+        },
+        subagent: Some(subagent_info_with_tx(RUN_A, "reader", Some(old_tx))),
+        run_id: maki_agent::BACKGROUND_RUN_ID,
+    })));
+    finish_run(&mut app, RUN_A, "reader", "completed");
+    app.update(Msg::Agent(Box::new(Envelope {
+        event: AgentEvent::RunStateChanged {
+            handle: RUN_A.into(),
+            state: "running".into(),
+        },
+        subagent: Some(subagent_info_with_tx(RUN_A, "reader", Some(new_tx.clone()))),
+        run_id: maki_agent::BACKGROUND_RUN_ID,
+    })));
+    app.update(Msg::Agent(Box::new(Envelope {
+        event: AgentEvent::PermissionRequest {
+            id: "ask-2".into(),
+            tool: ToolKey::native("bash"),
+            scopes: vec!["ls".into()],
+            reason: None,
+        },
+        subagent: Some(subagent_info_with_tx(RUN_A, "reader", Some(new_tx))),
+        run_id: maki_agent::BACKGROUND_RUN_ID,
+    })));
+    app.update(Msg::Key(key(KeyCode::Char('y'))));
+    assert!(old_rx.is_empty());
+    assert_eq!(new_rx.try_recv().unwrap(), allow_once("ask-2"));
+}
+
+fn restored_native_app(state_before_exit: &str) -> App {
+    let mut app = streaming_app();
+    start_run(&mut app, RUN_A, "reader", None, false);
+    if state_before_exit != "running" {
+        finish_run(&mut app, RUN_A, "reader", state_before_exit);
+    }
+    close_subagent_transcript(&mut app, RUN_A);
+    app.sync_subagents();
+    app.reset_ui_chrome();
+    app.restore_display();
+    app
+}
+
+#[test]
+fn restored_native_tab_is_read_only_until_a_message_revives_it() {
+    let mut app = restored_native_app("completed");
+    let idx = app.chat_index[RUN_A];
+    assert!(app.chats[idx].is_finished());
+    assert_eq!(app.chats[idx].run.as_ref().unwrap().state, "completed");
+    assert_eq!(app.runs.state_of(RUN_A), Some("completed"));
+    assert!(!rendered(&mut app).contains("runs "));
+    app.set_active_chat(idx);
+    let actions = type_and_submit(&mut app, "welcome back");
+    assert!(matches!(&actions[..], [Action::SendToRun { handle, .. }] if handle == RUN_A));
+}
+
+#[test]
+fn restored_run_that_was_live_reads_as_lost() {
+    let mut app = restored_native_app("running");
+    let idx = app.chat_index[RUN_A];
+    assert_eq!(app.chats[idx].run.as_ref().unwrap().state, "lost");
+    assert!(app.chats[idx].is_finished());
+    assert!(rendered(&mut app).contains("[runs 1 lost]"));
+    app.sync_subagents();
+    assert_eq!(
+        app.state.session.subagents()[0].run.as_ref().unwrap().state,
+        "lost"
+    );
+}
+
+/// A child the journal lost comes back with the tools it had, and one the
+/// session does not describe comes back read-only: the tools it comes back
+/// with are never wider than the ones it had.
+#[test]
+fn a_remembered_run_keeps_its_kind() {
+    let run = maki_storage::sessions::StoredRun {
+        handle: "ag-lost01".into(),
+        name: "lost".into(),
+        parent: None,
+        kind: "agent".into(),
+        state: "killed".into(),
+        depth: 1,
+        one_shot: true,
+    };
+    let stored = StoredSubagent {
+        tool_use_id: "ag-lost01".into(),
+        name: "lost".into(),
+        model: None,
+        subagent_type: Some("general".into()),
+        thinking: None,
+        fast: false,
+        plugin: None,
+        cost: None,
+        started_at: None,
+        ended_at: None,
+        run: Some(run),
+    };
+    let spec = maki_agent::runs::spec_for(
+        stored.subagent_type.as_deref(),
+        stored.run.as_ref().is_some_and(|run| run.one_shot),
+    );
+    assert_eq!(spec.subagent_type, "general");
+    assert!(spec.one_shot);
+    assert!(spec.prompt.is_empty());
+    let mut unknown = stored.clone();
+    unknown.subagent_type = None;
+    assert_eq!(
+        maki_agent::runs::spec_for(
+            unknown.subagent_type.as_deref(),
+            unknown.run.as_ref().is_some_and(|run| run.one_shot)
+        )
+        .subagent_type,
+        "research",
+        "a child the session does not describe is read-only"
     );
 }
 
@@ -13473,6 +14189,7 @@ const OWNER_LEAKED_A_KEY: &str = "a key the holder of the keyboard answers must 
 #[test_case(KeyboardOwner::Permission ; "permission")]
 #[test_case(KeyboardOwner::PackReview ; "pack_review")]
 #[test_case(KeyboardOwner::PlanForm ; "plan_form")]
+#[test_case(KeyboardOwner::LogViewer ; "log_viewer")]
 #[test_case(KeyboardOwner::Usage ; "usage")]
 #[test_case(KeyboardOwner::Btw ; "btw")]
 #[test_case(KeyboardOwner::FocusedWindow ; "focused_window")]
@@ -13483,6 +14200,7 @@ const OWNER_LEAKED_A_KEY: &str = "a key the holder of the keyboard answers must 
 #[test_case(KeyboardOwner::ThemePicker ; "theme_picker")]
 #[test_case(KeyboardOwner::ModelPicker ; "model_picker")]
 #[test_case(KeyboardOwner::LoginPicker ; "login_picker")]
+#[test_case(KeyboardOwner::RunsPicker ; "runs_picker")]
 #[test_case(KeyboardOwner::McpPicker ; "mcp_picker")]
 fn the_holder_of_the_keyboard_keeps_a_shortcut_from_the_chat(owner: KeyboardOwner) {
     let mut app = test_app();

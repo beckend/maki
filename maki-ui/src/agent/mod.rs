@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
+use maki_agent::AgentEvent;
 use maki_agent::mcp::McpSession;
 use maki_agent::permissions::PermissionManager;
 use maki_agent::session::Resumed;
@@ -37,9 +38,15 @@ pub(crate) use maki_agent::ModelSlot;
 /// Why a tab's agent loop is replaced.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Respawn {
-    /// The tab's own session moved on (rewind, `/new`). Its meta lags behind
-    /// the mailbox then, so the receipts it lists are not lost work.
+    /// The tab's own session moved on (`/new`). Its meta lags behind the
+    /// mailbox then, so the receipts it lists are not lost work. The session
+    /// is gone, so its runs go with it.
     Restart,
+    /// A rewind: the parent's transcript goes back to an earlier turn, but
+    /// the session is the same one, so its runs stay. A sub-agent that the
+    /// rewind keeps goes on working; only the runs whose receipts the rewind
+    /// drops are stopped.
+    Rewind,
     /// A stored session was loaded into the tab. The receipts it left
     /// unanswered come back as lost notices, ahead of its restored queue.
     Load,
@@ -113,7 +120,15 @@ impl AgentHandles {
         deps: AgentDeps,
     ) -> Self {
         let seed = deps.seed(&resumed, model_slot, config, tool_output_lines, permissions);
-        spawn_agent_internal(unbounded_channel(), seed, resumed, lua_handle, deps, false)
+        spawn_agent_internal(
+            unbounded_channel(),
+            seed,
+            resumed,
+            lua_handle,
+            deps,
+            false,
+            None,
+        )
     }
 
     pub(crate) fn mcp_reader(&self) -> McpSnapshotReader {
@@ -154,13 +169,83 @@ impl AgentHandles {
     }
 
     pub(crate) fn cancel_subagent(&self, tool_use_id: String) {
+        // A native run's tab is keyed by its handle, and it stops through the
+        // hub. Only that run goes: what it started moves up to its own parent
+        // and goes on working, since the user stopped the run in front of them
+        // and not the work below it.
+        if let Some(runs) = self.mailbox.seed().and_then(|seed| seed.runs.clone())
+            && let Ok(id) = runs.hub.resolve(runs.hub.main(), &tool_use_id)
+        {
+            runs.hub.stop(
+                runs.hub.main(),
+                &[id],
+                maki_agent::runs::StopOpts {
+                    detach: true,
+                    ..Default::default()
+                },
+            );
+            return;
+        }
         self.subagent_cancels.cancel(tool_use_id);
+    }
+
+    /// `/stop`: a handle or name stops that run and what it started, `all`
+    /// every live run. Fire and forget, like the stop an Esc in the tab does.
+    pub(crate) fn stop_runs(&self, target: &str) {
+        let Some(runs) = self.mailbox.seed().and_then(|seed| seed.runs.clone()) else {
+            return;
+        };
+        let hub = &runs.hub;
+        let ids: Vec<_> = if target == "all" {
+            hub.list(hub.main(), maki_agent::runs::Scope::Children)
+                .into_iter()
+                .filter(|v| !v.state.is_done())
+                .map(|v| v.id)
+                .collect()
+        } else {
+            hub.resolve(hub.main(), target).into_iter().collect()
+        };
+        hub.stop(hub.main(), &ids, maki_agent::runs::StopOpts::default());
+    }
+
+    /// Text typed in a native run's tab: a steer from the user, after bringing
+    /// a finished run back from its transcript when it is not live. The work
+    /// is async (transcript and launch), so it runs detached and reports a
+    /// refusal as a notice in the main chat.
+    pub(crate) fn send_to_run(&self, handle: String, text: String) {
+        let Some(runs) = self.mailbox.seed().and_then(|seed| seed.runs.clone()) else {
+            return;
+        };
+        let seed = self.mailbox.seed();
+        let events = maki_agent::EventSender::new(self.agent_tx.clone(), 0);
+        tokio::spawn(async move {
+            if let Err(e) = deliver_to_run(&runs, seed.as_deref(), &handle, text).await {
+                events.try_send(AgentEvent::Notice {
+                    text: format!("could not message {handle}: {}", why(&e)),
+                });
+            }
+        });
     }
 
     /// Respawn or shutdown: this loop is done, whatever it was in the middle of.
     pub(crate) fn cancel_all(&self) {
+        self.cancel_loop();
+        self.shutdown_runs();
+    }
+
+    /// The loop's own work: the run in flight and the legacy subagents of the
+    /// turn. A native run lives on the hub and outlives the loop.
+    fn cancel_loop(&self) {
         self.cancels.cancel_all();
         self.subagent_cancels.cancel_all();
+    }
+
+    /// The session's runs: the hub's own shutdown, which stops every run and
+    /// settles it. Only the session going away does this.
+    fn shutdown_runs(&self) {
+        if let Some(runs) = self.mailbox.seed().and_then(|seed| seed.runs.clone()) {
+            runs.hub.shutdown();
+        }
     }
 
     pub(crate) fn send_mcp(&self, cmd: McpCommand) {
@@ -171,6 +256,16 @@ impl AgentHandles {
 
     pub(crate) fn mailbox(&self) -> &SessionMailbox {
         &self.mailbox
+    }
+
+    /// True when a waking run notice is queued for `main` and the wake budget
+    /// allows a turn for it. The notice itself stays in the hub's inbox; the
+    /// run this starts drains it like any other.
+    pub(crate) fn claim_run_wake(&self) -> bool {
+        self.mailbox
+            .seed()
+            .and_then(|seed| seed.runs.clone())
+            .is_some_and(|runs| runs.hub.claim_main_wake())
     }
 
     /// The new loop runs under the app's permissions and Lua handle.
@@ -187,6 +282,16 @@ impl AgentHandles {
         // thing that makes the old loop's in-flight envelopes stale. It lives
         // here so no caller can respawn without it.
         app.run_id += 1;
+        // A rewind rewrites the parent's transcript, not the session: the hub
+        // and the runs on it stay, so a sub-agent the rewind keeps goes on
+        // working. A new session or a loaded one brings its own runs, so the
+        // old hub goes down with the old loop.
+        let keep_runs = reason == Respawn::Rewind;
+        let runs = if keep_runs {
+            self.mailbox.seed().and_then(|seed| seed.runs.clone())
+        } else {
+            None
+        };
         let resumed = Resumed {
             id: SessionRef::from(app.state.session.id),
             history,
@@ -213,6 +318,7 @@ impl AgentHandles {
             app.lua_event_handle.clone(),
             self.deps.clone(),
             true,
+            runs,
         );
         let old = mem::replace(self, new);
         // Repoint the app at the new queue before dropping `old`, otherwise the app keeps
@@ -224,7 +330,12 @@ impl AgentHandles {
             app.restore_lost_background();
         }
         app.flush_restored_queue();
-        old.cancel_all();
+        if keep_runs {
+            // The hub stays: its runs are the session's, not the loop's.
+            old.cancel_loop();
+        } else {
+            old.cancel_all();
+        }
     }
 
     pub(crate) fn is_finished(&self) -> bool {
@@ -264,6 +375,7 @@ fn spawn_agent_internal(
     lua_handle: EventHandle,
     deps: AgentDeps,
     reload_auth: bool,
+    runs: Option<maki_agent::runs::RunsCtx>,
 ) -> AgentHandles {
     let (answer_tx, answer_rx) = unbounded_channel::<String>();
     let (queue_tx, queue_rx) = shared_queue::queue();
@@ -276,6 +388,17 @@ fn spawn_agent_internal(
     let subagent_cancels: Arc<CancelMap<String>> = Arc::new(CancelMap::new());
     let mailbox = SessionMailbox::register(resumed.id.id());
 
+    // The hub of the session this loop takes over, when the session stays and
+    // only the transcript changes (a rewind). A fresh session starts its own.
+    let runs = runs.or_else(|| {
+        maki_agent::runs::start_session(
+            &seed.config.runs,
+            maki_agent::EventSender::new(agent_tx.clone(), 0),
+            resumed.id.id(),
+            true,
+        )
+    });
+    let seed = seed.with_runs(runs);
     let provider = Arc::clone(&seed.model_slot.load().provider);
 
     let agent_loop = AgentLoop::new(
@@ -314,6 +437,52 @@ fn spawn_agent_internal(
         mailbox,
         task,
     }
+}
+
+/// What a refusal to revive a run says, in words a user can act on. The
+/// hub's codes name the reason; the tab needs the reason spelled out.
+fn why(error: &str) -> String {
+    match error {
+        "RECIPIENT_TERMINAL" => {
+            "its history was not kept, so there is nothing to continue from".to_owned()
+        }
+        "UNKNOWN_RUN" => "it is not one of this session's runs any more".to_owned(),
+        "NOT_REACHABLE" => "it cannot be reached from here".to_owned(),
+        "NOT_AGENT" => "it is a command, not an agent".to_owned(),
+        other => other.to_owned(),
+    }
+}
+
+/// One message from the user to a run, reviving it first when it is finished.
+async fn deliver_to_run(
+    runs: &maki_agent::runs::RunsCtx,
+    seed: Option<&maki_agent::AgentSeed>,
+    handle: &str,
+    text: String,
+) -> Result<(), String> {
+    use maki_agent::runs::{AgentLaunch, DeliveryKind};
+    let hub = &runs.hub;
+    let user = hub.user();
+    let to = hub.resolve(hub.main(), handle).map_err(|e| e.to_string())?;
+    let kind = DeliveryKind::Steer;
+    let Some(plan) = hub.revive_plan(user, to).map_err(|e| e.to_string())? else {
+        return hub
+            .send(user, to, text, kind)
+            .map(|_| ())
+            .map_err(|e| e.to_string());
+    };
+    let seed = seed.ok_or("the session has no live agent")?;
+    let (loader, name) = (Arc::clone(hub), plan.handle.to_string());
+    let transcript = tokio::task::spawn_blocking(move || loader.load_transcript(&name))
+        .await
+        .ok()
+        .flatten()
+        .ok_or("its transcript is gone")?;
+    let ctx = seed.tool_context(maki_agent::CancelToken::none());
+    let launch = AgentLaunch::prepare(&ctx, &plan.spec).await?;
+    hub.revive(user, plan, launch, transcript, text, kind)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -429,6 +598,15 @@ mod tests {
         model_slot: &Arc<ArcSwap<ModelSlot>>,
         initial_history: Vec<Message>,
     ) -> AgentHandles {
+        spawn_with_config(model_slot, AgentConfig::default(), initial_history)
+    }
+
+    /// A loop under `config`, so a test can turn the native runs on.
+    fn spawn_with_config(
+        model_slot: &Arc<ArcSwap<ModelSlot>>,
+        config: AgentConfig,
+        initial_history: Vec<Message>,
+    ) -> AgentHandles {
         let permissions = Arc::new(PermissionManager::new(
             PermissionsConfig::default(),
             PathBuf::from("/tmp"),
@@ -441,7 +619,7 @@ mod tests {
                 history: initial_history,
                 ..Resumed::fresh()
             },
-            AgentConfig::default(),
+            config,
             ToolOutputLines::default(),
             &permissions,
             EventHandle::disconnected_for_test(),
@@ -577,6 +755,60 @@ mod tests {
         let model_id = reported.recv_timeout(LONG_TIMEOUT).expect(NO_CALL);
         await_turn_end(handles);
         model_id
+    }
+
+    /// A finished shell run leaves a waking notice in `main`'s inbox and one
+    /// `RunNotice` event, so the event loop wakes; the claim says yes once, and
+    /// nothing is left to start a second turn once the run drained it.
+    #[test]
+    fn run_notice_wakes_idle_main() {
+        let _runtime = enter_runtime();
+        let model_slot = Arc::new(ArcSwap::from_pointee(ModelSlot {
+            model: crate::components::test_model(),
+            provider: Arc::new(StubProvider::default()),
+        }));
+        let mut config = AgentConfig::default();
+        config.runs.enabled = true;
+        let mut handles = spawn_with_config(&model_slot, config, Vec::new());
+        let runs = handles.mailbox.seed().and_then(|seed| seed.runs.clone());
+        let runs = runs.expect("runs are enabled");
+        assert!(!handles.claim_run_wake(), "nothing queued yet");
+        let req: maki_agent::runs::SpawnRequest = serde_json::from_value(serde_json::json!({
+            "kind": "shell", "description": "quick", "command": "true"
+        }))
+        .unwrap();
+        runs.hub.spawn(runs.hub.main(), req).unwrap();
+        let end = std::time::Instant::now() + LONG_TIMEOUT;
+        while !handles.claim_run_wake() {
+            assert!(std::time::Instant::now() < end, "no wake for the notice");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(wait_for_run_notice(&mut handles), "the event loop is told");
+        // The turn this starts drains the notice, so there is nothing to wake again.
+        assert_eq!(
+            runs.hub
+                .inbox_of(runs.hub.main())
+                .unwrap()
+                .drain_step()
+                .len(),
+            1
+        );
+        assert!(!handles.claim_run_wake());
+    }
+
+    /// Waits for the notice that wakes the event loop. The event follows the
+    /// queueing of the notice, so it may arrive a moment later.
+    fn wait_for_run_notice(handles: &mut AgentHandles) -> bool {
+        let end = std::time::Instant::now() + LONG_TIMEOUT;
+        while std::time::Instant::now() < end {
+            while let Ok(envelope) = handles.agent_rx.try_recv() {
+                if matches!(envelope.event, AgentEvent::RunNotice { wake: true }) {
+                    return true;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        false
     }
 
     /// The regression the per-runtime cell fixed. With one process-wide slot,
@@ -781,6 +1013,100 @@ mod tests {
         assert_eq!(observed, restored);
     }
 
+    /// A hub with the runs on it, and the loop that owns it.
+    fn spawn_with_runs() -> (AgentHandles, Arc<ArcSwap<ModelSlot>>) {
+        let model_slot = Arc::new(ArcSwap::from_pointee(ModelSlot {
+            model: crate::components::test_model(),
+            provider: Arc::new(StubProvider::default()),
+        }));
+        let handles = spawn_with_config(&model_slot, runs_config(), Vec::new());
+        (handles, model_slot)
+    }
+
+    fn runs_config() -> AgentConfig {
+        let mut config = AgentConfig::default();
+        config.runs.enabled = true;
+        config
+    }
+
+    /// A rewind rewrites the parent's transcript, not the session: the runs on
+    /// the hub go on working. A respawn that took a fresh hub would leave them
+    /// behind, and the old hub's shutdown would kill every one of them.
+    #[test]
+    fn a_rewind_keeps_the_runs_of_the_session() {
+        let _runtime = enter_runtime();
+        let (mut handles, model_slot) = spawn_with_runs();
+        let runs = handles
+            .mailbox
+            .seed()
+            .and_then(|seed| seed.runs.clone())
+            .expect("runs are enabled");
+        let req: maki_agent::runs::SpawnRequest = serde_json::from_value(serde_json::json!({
+            "kind": "shell", "description": "sleeper", "command": "sleep 20"
+        }))
+        .unwrap();
+        let ack = runs.hub.spawn(runs.hub.main(), req).unwrap();
+        let mut app = crate::app::tests::test_app();
+
+        handles.respawn(
+            Vec::new(),
+            &model_slot,
+            runs_config(),
+            ToolOutputLines::default(),
+            &mut app,
+            Respawn::Rewind,
+        );
+
+        let kept = handles
+            .mailbox
+            .seed()
+            .and_then(|seed| seed.runs.clone())
+            .expect("runs are enabled");
+        assert!(
+            Arc::ptr_eq(&runs.hub, &kept.hub),
+            "the rewind must keep the hub of the session"
+        );
+        let view = runs.hub.get(ack.id).expect("the run is still known");
+        assert!(
+            !view.state.is_done(),
+            "the run must go on working: {:?}",
+            view.state
+        );
+    }
+
+    /// A new session brings its own runs: the old hub goes down with the old
+    /// loop, and the new loop gets a hub of its own.
+    #[test]
+    fn a_new_session_takes_the_runs_with_it() {
+        let _runtime = enter_runtime();
+        let (mut handles, model_slot) = spawn_with_runs();
+        let runs = handles
+            .mailbox
+            .seed()
+            .and_then(|seed| seed.runs.clone())
+            .expect("runs are enabled");
+        let mut app = crate::app::tests::test_app();
+
+        handles.respawn(
+            Vec::new(),
+            &model_slot,
+            runs_config(),
+            ToolOutputLines::default(),
+            &mut app,
+            Respawn::Restart,
+        );
+
+        let fresh = handles
+            .mailbox
+            .seed()
+            .and_then(|seed| seed.runs.clone())
+            .expect("runs are enabled");
+        assert!(
+            !Arc::ptr_eq(&runs.hub, &fresh.hub),
+            "a new session must not share the hub of the old one"
+        );
+    }
+
     /// A monitor can prompt before the user sends anything, so the seed has to
     /// know whether the chat plans, and its effort, from the moment the loop
     /// exists.
@@ -827,5 +1153,36 @@ mod tests {
         )
         .await;
         assert!(start.elapsed() >= SHORT_TIMEOUT);
+    }
+
+    fn test_hub() -> maki_agent::runs::RunsCtx {
+        use maki_agent::runs::{ManualClock, UnitHub, UnitLimits};
+        let (tx, _rx) = unbounded_channel();
+        let hub = UnitHub::new(
+            UnitLimits::default(),
+            maki_agent::EventSender::new(tx, 0),
+            Arc::new(ManualClock::default()),
+        );
+        let self_run = hub.main();
+        maki_agent::runs::RunsCtx { hub, self_run }
+    }
+
+    #[tokio::test]
+    async fn deliver_to_run_refuses_an_unknown_run() {
+        let runs = test_hub();
+        let err = deliver_to_run(&runs, None, "ag-nope", "hi".into()).await;
+        assert!(err.is_err());
+    }
+
+    #[tokio::test]
+    async fn deliver_to_run_does_not_route_the_user_to_main() {
+        let runs = test_hub();
+        let inbox = runs.hub.inbox_of(runs.hub.main()).unwrap();
+        assert!(
+            deliver_to_run(&runs, None, "main", "hi".into())
+                .await
+                .is_err()
+        );
+        assert!(inbox.is_empty());
     }
 }

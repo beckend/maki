@@ -1468,7 +1468,15 @@ impl<'t> EventLoop<'t> {
                 self.queue_compact(index, request.instructions, CompactReason::Requested);
                 dirty = Dirty::YES;
             }
-            let actions = self.sessions[index].app.start_woken_run();
+            // A run notice in the hub's inbox asks for a turn of its own: the
+            // run that starts drains it like any other, so the notice is
+            // claimed even when the mailbox wake already starts that run.
+            let run_wake = self.sessions[index].app.takes_wake()
+                && self.sessions[index].handles.claim_run_wake();
+            let mut actions = self.sessions[index].app.start_woken_run();
+            if actions.is_empty() && run_wake {
+                actions = self.sessions[index].app.start_run_wake();
+            }
             dirty |= Dirty::from(!actions.is_empty());
             self.dispatch(index, actions);
         }
@@ -2170,11 +2178,18 @@ impl<'t> EventLoop<'t> {
                     .cancel_subagent(tool_use_id.clone());
                 self.emit_task_stopped(idx, &tool_use_id, None);
             }
+            Action::StopRuns { target } => {
+                self.sessions[idx].handles.stop_runs(&target);
+            }
+            Action::SendToRun { handle, text } => {
+                self.sessions[idx].handles.send_to_run(handle, text);
+            }
             Action::CancelPluginTask { id, plugin } => {
                 self.ctx.lua_event_handle.cancel_plugin_session(&id);
                 self.emit_task_stopped(idx, &id, Some(&plugin));
             }
             Action::RestartAgent(history) => self.respawn_agent(idx, history, Respawn::Restart),
+            Action::RewindAgent(history) => self.respawn_agent(idx, history, Respawn::Rewind),
             Action::OpenFork(open) => self.open_fork(idx, *open),
             Action::ChangeModel(spec) => {
                 if let Err(e) = self.change_model(&spec) {

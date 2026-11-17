@@ -8,6 +8,7 @@ pub(crate) mod help_modal;
 pub mod input;
 pub mod keybindings;
 pub(crate) mod list_picker;
+pub(crate) mod log_viewer;
 pub(crate) mod login_picker;
 pub(crate) mod lua_float;
 pub(crate) mod mcp_picker;
@@ -20,6 +21,7 @@ pub(crate) mod plan_form;
 pub(crate) mod progress_bar;
 pub mod queue_panel;
 pub(crate) mod rewind_picker;
+pub(crate) mod runs_picker;
 pub(crate) mod scrollbar;
 pub(crate) mod search_modal;
 pub(crate) mod split_layout;
@@ -297,6 +299,17 @@ pub enum Action {
     CancelSubagent {
         tool_use_id: String,
     },
+    /// `/stop`: stops a native run (and what it started) through the hub.
+    /// `target` is a handle or name, `all` stops every live run.
+    StopRuns {
+        target: String,
+    },
+    /// Text typed into a native run's tab. A live run gets it as a steer; a
+    /// finished one is revived from its transcript first.
+    SendToRun {
+        handle: String,
+        text: String,
+    },
     /// Esc in a plugin task's tab: closes the plugin session behind it.
     CancelPluginTask {
         id: String,
@@ -306,6 +319,9 @@ pub enum Action {
     /// The history under this runtime changed (reset, load, rewind), so the
     /// agent has to be respawned on it.
     RestartAgent(Vec<Message>),
+    /// The same, for a rewind: the session stays, so the runs on it stay too.
+    /// Only the runs whose receipts the rewind drops are stopped.
+    RewindAgent(Vec<Message>),
     /// A copy of this session, to run beside it and take the focus.
     OpenFork(Box<OpenSession>),
     ChangeModel(String),

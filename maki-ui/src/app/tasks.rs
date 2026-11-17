@@ -9,7 +9,7 @@ use std::mem;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use maki_agent::tools::{MAIN_TASK_ID, ToolRegistry};
+use maki_agent::tools::{MAIN_TASK_ID, ToolRegistry, ToolSource};
 use maki_agent::{AgentEvent, PartStatus, SessionMailbox, ToolDoneEvent, ToolPart};
 use maki_lua::MoveOutcome;
 use maki_storage::id::MakiId;
@@ -18,7 +18,7 @@ use strum::IntoStaticStr;
 use tokio::sync::oneshot::Receiver;
 use tokio::sync::oneshot::error::TryRecvError;
 
-use crate::app::{App, MAIN_CHAT};
+use crate::app::{App, MAIN_CHAT, is_native_run};
 use crate::chat::{CANCELLED_TEXT, Chat, DONE_TEXT, ERROR_TEXT, LOST_TEXT};
 use crate::components::tool_display::without_timeout;
 use crate::components::{
@@ -323,9 +323,13 @@ fn part_task_id(call: &str, part: &str) -> String {
 /// The plugin that registered {tool}, or the tool itself for one no plugin
 /// owns, so the task still has an owner to show.
 fn tool_owner(tool: &Arc<str>) -> Arc<str> {
-    ToolRegistry::global()
-        .get(tool)
-        .map_or_else(|| Arc::clone(tool), |entry| entry.source.plugin)
+    let Some(entry) = ToolRegistry::global().get(tool) else {
+        return Arc::clone(tool);
+    };
+    match &entry.source {
+        ToolSource::Lua { plugin } => Arc::clone(plugin),
+        ToolSource::Native => Arc::clone(tool),
+    }
 }
 
 impl App {
@@ -625,11 +629,15 @@ impl App {
         self.chats[idx].plugin.clone()
     }
 
-    /// The tasks quitting, `/new` or a rewind would end, as opposed to the
-    /// tool tasks a turn owns. Counted the way `/tasks` lists them.
+    /// What `/tasks` counts in its hint: the tasks quitting or a rewind would
+    /// end, as opposed to the tool tasks a turn owns. A native run counts as
+    /// one: it works in the background like a plugin's task does, and the
+    /// status bar says the session is busy while it does. Counted the way
+    /// `/tasks` lists them.
     pub(crate) fn running_background_tasks(&self) -> impl Iterator<Item = &Chat> {
         self.chats.iter().filter(|chat| {
-            chat.plugin.is_some()
+            chat.task_id().is_some()
+                && (chat.plugin.is_some() || chat.run.is_some())
                 && chat.task_status() == TaskStatus::Working
                 && !self.is_wrapper(chat)
         })
@@ -734,6 +742,7 @@ impl App {
         }
         let chat = &mut self.chats[idx];
         let live = !chat.is_finished();
+        let native = is_native_run(chat);
         let action = match &chat.plugin {
             Some(plugin) if live => Action::CancelPluginTask {
                 id: id.to_owned(),
@@ -744,7 +753,13 @@ impl App {
             },
             _ => return Err(format!("{NOT_RUNNING_ERR}{id}")),
         };
-        self.end_task(id, BackgroundOutcome::Cancelled);
+        // A native run's children move up to its own parent when it stops, so
+        // they go on working: only the run in front of the user ends here.
+        if native {
+            self.end_task_alone(id, BackgroundOutcome::Cancelled);
+        } else {
+            self.end_task(id, BackgroundOutcome::Cancelled);
+        }
         Ok(action)
     }
 
@@ -755,13 +770,23 @@ impl App {
     /// because the tab and its final result may be gone before the call
     /// honours the stop.
     pub(crate) fn end_task(&mut self, id: &str, outcome: BackgroundOutcome) {
+        self.end_task_with(id, outcome, true);
+    }
+
+    /// Ends task `id` and nothing else: what it started stays, because the
+    /// stop left it running.
+    fn end_task_alone(&mut self, id: &str, outcome: BackgroundOutcome) {
+        self.end_task_with(id, outcome, false);
+    }
+
+    fn end_task_with(&mut self, id: &str, outcome: BackgroundOutcome, cascade: bool) {
         let (ending, text) = tab_ending(outcome);
         for chat in &mut self.chats {
             let Some(task) = chat.task_id() else {
                 continue;
             };
             let started_by_it =
-                matches!(&chat.parent, Some(TaskParent::Started(call)) if **call == *id);
+                cascade && matches!(&chat.parent, Some(TaskParent::Started(call)) if **call == *id);
             if (**task == *id || started_by_it) && !chat.is_finished() {
                 self.permission_prompt.drop_subagent(task);
                 chat.end_early(ending, text);
@@ -1676,6 +1701,37 @@ mod tests {
         end(&mut app);
         assert_eq!(app.chats[1].task_status(), status);
         assert_eq!(app.chats[1].last_message_text(), text);
+    }
+
+    /// The index that routes a task's events is a per-turn cache, so a task
+    /// that ends long after the turn that started it is not in it any more.
+    /// Its chat still has to end, or the picker shows it as running forever
+    /// and the status bar spins on a task that is gone.
+    #[test]
+    fn a_task_that_ends_after_its_turn_still_ends() {
+        let mut app = app_with_subagent_id(TASK_ID);
+        // The turn ends: the routing cache goes with it.
+        app.chat_index.clear();
+        close_subagent_transcript(&mut app, TASK_ID);
+        assert_eq!(app.chats[1].task_status(), TaskStatus::Done);
+    }
+
+    /// The chats are the source of the subagent mirror, and the checkpoint is
+    /// where the mirror is written: a task the chats hold has to reach the
+    /// session file, or a reload brings back a list the picker never shows.
+    #[test]
+    fn a_checkpoint_writes_the_tasks_the_chats_hold() {
+        let mut app = app_with_subagent_id(TASK_ID);
+        app.state.session_mut().set_subagents(Vec::new());
+        app.checkpoint();
+        let recorded: Vec<_> = app
+            .state
+            .session
+            .subagents()
+            .iter()
+            .map(|sa| sa.tool_use_id.clone())
+            .collect();
+        assert_eq!(recorded, vec![TASK_ID.to_owned()]);
     }
 
     /// No way of ending a turn may leave a task `working`: nothing runs after

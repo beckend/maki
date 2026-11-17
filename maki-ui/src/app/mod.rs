@@ -12,6 +12,7 @@ pub(crate) mod mode;
 mod mouse;
 mod plan_form;
 mod queue;
+mod runs;
 mod session;
 pub(crate) mod session_state;
 pub(crate) mod shell;
@@ -33,15 +34,18 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::OpenSession;
 use crate::app::tasks::{BackgroundMoves, TaskOutcome, TaskStatus, count_phrase};
 use crate::chat::Chat;
-use crate::chat::{CANCELLED_TEXT, ERROR_TEXT};
+use crate::chat::{CANCELLED_TEXT, DONE_TEXT, ERROR_TEXT};
 use crate::clipboard::ClipboardState;
 use crate::components::alert_modal::AlertModal;
 use crate::components::btw_modal::BtwModal;
-use crate::components::command::{CommandAction, CommandPalette, PluginAccess, SUBMITS_PROMPT};
+use crate::components::command::{
+    CommandAction, CommandPalette, ParsedCommand, PluginAccess, SUBMITS_PROMPT,
+};
 use crate::components::file_picker::{FilePickerModal, FilePickerModalAction};
 use crate::components::help_modal::HelpModal;
 use crate::components::input::{InputAction, InputBox, Placeholder, Submission, sent_text};
 use crate::components::keybindings::key;
+use crate::components::log_viewer::LogViewer;
 use crate::components::login_picker::{LoginPicker, LoginPickerAction};
 use crate::components::lua_float::FloatManager;
 use crate::components::mcp_picker::{McpPicker, McpPickerAction};
@@ -50,6 +54,7 @@ use crate::components::pack_review::{PackReview, PackReviewAction};
 use crate::components::permission_prompt::PermissionPrompt;
 use crate::components::plan_form::{PlanForm, PlanFormAction};
 use crate::components::rewind_picker::{RewindPicker, RewindPickerAction};
+use crate::components::runs_picker::{RunsPicker, RunsPickerAction};
 use crate::components::scrollbar;
 use crate::components::search_modal::{SearchAction, SearchModal};
 use crate::components::status_bar::{Motion, StatusBar};
@@ -107,6 +112,11 @@ use typeahead::{Hold, InputAt, KeyboardFocus, Pressed, Prompts, Sight, Turn, Typ
 
 const CANCEL_MSG: &str = "Cancelled.";
 const MAIN_CHAT: usize = 0;
+const NO_RUN_TAB: &str = "That run has no tab in this session";
+const STOP_USAGE: &str = "Usage: /stop <name|handle|all>";
+const NO_LIVE_RUNS: &str = "No run is live";
+const RUN_NOT_LIVE: &str = "That run has already finished";
+const UNKNOWN_RUN: &str = "No such run: ";
 const EXIT_WORD: &str = "exit";
 const EXIT_COMMAND: &str = "/exit";
 /// Bypasses the per-run staleness filter because re-bake replies
@@ -226,6 +236,8 @@ enum KeyboardOwner {
     /// Hands `<Tab>` on to the owner under it, see [`PlanFormAction::Passthrough`].
     PlanForm,
     Help,
+    /// The log of a shell run, over the transcript it belongs to.
+    LogViewer,
     Usage,
     Btw,
     /// The focused Lua window takes every key. An unfocused popup never holds
@@ -238,12 +250,32 @@ enum KeyboardOwner {
     ThemePicker,
     ModelPicker,
     LoginPicker,
+    /// The picker of the native runs, over every other overlay.
+    RunsPicker,
     McpPicker,
     /// Nothing above holds the keyboard: the chat input, or the transcript of
     /// a tab with no input. It comes last because the command palette it
     /// answers is drawn under every modal above. Window bindings, global
     /// bindings and maki's built-in keys run from here.
     Chat,
+}
+
+/// A native run's own event, taken out of its envelope before the envelope is
+/// delivered: what the run's record says and which run it is about.
+enum NativeRunEvent {
+    Started(maki_storage::sessions::StoredRun),
+    StateChanged {
+        handle: String,
+        state: String,
+    },
+    Finished {
+        handle: String,
+        reason: String,
+    },
+    PermissionWithdrawn {
+        id: String,
+        subagent: Option<String>,
+    },
 }
 
 /// For a typed key `Swallowed` and `Handled` mean the same thing, the key is
@@ -520,6 +552,9 @@ pub struct App {
     pub(super) model_picker: ModelPicker,
     pub(super) login_picker: LoginPicker,
     pub(super) mcp_picker: McpPicker,
+    pub(super) runs_picker: RunsPicker,
+    pub(super) log_viewer: LogViewer,
+    pub(super) runs: runs::RunsView,
     pub(super) rewind_picker: RewindPicker,
     pub(super) alert_modal: AlertModal,
     pub(super) help_modal: HelpModal,
@@ -674,6 +709,9 @@ impl App {
             model_picker: ModelPicker::new(available_models),
             login_picker: LoginPicker::new(),
             mcp_picker: McpPicker::new(mcp_reader, mcp_config_errors),
+            runs_picker: RunsPicker::new(),
+            log_viewer: LogViewer::new(),
+            runs: runs::RunsView::default(),
             rewind_picker: RewindPicker::new(),
             alert_modal: AlertModal::new(),
             help_modal: HelpModal::new(),
@@ -759,12 +797,206 @@ impl App {
         self.active_chat == MAIN_CHAT
     }
 
+    /// A native agent's tab: input goes to the hub, finished or not.
+    fn native_tab(&self, idx: usize) -> Option<&maki_storage::sessions::StoredRun> {
+        self.chats[idx]
+            .run
+            .as_ref()
+            .filter(|run| run.kind == "agent")
+    }
+
+    /// Whether a message typed in the active tab can reach its run: every
+    /// native agent run takes one, a finished one included, since the hub
+    /// brings it back from its transcript.
+    fn run_tab_takes_input(&self) -> bool {
+        self.native_tab(self.active_chat).is_some()
+    }
+
+    /// Keeps `RunsView` in step with the hub's run events, shells included.
+    fn track_run(&mut self, event: &AgentEvent) {
+        match event {
+            AgentEvent::RunStarted {
+                handle,
+                name,
+                kind,
+                parent,
+                ..
+            } => self
+                .runs
+                .started(handle, name, kind, parent.as_deref(), "running"),
+            AgentEvent::RunStateChanged { handle, state } => self.runs.set_state(handle, state),
+            AgentEvent::RunFinished { handle, reason, .. } => self.runs.set_state(handle, reason),
+            _ => return,
+        }
+        if self.runs_picker.is_open() {
+            let waiting = self.permission_prompt.waiting_runs();
+            self.runs_picker.refresh(self.runs.rows(&waiting));
+        }
+    }
+
+    /// A native run's own events, which upstream's delivery knows nothing
+    /// of: the record the picker reads, and the tab that follows the run.
+    /// The run's chat is resolved the way a task's is, which is what opens
+    /// the tab, and the event goes no further.
+    ///
+    /// `Some(envelope)` hands the event back to the normal delivery.
+    fn native_run_event(&mut self, envelope: Envelope) -> Option<Envelope> {
+        let native = match &envelope.event {
+            AgentEvent::RunStarted {
+                handle,
+                name,
+                kind,
+                parent,
+                depth,
+                one_shot,
+            } => Some(NativeRunEvent::Started(maki_storage::sessions::StoredRun {
+                handle: handle.clone(),
+                name: name.clone(),
+                parent: parent.clone(),
+                kind: kind.clone(),
+                state: "running".to_owned(),
+                depth: *depth,
+                one_shot: *one_shot,
+            })),
+            AgentEvent::RunStateChanged { handle, state } => Some(NativeRunEvent::StateChanged {
+                handle: handle.clone(),
+                state: state.clone(),
+            }),
+            AgentEvent::RunFinished { handle, reason, .. } => Some(NativeRunEvent::Finished {
+                handle: handle.clone(),
+                reason: reason.clone(),
+            }),
+            AgentEvent::PermissionWithdrawn { id } => Some(NativeRunEvent::PermissionWithdrawn {
+                id: id.clone(),
+                subagent: envelope
+                    .subagent
+                    .as_ref()
+                    .map(|subagent| subagent.parent_tool_use_id.clone()),
+            }),
+            _ => None,
+        };
+        let Some(native) = native else {
+            return Some(envelope);
+        };
+        match native {
+            NativeRunEvent::Started(run) => {
+                self.track_run(&envelope.event);
+                self.deliver(envelope, None);
+                if let Ok(idx) = self.chat_of_task(&run.handle)
+                    && idx != MAIN_CHAT
+                {
+                    self.chats[idx].run = Some(run);
+                }
+            }
+            NativeRunEvent::StateChanged { handle, state } => {
+                self.track_run(&envelope.event);
+                self.deliver(envelope, None);
+                if let Ok(idx) = self.chat_of_task(&handle)
+                    && idx != MAIN_CHAT
+                {
+                    if let Some(run) = &mut self.chats[idx].run {
+                        run.state.clone_from(&state);
+                    }
+                    // A finished run that is running again was revived by a
+                    // message: its tab takes input once more.
+                    if state != "idle" && self.chats[idx].is_finished() {
+                        self.chats[idx].reopen();
+                    }
+                    self.chats[idx].idle = state == "idle";
+                    if state == "idle" {
+                        self.drop_run_prompts(Some(&handle));
+                    }
+                }
+            }
+            NativeRunEvent::Finished { handle, reason } => {
+                self.track_run(&envelope.event);
+                self.deliver(envelope, None);
+                if let Ok(idx) = self.chat_of_task(&handle)
+                    && idx != MAIN_CHAT
+                {
+                    if let Some(run) = &mut self.chats[idx].run {
+                        run.state.clone_from(&reason);
+                    }
+                    self.drop_run_prompts(Some(&handle));
+                    self.chats[idx].cancel_in_progress();
+                    let (outcome, text) = match reason.as_str() {
+                        "completed" => (TaskOutcome::Done, DONE_TEXT),
+                        "killed" => (TaskOutcome::Error, CANCELLED_TEXT),
+                        _ => (TaskOutcome::Error, ERROR_TEXT),
+                    };
+                    self.chats[idx].mark_finished(outcome, text);
+                }
+            }
+            NativeRunEvent::PermissionWithdrawn { id, subagent } => {
+                if let Some(subagent) = subagent {
+                    self.permission_prompt.withdraw(&subagent, &id);
+                }
+            }
+        }
+        None
+    }
+
+    /// Where a shell run's log lives: the hub keeps it under the session's
+    /// runs directory as `<handle>.log`. `None` when the file is not there
+    /// (the hub keeps the output in memory when it cannot write logs).
+    fn shell_log_path(&self, handle: &str) -> Option<std::path::PathBuf> {
+        let state = maki_storage::paths::state_dir().ok()?;
+        let dir = maki_storage::paths::session_runs_dir(&state, &self.state.session.id.to_string());
+        let path = dir.join(format!("{handle}.log"));
+        path.is_file().then_some(path)
+    }
+
+    /// `/stop <name|handle|all>`.
+    fn cmd_stop(&mut self, args: &str) -> Vec<Action> {
+        let target = args.trim();
+        if target.is_empty() {
+            self.flash(STOP_USAGE.into());
+            return vec![];
+        }
+        if target == "all" {
+            if self.runs.live_handles().is_empty() {
+                self.flash(NO_LIVE_RUNS.into());
+                return vec![];
+            }
+            return vec![Action::StopRuns {
+                target: "all".into(),
+            }];
+        }
+        match self.runs.find(target) {
+            Some(run) if runs::is_live(&run.state) => vec![Action::StopRuns {
+                target: run.handle.clone(),
+            }],
+            Some(_) => {
+                self.flash(RUN_NOT_LIVE.into());
+                vec![]
+            }
+            None => {
+                self.flash(format!("{UNKNOWN_RUN}{target}"));
+                vec![]
+            }
+        }
+    }
+
+    /// The label of an ask that a native run waits for: its name and handle,
+    /// so the user sees which run the question belongs to.
+    pub(super) fn run_prompt_label(
+        &self,
+        subagent_id: Option<&str>,
+        asker_name: Option<&str>,
+    ) -> Option<String> {
+        let handle = subagent_id.filter(|id| is_run_handle(id))?;
+        let name = asker_name?;
+        Some(format!("{name} ({handle})"))
+    }
+
     /// Whether the chat in front shows the input box. A running subagent's
     /// chat does, so a message can be queued for that subagent while it is
     /// watched. A finished one, or a task with no inbox like a moved `bash`,
     /// is a transcript, so it does not: Esc leaves it and `/tasks` stops it.
     pub(super) fn chat_accepts_input(&self) -> bool {
-        self.is_main_chat() || self.chats[self.active_chat].takes_messages()
+        self.is_main_chat()
+            || self.chats[self.active_chat].takes_messages()
+            || self.run_tab_takes_input()
     }
 
     /// Whether the agent behind the chat in front is at work: the main
@@ -1092,6 +1324,15 @@ impl App {
         if matches!(sending, Sending::Nothing) {
             return Err(NOTHING_TO_SEND_ERR.to_string());
         }
+        // A native run.s tab takes the text through the hub, so the run sees it.
+        if self.run_tab_takes_input() && matches!(sending, Sending::Message) {
+            let text = sent_text(self.input_box.buffer.value()).to_owned();
+            let sub = Submission {
+                text,
+                images: Vec::new(),
+            };
+            return Ok(self.send_to_run_tab(sub));
+        }
         self.send_input(sending, sight, caller)
     }
 
@@ -1303,7 +1544,9 @@ impl App {
                 vec![]
             }
             Msg::Agent(envelope) => {
-                self.handle_agent_event(*envelope);
+                if let Some(envelope) = self.native_run_event(*envelope) {
+                    self.handle_agent_event(envelope);
+                }
                 vec![]
             }
         }
@@ -1362,6 +1605,10 @@ impl App {
         }
         if self.help_modal.is_open() {
             self.help_modal.scroll(delta);
+            return None;
+        }
+        if self.log_viewer.is_open() {
+            self.log_viewer.scroll(delta);
             return None;
         }
         if self.usage_modal.is_open() {
@@ -1500,6 +1747,10 @@ impl App {
                 self.help_modal.handle_key(key);
                 Some(vec![])
             }
+            KeyboardOwner::LogViewer => {
+                self.log_viewer.handle_key(key);
+                Some(vec![])
+            }
             KeyboardOwner::Usage => {
                 if key::REFRESH.matches(key) {
                     return Some(vec![Action::RefreshUsage]);
@@ -1608,6 +1859,18 @@ impl App {
                 }
                 ModelPickerAction::Close => vec![],
             }),
+            KeyboardOwner::RunsPicker => Some(match self.runs_picker.handle_key(key) {
+                RunsPickerAction::Consumed | RunsPickerAction::Close => vec![],
+                RunsPickerAction::Focus { handle, kind } => {
+                    if kind == "shell" {
+                        let path = self.shell_log_path(&handle);
+                        self.log_viewer.open(&handle, path);
+                    } else if self.focus_task(&handle).is_err() {
+                        self.flash(NO_RUN_TAB.into());
+                    }
+                    vec![]
+                }
+            }),
             KeyboardOwner::LoginPicker => {
                 let action = self.login_picker.handle_key(key);
                 Some(self.handle_login_picker_action(action))
@@ -1696,7 +1959,7 @@ impl App {
                 // behind as the subagent chat's draft.
                 self.input_box.discard();
                 self.set_active_chat(MAIN_CHAT);
-                PaletteKey::Handled(self.execute_command(cmd, 0))
+                PaletteKey::Handled(self.run_command(cmd, 0))
             }
             CommandAction::Complete(text) => {
                 self.input_box.rewrite_input(&text);
@@ -1705,6 +1968,20 @@ impl App {
                 PaletteKey::Handled(vec![])
             }
             CommandAction::Passthrough => PaletteKey::Passthrough,
+        }
+    }
+
+    /// The commands of the native runs, which upstream's command table knows
+    /// nothing of, and every other command as upstream runs it.
+    fn run_command(&mut self, cmd: ParsedCommand, depth: u8) -> Vec<Action> {
+        match cmd.name.as_str() {
+            "/runs" => {
+                let waiting = self.permission_prompt.waiting_runs();
+                self.runs_picker.open(self.runs.rows(&waiting));
+                vec![]
+            }
+            "/stop" => self.cmd_stop(&cmd.args),
+            _ => self.execute_command(cmd, depth),
         }
     }
 
@@ -2302,7 +2579,7 @@ impl App {
     /// things the user still needs: the text kept for recovery after an agent
     /// error (`start_run` clears it), and the error a failed `--exit-on-done`
     /// turn exits with.
-    fn takes_wake(&self) -> bool {
+    pub(crate) fn takes_wake(&self) -> bool {
         !self.runs_turn()
             && !self.awaiting_input()
             && self.recoverable_queue.is_empty()
@@ -2442,6 +2719,9 @@ impl App {
             Sending::AuthRetry | Sending::Nothing => vec![],
             Sending::Exit => self.quit(),
             Sending::Shell(prefix) => self.run_shell_line(prefix),
+            // A native run's tab takes the text through the hub, so the run
+            // sees it: a finished run is revived by the message.
+            Sending::Message if self.run_tab_takes_input() => self.send_to_run_tab(sub),
             Sending::Message if self.is_main_chat() => self.submit_or_queue(sub.into()),
             Sending::Message => self.queue_for_subagent(sub.into()),
         }
@@ -2474,7 +2754,11 @@ impl App {
         self.finish_subagents(TaskOutcome::Cancelled, CANCELLED_TEXT);
         self.chats[MAIN_CHAT].auth_parked = false;
         self.shell.cancel_all();
-        for chat in self.chats.iter_mut().filter(|c| c.plugin.is_none()) {
+        for chat in self
+            .chats
+            .iter_mut()
+            .filter(|c| c.plugin.is_none() && !is_native_run(c))
+        {
             chat.flush();
             chat.cancel_in_progress();
         }
@@ -2501,6 +2785,7 @@ impl App {
             KeyboardOwner::Permission => &self.permission_prompt,
             KeyboardOwner::PackReview => &self.pack_review,
             KeyboardOwner::Help => &self.help_modal,
+            KeyboardOwner::LogViewer => &self.log_viewer,
             KeyboardOwner::Usage => &self.usage_modal,
             KeyboardOwner::Btw => &self.btw_modal,
             KeyboardOwner::FocusedWindow => &self.float_mgr,
@@ -2510,6 +2795,7 @@ impl App {
             KeyboardOwner::ThemePicker => &self.theme_picker,
             KeyboardOwner::ModelPicker => &self.model_picker,
             KeyboardOwner::LoginPicker => &self.login_picker,
+            KeyboardOwner::RunsPicker => &self.runs_picker,
             KeyboardOwner::McpPicker => &self.mcp_picker,
             KeyboardOwner::PlanForm | KeyboardOwner::Queue | KeyboardOwner::Chat => return None,
         })
@@ -2521,6 +2807,7 @@ impl App {
             KeyboardOwner::Permission => &mut self.permission_prompt,
             KeyboardOwner::PackReview => &mut self.pack_review,
             KeyboardOwner::Help => &mut self.help_modal,
+            KeyboardOwner::LogViewer => &mut self.log_viewer,
             KeyboardOwner::Usage => &mut self.usage_modal,
             KeyboardOwner::Btw => &mut self.btw_modal,
             KeyboardOwner::FocusedWindow => &mut self.float_mgr,
@@ -2530,6 +2817,7 @@ impl App {
             KeyboardOwner::ThemePicker => &mut self.theme_picker,
             KeyboardOwner::ModelPicker => &mut self.model_picker,
             KeyboardOwner::LoginPicker => &mut self.login_picker,
+            KeyboardOwner::RunsPicker => &mut self.runs_picker,
             KeyboardOwner::McpPicker => &mut self.mcp_picker,
             KeyboardOwner::PlanForm | KeyboardOwner::Queue | KeyboardOwner::Chat => return None,
         })
@@ -2583,6 +2871,13 @@ impl App {
         sync_search_highlight(&self.search_modal, chat);
     }
 
+    /// A run that ended or went idle has nothing left to answer.
+    fn drop_run_prompts(&mut self, handle: Option<&str>) {
+        if let Some(handle) = handle {
+            self.permission_prompt.drop_subagent(handle);
+        }
+    }
+
     pub fn close_all_overlays(&mut self) {
         for owner in KeyboardOwner::iter() {
             if let Some(overlay) = self.overlay_mut(owner) {
@@ -2607,6 +2902,7 @@ impl App {
             | self.mcp_picker.refresh()
             | self.model_picker.refresh()
             | self.usage_modal.poll(&self.usage_slot)
+            | self.log_viewer.poll()
             | self.hints.poll(self.hint_reader.load_full())
             | self.poll_input_rules()
             | Dirty::from(self.input_box.poll_decor())
@@ -2704,7 +3000,12 @@ impl App {
     fn terminalize_turn(&mut self, message: &str) {
         self.retain_resolved_subagents(TaskOutcome::Error, ERROR_TEXT);
         self.chats[MAIN_CHAT].fail_in_progress_except(message.into(), self.shell.active_ids());
-        for chat in self.chats.iter_mut().skip(1).filter(|c| c.plugin.is_none()) {
+        for chat in self
+            .chats
+            .iter_mut()
+            .skip(1)
+            .filter(|c| c.plugin.is_none() && !is_native_run(c))
+        {
             chat.fail_in_progress_with_message(message.into());
         }
     }
@@ -2713,7 +3014,7 @@ impl App {
     /// `chat_index`.
     fn retain_resolved_subagents(&mut self, outcome: TaskOutcome, text: &str) {
         self.chat_index.retain(|_, &mut sub_idx| {
-            if self.chats[sub_idx].is_finished() {
+            if self.chats[sub_idx].is_finished() || is_native_run(&self.chats[sub_idx]) {
                 true
             } else {
                 self.chats[sub_idx].mark_finished(outcome, text);
@@ -2741,6 +3042,7 @@ impl App {
             | KeyboardOwner::PackReview
             | KeyboardOwner::PlanForm
             | KeyboardOwner::Help
+            | KeyboardOwner::LogViewer
             | KeyboardOwner::Usage
             | KeyboardOwner::Btw
             | KeyboardOwner::Queue => {}
@@ -2758,6 +3060,7 @@ impl App {
             KeyboardOwner::ModelPicker => self.model_picker.handle_paste(text),
             KeyboardOwner::LoginPicker => self.login_picker.handle_paste(text),
             KeyboardOwner::McpPicker => self.mcp_picker.handle_paste(text),
+            KeyboardOwner::RunsPicker => self.runs_picker.handle_paste(text),
             KeyboardOwner::Chat => {
                 let pressed = Pressed::Paste(text.to_owned());
                 if !self.dispatch_on_screen_windows(&pressed, turn)
@@ -2776,4 +3079,15 @@ fn sync_search_highlight(modal: &SearchModal, chat: &mut Chat) {
         chat.scroll_to_segment(i);
     }
     chat.set_highlight_segment(idx);
+}
+
+/// A native background run's tab, keyed by its `ag-` handle. It outlives the
+/// turn, so cancelling or ending a turn leaves it alone; only its own
+/// `RunFinished` closes it.
+fn is_native_run(chat: &Chat) -> bool {
+    chat.task_id().is_some_and(|id| is_run_handle(id))
+}
+
+fn is_run_handle(id: &str) -> bool {
+    id.starts_with("ag-")
 }

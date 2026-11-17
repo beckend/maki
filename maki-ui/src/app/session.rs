@@ -5,12 +5,14 @@ use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 use crate::app::tasks::{BackgroundMoves, TaskClock, TaskOutcome, tab_ending};
-use crate::chat::{Chat, DONE_TEXT, history_to_display};
+use crate::chat::{CANCELLED_TEXT, Chat, DONE_TEXT, ERROR_TEXT, history_to_display};
 use crate::components::command::PROMPT_NEEDS;
 use crate::components::input::{COMMAND_PREFIX, sent_text};
 use crate::components::rewind_picker::{RewindEntry, drops_receipt};
 use crate::components::{Action, BackgroundBadge, BackgroundOutcome};
 use crate::text_buffer::Writers;
+
+const LOST_TEXT: &str = "Lost when maki exited";
 use maki_agent::agent::SessionExport;
 use maki_agent::session::SessionHeader;
 use maki_agent::{CompactRequest, SessionMailbox, TaskEnd, Transcript};
@@ -25,7 +27,7 @@ use maki_storage::sessions::{
 use crate::{AppSession, OpenSession};
 
 use super::session_state::{SessionState, rules_to_stored, stored_to_rules};
-use super::{App, MAIN_CHAT, Mode, PlanState, Sending, Status};
+use super::{App, MAIN_CHAT, Mode, PlanState, Sending, Status, is_native_run};
 
 /// The shortest gap between two writes that carry only UI state.
 const SOFT_SAVE_DELAY: Duration = Duration::from_millis(1000);
@@ -251,7 +253,7 @@ impl App {
     /// task dropped from it must still come back on reload. Called only
     /// where the meta is read, every checkpoint and a rewind, so no
     /// transition has to remember it.
-    fn sync_subagents(&mut self) {
+    pub(crate) fn sync_subagents(&mut self) {
         let subagents = self
             .chats
             .iter()
@@ -262,16 +264,41 @@ impl App {
                     tool_use_id: chat.task_id()?.to_string(),
                     name: chat.name.clone(),
                     model: chat.model_id.clone(),
+                    subagent_type: chat.subagent_type.clone(),
                     thinking: chat.opts.map(|o| o.thinking.into()),
                     fast: chat.opts.is_some_and(|o| o.fast),
                     plugin: chat.plugin.clone(),
                     cost: chat.cost,
                     started_at: chat.clock.as_ref().and_then(TaskClock::started_at),
                     ended_at: chat.clock.as_ref().and_then(TaskClock::ended_at),
+                    run: chat.run.clone(),
                 })
             })
             .collect();
         self.state.session_mut().set_subagents(subagents);
+    }
+
+    /// A run the journal lost is taken back from what the session kept: its
+    /// name, its kind and its transcript. The hub knows it again as a
+    /// finished agent, so a message revives it instead of failing.
+    ///
+    /// The journal is the fast path; the session is what survives a restart.
+    /// A run whose journal record went missing (a journal that degraded, a
+    /// process that could not take the lock) is still in the session, and the
+    /// child the user wants to continue must not be lost with it.
+    pub(crate) fn remember_runs(&mut self) {
+        let Some(runs) = self.live_runs() else {
+            return;
+        };
+        maki_agent::runs::remember_session_runs(&runs.hub, &self.state.session);
+    }
+
+    /// The hub of this session, when the agent is live and runs are on.
+    pub(crate) fn live_runs(&self) -> Option<maki_agent::runs::RunsCtx> {
+        self.mailbox
+            .as_ref()
+            .and_then(|mailbox| mailbox.seed())
+            .and_then(|seed| seed.runs.clone())
     }
 
     pub(super) fn save_input_history(&self) {
@@ -286,12 +313,14 @@ impl App {
     /// as done that keeps streaming and that Esc can no longer reach.
     pub(super) fn reset_ui_chrome(&mut self) {
         let session = self.state.session.id;
-        self.reset_ui_chrome_keeping(|chat| chat.is_live_plugin_task_of(session));
+        self.reset_ui_chrome_keeping(|chat| chat.is_live_plugin_task_of(session), false);
     }
 
     /// [`Self::reset_ui_chrome`] that keeps every task tab {keep} accepts, as
-    /// it is. The main chat always goes.
-    fn reset_ui_chrome_keeping(&mut self, keep: impl Fn(&Chat) -> bool) {
+    /// it is. The main chat always goes. `runs_stay` says the session's runs
+    /// are still there: a rewind keeps them, a new session does not, and the
+    /// picker has to show the ones that go on working.
+    fn reset_ui_chrome_keeping(&mut self, keep: impl Fn(&Chat) -> bool, runs_stay: bool) {
         // Brings the main draft back to the box before the chats holding it go.
         self.set_active_chat(MAIN_CHAT);
         self.chats
@@ -308,11 +337,15 @@ impl App {
         self.active_chat = MAIN_CHAT;
         self.chat_index.clear();
         self.deleted_tasks.clear();
+        if !runs_stay {
+            self.runs.clear();
+        }
         self.status = Status::Idle;
         self.clear_exit_request();
         self.queue.clear();
         self.recoverable_queue.clear();
         self.close_all_overlays();
+        self.permission_prompt.clear();
         self.status_bar.clear_flash();
         self.last_esc = None;
         self.last_quit = None;
@@ -359,9 +392,14 @@ impl App {
             // when it ends, so one without an entry here never got to finish:
             // leftovers from a kill mid-turn. It has nothing to show, and
             // restoring it would park a task no agent backs at the top of the
-            // picker, running forever. The next checkpoint drops it for good.
-            let Some(messages) = self.state.session.subagent_messages().get(&sa.tool_use_id) else {
-                continue;
+            // picker, running forever. `sync_subagents` below drops it for good.
+            // A native run keeps its transcript in the journal, so it comes back
+            // even without one here: the tab is read-only until a message revives it.
+            let none = Vec::new();
+            let messages = match self.state.session.subagent_messages().get(&sa.tool_use_id) {
+                Some(messages) => messages,
+                None if sa.run.is_some() => &none,
+                None => continue,
             };
             if self.chat_of_task(&sa.tool_use_id).is_ok() {
                 continue;
@@ -392,9 +430,25 @@ impl App {
                 fast: sa.fast,
             });
             chat.load_messages(display);
-            // The session file keeps the transcript but never how it ended,
-            // so a reload admits that instead of guessing.
-            chat.mark_finished(TaskOutcome::Unknown, DONE_TEXT);
+            match sa.run {
+                Some(mut run) => {
+                    self.runs.restored(&run);
+                    if super::runs::is_live(&run.state) {
+                        run.state = super::runs::LOST.to_owned();
+                    }
+                    let (outcome, text) = match run.state.as_str() {
+                        "completed" => (TaskOutcome::Done, DONE_TEXT),
+                        "killed" => (TaskOutcome::Error, CANCELLED_TEXT),
+                        super::runs::LOST => (TaskOutcome::Error, LOST_TEXT),
+                        _ => (TaskOutcome::Error, ERROR_TEXT),
+                    };
+                    chat.run = Some(run);
+                    chat.mark_finished(outcome, text);
+                }
+                // The session file keeps the transcript but never how it ended,
+                // so a reload admits that instead of guessing.
+                None => chat.mark_finished(TaskOutcome::Unknown, DONE_TEXT),
+            }
             // After mark_finished, which would stop a still-running clock at
             // the reload instead of the task's end.
             chat.clock = TaskClock::from_unix(sa.started_at, sa.ended_at);
@@ -402,6 +456,9 @@ impl App {
             self.chats.push(chat);
         }
 
+        // The hub takes back the runs the journal lost, so a message in one
+        // of these tabs revives it instead of failing.
+        self.remember_runs();
         let eh = &self.lua_event_handle;
         if eh.is_disconnected() {
             self.restoring
@@ -727,11 +784,16 @@ impl App {
         session.update_title_if_default(None);
         self.state.context_size = context_size;
 
-        // A tool task still running belongs to a turn that is over.
-        self.reset_ui_chrome_keeping(|chat| {
-            chat.task_id().is_some_and(|id| !dropped.contains(id))
-                && (chat.plugin.is_some() || chat.is_finished())
-        });
+        // A tool task still running belongs to a turn that is over. A native
+        // run does not: it outlives the turn that started it, so a rewind
+        // that keeps it keeps its tab.
+        self.reset_ui_chrome_keeping(
+            |chat| {
+                chat.task_id().is_some_and(|id| !dropped.contains(id))
+                    && (chat.plugin.is_some() || chat.is_finished() || is_native_run(chat))
+            },
+            true,
+        );
         self.deleted_tasks = deleted;
         self.deleted_tasks
             .extend(dropped.iter().map(|id| id.to_string()));
@@ -743,7 +805,7 @@ impl App {
 
         self.restore_input(&entry.prompt_text, turn_writers(&entry.prompt_text));
 
-        actions.push(Action::RestartAgent(self.install_local_history()));
+        actions.push(Action::RewindAgent(self.install_local_history()));
         actions
     }
 

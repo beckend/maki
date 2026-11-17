@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
@@ -149,6 +150,8 @@ struct Request {
     tool: ToolKey,
     scopes: Vec<String>,
     subagent_id: Option<String>,
+    /// Who is asking, for a background run: `name (handle)`.
+    label: Option<String>,
     allow_scopes: Vec<String>,
     project_answers: ProjectAnswers,
     /// Set when a plugin escalated the call, so the user sees why they are
@@ -179,7 +182,13 @@ pub struct PermissionPrompt {
     queue: VecDeque<Request>,
     state: PromptState,
     buffer: TextBuffer,
+    /// Keys are ignored until then: set when the ask on screen was taken away
+    /// by a withdrawal, so a keystroke meant for it cannot answer the next.
+    guard_until: Option<Instant>,
 }
+
+/// How long an answer key is swallowed after the ask on screen changed under it.
+const SWITCH_GUARD: Duration = Duration::from_millis(400);
 
 impl Overlay for PermissionPrompt {
     fn is_prompting(&self) -> bool {
@@ -198,7 +207,7 @@ impl Overlay for PermissionPrompt {
     /// key while it holds an ask, so neither runs over one: an ask from a task
     /// that outlives them would wait on an answer that never comes.
     fn close(&mut self) {
-        self.queue.clear();
+        self.queue.retain(|request| request.label.is_some());
         self.reset_entry();
     }
 }
@@ -209,6 +218,7 @@ impl PermissionPrompt {
             queue: VecDeque::new(),
             state: PromptState::Normal,
             buffer: TextBuffer::new(String::new()),
+            guard_until: None,
         }
     }
 
@@ -227,15 +237,61 @@ impl PermissionPrompt {
         } else {
             allow_scopes
         };
-        self.queue.push_back(Request {
-            id,
-            tool,
-            scopes,
-            subagent_id,
-            allow_scopes,
-            project_answers,
-            reason,
-        });
+        // The user's own asks go ahead of the background runs' waiting ones (not
+        // the one on screen), so a flood of those cannot starve them.
+        let background = subagent_id.as_deref().is_some_and(|s| s.starts_with("ag-"));
+        let at = if background {
+            self.queue.len()
+        } else {
+            (1..self.queue.len())
+                .find(|&i| {
+                    self.queue[i]
+                        .subagent_id
+                        .as_deref()
+                        .is_some_and(|s| s.starts_with("ag-"))
+                })
+                .unwrap_or(self.queue.len())
+        };
+        self.queue.insert(
+            at,
+            Request {
+                id,
+                tool,
+                scopes,
+                subagent_id,
+                label: None,
+                allow_scopes,
+                project_answers,
+                reason,
+            },
+        );
+    }
+
+    /// Drops every ask, background runs' included (a new session).
+    pub fn clear(&mut self) {
+        self.queue.clear();
+        self.reset_entry();
+    }
+
+    /// Names the run behind the ask that was just pushed.
+    pub fn label_last(&mut self, label: String) {
+        if let Some(request) = self.queue.back_mut() {
+            request.label = Some(label);
+        }
+    }
+
+    /// The ask `id` of `subagent_id` needs no answer any more (it timed out or
+    /// its run ended); it leaves the screen without being answered.
+    pub fn withdraw(&mut self, subagent_id: &str, id: &str) {
+        let is_it = |r: &Request| r.id == id && r.subagent_id.as_deref() == Some(subagent_id);
+        let front = self.queue.front().is_some_and(is_it);
+        if front {
+            self.reset_entry();
+        }
+        self.queue.retain(|r| !is_it(r));
+        if front && !self.queue.is_empty() {
+            self.guard_until = Some(Instant::now() + SWITCH_GUARD);
+        }
     }
 
     fn reset_entry(&mut self) {
@@ -257,11 +313,36 @@ impl PermissionPrompt {
         self.queue.iter().any(|request| request.id == id)
     }
 
+    #[cfg(test)]
+    pub(crate) fn front_label(&self) -> Option<&str> {
+        self.queue.front().and_then(|r| r.label.as_deref())
+    }
+
+    /// Handles of the background runs that have an ask waiting, on screen or
+    /// not. Drives the `!` badge and the `/runs` rows.
+    pub(crate) fn waiting_runs(&self) -> Vec<&str> {
+        let mut out: Vec<&str> = Vec::new();
+        for handle in self
+            .queue
+            .iter()
+            .filter_map(|r| r.subagent_id.as_deref())
+            .filter(|s| s.starts_with("ag-"))
+        {
+            if !out.contains(&handle) {
+                out.push(handle);
+            }
+        }
+        out
+    }
+
     pub(crate) fn tool(&self) -> Option<&ToolKey> {
         self.queue.front().map(|request| &request.tool)
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<AnsweredRequest> {
+        if self.guard_until.is_some_and(|t| Instant::now() < t) {
+            return None;
+        }
         let answer = self.key_answer(key)?;
         let request = self.queue.pop_front()?;
         self.reset_entry();
@@ -276,6 +357,7 @@ impl PermissionPrompt {
         if !self.is_open() {
             return None;
         }
+        let background = self.queue.front().is_some_and(|r| r.label.is_some());
         let (state, buffer) = (&mut self.state, &mut self.buffer);
         if is_ctrl(&key) && key.code == KeyCode::Char('c') {
             return Some(PermissionAnswer::Deny);
@@ -325,6 +407,8 @@ impl PermissionPrompt {
             };
         }
         match key.code {
+            // Dismissing a background run's ask denies it; the run goes on.
+            KeyCode::Esc if background => Some(PermissionAnswer::Deny),
             KeyCode::Char('y') => Some(PermissionAnswer::AllowOnce),
             KeyCode::Char('n') => {
                 *state = PromptState::DenyEditing;
@@ -371,6 +455,7 @@ impl PermissionPrompt {
             tool,
             scopes,
             subagent_id,
+            label,
             allow_scopes,
             project_answers,
             reason,
@@ -390,12 +475,20 @@ impl PermissionPrompt {
         }
         tool_spans.push(Span::styled(tool.to_string(), value_style));
 
-        let mut lines = vec![Line::raw(""), Line::from(tool_spans)];
+        let mut lines = vec![Line::raw("")];
+        if let Some(label) = label {
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled("agent ", label_style),
+                Span::styled(visible(label), value_style),
+            ]));
+        }
+        lines.push(Line::from(tool_spans));
         if let Some(reason) = reason {
             lines.push(Line::from(vec![
                 Span::raw("  "),
                 Span::styled("why   ", label_style),
-                Span::styled(reason.clone(), value_style),
+                Span::styled(visible(reason), value_style),
             ]));
         }
         let waiting = self.queue.len() - 1;
@@ -411,7 +504,7 @@ impl PermissionPrompt {
             lines.push(Line::from(vec![
                 Span::raw("  "),
                 Span::styled(label, label_style),
-                Span::styled(s.clone(), value_style),
+                Span::styled(visible(s), value_style),
             ]));
         }
 
@@ -421,7 +514,7 @@ impl PermissionPrompt {
                 lines.push(Line::from(vec![
                     Span::raw("  "),
                     Span::styled(label, label_style),
-                    Span::styled(g.clone(), value_style),
+                    Span::styled(visible(g), value_style),
                 ]));
             }
         }
@@ -588,6 +681,25 @@ mod tests {
             .flat_map(|line| line.spans.iter())
             .map(|span| span.content.as_ref())
             .collect()
+    }
+
+    #[test]
+    fn run_label_is_shown_and_withdraw_removes_only_that_ask() {
+        let mut prompt = PermissionPrompt::new();
+        push_subagent_ask(&mut prompt);
+        prompt.label_last("auditor (ag-k3x9ab)".into());
+        assert!(rendered(&prompt).contains("auditor (ag-k3x9ab)"));
+        open_with(&mut prompt, ProjectAnswers::Saved);
+        prompt.withdraw("other", SUB_ID);
+        prompt.withdraw(SUB_AGENT, MAIN_ID);
+        assert_eq!(
+            prompt.queue.len(),
+            2,
+            "wrong run or wrong id removes nothing"
+        );
+        prompt.withdraw(SUB_AGENT, SUB_ID);
+        assert_eq!(prompt.queue.len(), 1);
+        assert_eq!(prompt.front_label(), None);
     }
 
     fn ctrl_c() -> KeyEvent {
@@ -818,5 +930,97 @@ mod tests {
                 .then(|| text.trim_start()[WHY_LABEL.len()..].trim().to_owned())
         });
         assert_eq!(why_row.as_deref(), reason);
+    }
+}
+
+/// Text a model controls, made safe to show in the prompt: control characters
+/// (escape sequences, carriage returns) and bidi overrides could redraw or
+/// reorder what the user is about to approve, so they become visible marks.
+fn visible(text: &str) -> String {
+    text.chars()
+        .map(|c| match c {
+            '\n' => '\u{23ce}',
+            c if c.is_control() => '\u{fffd}',
+            '\u{200e}'
+            | '\u{200f}'
+            | '\u{061c}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2066}'..='\u{2069}' => '\u{fffd}',
+            c => c,
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod visible_tests {
+    use super::*;
+
+    #[test]
+    fn hostile_scope_text_is_shown_without_control_characters() {
+        let mut prompt = PermissionPrompt::new();
+        prompt.push(
+            "i".into(),
+            ToolKey::native("bash"),
+            vec!["echo \x1b[2J\x1b[H FAKE\r\nrm -rf \u{202e}fdp.exe".into()],
+            Some("ag-aaaaaa".into()),
+            ProjectAnswers::Saved,
+            Some("why \x1b[31m".into()),
+        );
+        prompt.label_last("x\x1b[2J (ag-aaaaaa)".into());
+        let text: String = prompt
+            .build_lines()
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(
+            !text
+                .chars()
+                .any(|c| c.is_control() || ('\u{202a}'..='\u{202e}').contains(&c))
+        );
+        assert!(text.contains('\u{23ce}'));
+    }
+}
+
+#[cfg(test)]
+mod order_tests {
+    use super::*;
+
+    fn ask(p: &mut PermissionPrompt, id: &str, sub: Option<&str>) {
+        p.push(
+            id.into(),
+            ToolKey::native("bash"),
+            vec!["ls".into()],
+            sub.map(Into::into),
+            ProjectAnswers::Saved,
+            None,
+        );
+    }
+
+    fn key_y() -> KeyEvent {
+        KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn a_main_ask_goes_ahead_of_waiting_background_asks_but_not_the_one_shown() {
+        let mut p = PermissionPrompt::new();
+        for i in 0..3 {
+            ask(&mut p, &format!("b{i}"), Some("ag-aaaaaa"));
+        }
+        ask(&mut p, "main", None);
+        let ids: Vec<_> = p.queue.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, ["b0", "main", "b1", "b2"]);
+    }
+
+    #[test]
+    fn a_withdrawal_under_the_user_swallows_the_next_keys_briefly() {
+        let mut p = PermissionPrompt::new();
+        ask(&mut p, "a", Some("ag-aaaaaa"));
+        ask(&mut p, "b", Some("ag-bbbbbb"));
+        p.withdraw("ag-aaaaaa", "a");
+        assert!(p.handle_key(key_y()).is_none(), "key meant for the old ask");
+        assert_eq!(p.queue.len(), 1);
+        p.guard_until = Some(Instant::now() - Duration::from_millis(1));
+        assert!(p.handle_key(key_y()).is_some());
     }
 }

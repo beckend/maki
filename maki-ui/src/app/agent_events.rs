@@ -133,7 +133,12 @@ impl App {
             self.deliver(envelope, Some(plugin));
             return;
         }
-        if envelope.run_id != self.run_id && !self.is_racing_receipt(&envelope) {
+        // A native run reports under its own id, not the turn's: it outlives
+        // the turn that started it, so its events are never stale.
+        if envelope.run_id != self.run_id
+            && envelope.run_id != maki_agent::BACKGROUND_RUN_ID
+            && !self.is_racing_receipt(&envelope)
+        {
             // A snapshot dropped here degrades the tool body to llm_output.
             if let AgentEvent::ToolSnapshot { id, .. }
             | AgentEvent::ToolHeaderSnapshot { id, .. }
@@ -223,7 +228,9 @@ impl App {
 
         self.account_usage(chat_idx, subagent_id.as_deref(), &event);
 
-        let Some(event) = self.answer_request(chat_idx, subagent_id, event) else {
+        let Some(event) =
+            self.answer_request(chat_idx, subagent_id, envelope.subagent.as_ref(), event)
+        else {
             return;
         };
 
@@ -260,7 +267,19 @@ impl App {
             // to the ToolDone that follows elsewhere. A plugin task is never in
             // `chat_index`, and rightly stays open here: it writes its
             // transcript after every prompt, and its close is `StreamClosed`.
-            if let Some(&sub_idx) = self.chat_index.get(tool_use_id.as_str()) {
+            // A native run's task ends with its transcript, and the index that
+            // used to say so is a per-turn cache, so it is gone by the time
+            // the transcript lands: a task that never ends keeps the picker
+            // showing it as running, and the status bar spinning on a task
+            // that is long gone.
+            let sub_idx = self
+                .chat_index
+                .get(tool_use_id.as_str())
+                .copied()
+                .or_else(|| self.chat_of_task(&tool_use_id).ok());
+            if let Some(sub_idx) = sub_idx
+                && self.chats[sub_idx].plugin.is_none()
+            {
                 self.chats[sub_idx].mark_finished(TaskOutcome::Unknown, DONE_TEXT);
             }
             self.state
@@ -380,10 +399,13 @@ impl App {
     /// The events that ask the App rather than the chat for something: a
     /// queued message going out, a permission prompt, a login. Hands any
     /// other event back for the chat.
+    /// `asker` names the subagent the event came from, so a prompt of a
+    /// background run can say whose call it is.
     fn answer_request(
         &mut self,
         chat_idx: usize,
         subagent_id: Option<String>,
+        asker: Option<&SubagentInfo>,
         event: AgentEvent,
     ) -> Option<AgentEvent> {
         match event {
@@ -402,6 +424,10 @@ impl App {
             } => {
                 let project_answers =
                     ProjectAnswers::new(self.permissions.project_is_trusted(), &self.trust);
+                let run_label = self.run_prompt_label(
+                    subagent_id.as_deref(),
+                    asker.map(|asker| asker.name.as_str()),
+                );
                 self.open_prompt(|app| {
                     app.permission_prompt.push(
                         id,
@@ -411,6 +437,9 @@ impl App {
                         project_answers,
                         reason,
                     );
+                    if let Some(label) = run_label {
+                        app.permission_prompt.label_last(label);
+                    }
                 });
             }
             AgentEvent::AuthRequired => self.park_for_auth(chat_idx),
@@ -516,7 +545,14 @@ impl App {
     ) -> usize {
         let id = &subagent.parent_tool_use_id;
         let known = match plugin {
-            None => self.chat_index.get(id.as_str()).copied(),
+            // The index is only a routing cache: it is wiped at the end of
+            // every turn, so a run that outlives its turn is found by the
+            // task it belongs to.
+            None => self
+                .chat_index
+                .get(id.as_str())
+                .copied()
+                .or_else(|| self.chat_of_task(id).ok()),
             Some(_) => self.chat_of_task(id).ok(),
         };
         if let Some(idx) = known {

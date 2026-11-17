@@ -60,11 +60,13 @@ impl App {
             | KeyboardOwner::ThemePicker
             | KeyboardOwner::ModelPicker
             | KeyboardOwner::LoginPicker
+            | KeyboardOwner::RunsPicker
             | KeyboardOwner::McpPicker => picker,
             KeyboardOwner::Alert
             | KeyboardOwner::PackReview
             | KeyboardOwner::PlanForm
             | KeyboardOwner::Help
+            | KeyboardOwner::LogViewer
             | KeyboardOwner::Usage
             | KeyboardOwner::Btw
             | KeyboardOwner::Queue => None,
@@ -367,6 +369,13 @@ impl App {
             record(KeyboardOwner::McpPicker, self.mcp_picker.view(frame, full));
         }
 
+        if self.runs_picker.is_open() {
+            record(
+                KeyboardOwner::RunsPicker,
+                self.runs_picker.view(frame, full),
+            );
+        }
+
         (overlay_rect, picker_caret)
     }
 
@@ -384,6 +393,10 @@ impl App {
             overlay_rect = r;
         }
         let r = self.help_modal.view(frame, full, &self.keymap_reader);
+        if r.width > 0 {
+            overlay_rect = r;
+        }
+        let r = self.log_viewer.view(frame, full);
         if r.width > 0 {
             overlay_rect = r;
         }
@@ -448,6 +461,9 @@ impl App {
             workflow: self.state.workflow,
             restricted: self.trust.question().is_some(),
             yolo: self.permissions.is_yolo(),
+            runs: self
+                .runs
+                .segment(self.permission_prompt.waiting_runs().len()),
         };
         self.status_bar.view(frame, status_area, &ctx);
     }

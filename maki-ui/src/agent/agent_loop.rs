@@ -334,8 +334,10 @@ impl AgentLoop {
                 prompt_slots: Arc::clone(&prompt_slots),
                 subagent_cancels: Arc::clone(&self.subagent_cancels),
                 ledger: Arc::clone(ledger),
+                registry: Arc::clone(ToolRegistry::global_arc()),
                 audience: ToolAudience::MAIN,
                 model_policy: Arc::clone(&self.seed.model_policy),
+                runs: self.seed.runs.clone(),
             },
             AgentRunParams {
                 history: &mut self.history,
