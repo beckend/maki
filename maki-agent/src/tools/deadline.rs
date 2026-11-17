@@ -96,6 +96,8 @@ mod tests {
         let before = deadline.at().unwrap();
         let clone = deadline.clone();
 
+        // The timer must start inside the wrapped future. Built as an argument
+        // it starts before `paused_at` is taken and can finish by less than WAIT.
         deadline.paused_while(tokio::time::sleep(WAIT)).await;
 
         assert!(clone.at().unwrap() - before >= WAIT);

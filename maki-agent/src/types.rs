@@ -789,6 +789,11 @@ pub enum AgentEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
     },
+    /// The prompt `id` no longer needs an answer (it timed out, or its run was
+    /// stopped), so a frontend takes it off the screen.
+    PermissionWithdrawn {
+        id: String,
+    },
     /// A `permission.prompt` layer allowed a call that would have prompted.
     /// The prompt is where the user learns what the agent is about to do, so
     /// a frontend marks the row instead. `id` is the closest row the user can
@@ -851,6 +856,33 @@ pub enum AgentEvent {
         processed: u32,
         total: u32,
         cache: u32,
+    },
+    /// A native run exists. Stamped with [`SubagentInfo`] for an agent run
+    /// (whose `parent_tool_use_id` is the handle), which is what opens its tab.
+    RunStarted {
+        handle: String,
+        name: String,
+        kind: String,
+        /// Handle of the run that started it, `None` for `main`.
+        parent: Option<String>,
+        depth: u8,
+        one_shot: bool,
+    },
+    /// An agent run moved to `idle` or back to `running`.
+    RunStateChanged {
+        handle: String,
+        state: String,
+    },
+    /// The run reached `Done`; `reason` is the `DoneReason` spelling.
+    RunFinished {
+        handle: String,
+        reason: String,
+        detail: Option<String>,
+    },
+    /// A notice or a message reached `main`'s inbox. With `wake` the frontend
+    /// may start a turn for it (`UnitHub::claim_main_wake` decides).
+    RunNotice {
+        wake: bool,
     },
     /// End of a session's event stream. Emitted only by
     /// [`EventStreamGuard::drop`] and swallowed by [`SessionEvents::next`], so
@@ -1350,6 +1382,11 @@ pub struct SubagentInfo {
     pub prompt: Option<String>,
     #[serde(rename = "parent_model", skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// What kind of subagent this is: "research" (read-only) or "general".
+    /// The session keeps it, so a child the journal lost comes back with the
+    /// tools it had.
+    #[serde(rename = "subagent_type", skip_serializing_if = "Option::is_none")]
+    pub subagent_type: Option<String>,
     /// What the subagent actually runs with, already reconciled against its
     /// model. `None` means unknown (a restore predating it), which reads as
     /// the parent's settings.
@@ -1368,6 +1405,10 @@ pub struct SubagentInfo {
     #[serde(skip)]
     pub parent_call: Option<String>,
 }
+
+/// The `run_id` of events from background runs. They belong to no turn, so a
+/// frontend must not drop them as stale when its own turn counter moves on.
+pub const BACKGROUND_RUN_ID: u64 = u64::MAX - 1;
 
 #[derive(Debug, Clone)]
 pub struct EventSender {

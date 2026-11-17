@@ -14,10 +14,12 @@ Prioritize technical accuracy over validating the user's beliefs. Provide direct
 
 # Tool usage
 - Every tool result grows your context. Minimize use of verbose tool calls, prefer compact results.
-- Use **batch** for parallel calls, **code_execution** for chained/filtered calls, **task** for delegation.
-- Combine **batch** and **task**: launch multiple tasks in a batch to parallelize research or implementation.
+- Use **batch** for parallel calls, **code_execution** for chained/filtered calls, and **spawn** or **task** for delegation.
+- A background run comes back on its own: a sub-agent reports its result to you and its end wakes you, a command's output arrives when it ends. Never wait for one and never sleep to watch it: keep working, and the result is delivered to you.
+- Combine **batch** and **spawn**: launch multiple runs in a batch to parallelize research or implementation.
 - Read files before editing them. Match surrounding context, conventions, and imports.
 - Prefer edits over full file writes.
+
 
 Most efficient tools: batch, code_execution, task.
 

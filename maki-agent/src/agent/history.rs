@@ -24,6 +24,10 @@ const PARENT_CANCEL_MARKER: &str = "[Cancelled by your parent agent or a plugin,
 /// (seen with llama.cpp stuck on an unterminated tool call).
 const USER_CUT_REPLY_NOTE: &str = "[Response cut off by user cancel]";
 const PARENT_CUT_REPLY_NOTE: &str = "[Response cut off by your parent agent or a plugin]";
+/// The request ended without anything asking for it: the provider dropped the
+/// stream (a transport hiccup, an aborted connection). It is not a cancel,
+/// and saying it was would put a lie in the transcript.
+pub(crate) const REQUEST_DROPPED_MARKER: &str = "[Cancelled: the request was dropped]";
 pub const UNAVAILABLE_RESULT: &str = "[Tool result not available]";
 
 pub type HistorySnapshot = maki_storage::sessions::HistorySnapshot<Message>;
@@ -139,6 +143,10 @@ pub struct History {
     /// because messages only make sense under the prefix they were sent with,
     /// and every frontend already keeps a `History` for the whole session.
     live: Option<LiveFrame>,
+    /// Run messages in the transcript that no sent request has carried yet.
+    /// Here and not on the `Agent`, which a driver builds anew every turn: a
+    /// turn cancelled mid-request must not forget them.
+    landed: Vec<(crate::runs::InboxItem, Option<u32>)>,
 }
 
 impl History {
@@ -148,7 +156,22 @@ impl History {
             mirror: None,
             unsaved: false,
             live: None,
+            landed: Vec::new(),
         }
+    }
+
+    pub(crate) fn note_landed(&mut self, items: &[crate::runs::InboxItem], step: Option<u32>) {
+        self.landed.extend(
+            items
+                .iter()
+                .filter(|i| i.id.0 != 0 || i.notice.is_some())
+                .cloned()
+                .map(|i| (i, step)),
+        );
+    }
+
+    pub(crate) fn take_landed(&mut self) -> Vec<(crate::runs::InboxItem, Option<u32>)> {
+        std::mem::take(&mut self.landed)
     }
 
     /// Call before [`Self::with_mirror`], which publishes.
@@ -579,10 +602,19 @@ pub(crate) fn sanitize_cancelled_history(
     rollback_len: usize,
     cutter: Cutter,
 ) {
+    sanitize_history_with_marker(history, rollback_len, cutter.cancel_marker());
+}
+
+/// The request ended and nobody asked for it: the provider dropped the
+/// stream. The marker must name that, not a cancel that never happened.
+pub(crate) fn sanitize_dropped_history(history: &mut History, rollback_len: usize) {
+    sanitize_history_with_marker(history, rollback_len, REQUEST_DROPPED_MARKER);
+}
+
+fn sanitize_history_with_marker(history: &mut History, rollback_len: usize, marker: &str) {
     if history.len() <= rollback_len {
         return;
     }
-    let marker = cutter.cancel_marker();
     // Close dangling tool calls and add the cancel marker, stamping both. The
     // free `close_dangling_tool_calls` is left for the restore path, which must
     // not re-time messages it is only repairing.

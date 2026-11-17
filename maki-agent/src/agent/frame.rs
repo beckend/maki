@@ -19,7 +19,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 use maki_providers::{Message, Model};
-use maki_storage::frame::{FactsUpdate, LiveFacts, PlanChange, PromptFacts, StoredFrame};
+use maki_storage::frame::{
+    FactsUpdate, LiveFacts, PlanChange, PromptFacts, StoredFrame, TopologyFacts,
+};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use strum::IntoEnumIterator;
@@ -181,13 +183,20 @@ fn hint_facts(slots: &ResolvedPrompts) -> BTreeMap<String, String> {
 }
 
 /// Hashes what no update can describe: the base tools, the MCP deferral mode
-/// (it shapes every MCP entry) and the host's own prompt text. The hash is the
-/// same in every process, so a resumed session can tell if its frame still fits.
+/// (it shapes every MCP entry), the host's own prompt text and the build the
+/// prompt states. The hash is the same in every process, so a resumed session
+/// can tell if its frame still fits.
 pub(crate) fn fingerprint(context: &RunContext, mcp: Option<&McpSession>, model: &Model) -> String {
     let mut hasher = Sha256::new();
     hasher.update(context.tools.definitions().to_string());
     hasher.update([0]);
     hasher.update(&context.authored);
+    // The prompt states the build, and no update corrects it: a session
+    // resumed after an upgrade must not keep a frame that names the old one.
+    if let Some(version) = stated_version(&context.system) {
+        hasher.update([0]);
+        hasher.update(version);
+    }
     if mcp.is_some() {
         hasher.update([0]);
         hasher.update(format!("{:?}", ToolDeferral::for_model(model)));
@@ -196,6 +205,14 @@ pub(crate) fn fingerprint(context: &RunContext, mcp: Option<&McpSession>, model:
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect()
+}
+
+/// The build the prompt states, if it states one. A prompt the host wrote
+/// itself is hashed whole, so it needs no separate look.
+fn stated_version(system: &str) -> Option<&str> {
+    system
+        .lines()
+        .find_map(|line| line.strip_prefix("- Maki version: "))
 }
 
 /// The in-memory half of a frame. The first run of a process rebuilds it from
@@ -362,12 +379,93 @@ pub fn plan_mode_update(plan_path: &Path, prompts: &ResolvedPrompts) -> String {
     wrap_update(&[plan_text(plan_path, prompts)])
 }
 
+const MAIN_NAME: &str = "main";
+
+fn child_list(children: &[(String, String, u8)]) -> String {
+    children
+        .iter()
+        .map(|(handle, name, kind)| {
+            let kind = if *kind == 0 { "agent" } else { "shell" };
+            format!("\"{name}\" ({handle}, {kind})")
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// What the model reads about the runs around it. Plain sentences: it is
+/// told again only when the parent or the children change.
+///
+/// `can_send` says whether this run may message its parent. A runtime that
+/// does not offer `send` (a host with its own tool set) must not be told to
+/// use it: there the final answer is the result the parent gets.
+pub(crate) fn topology_text(topology: &TopologyFacts, can_send: bool) -> String {
+    let (handle, name, depth) = &topology.me;
+    let (max_depth, siblings) = topology.limits;
+    let at_cap = *depth >= max_depth;
+    let Some((parent_handle, parent_name)) = &topology.parent else {
+        let runs = if topology.children.is_empty() {
+            "You have no unfinished runs.".to_owned()
+        } else {
+            format!("Runs you started: {}.", child_list(&topology.children))
+        };
+        // The parent is the one that has to be told what a run does for it:
+        // the child reports with send and its end wakes the parent, so
+        // waiting for it, sleeping on it or polling it is all wasted.
+        return format!(
+            "Run topology changed. You are \"{MAIN_NAME}\". {runs} A sub-agent you started \
+             reports its result to you (it sends it to \"parent\") and its end wakes you, so \
+             keep working: never wait for it, never sleep to watch it, never poll it. A \
+             command's output arrives when it ends. Runs finish with a notice. Maximum depth \
+             {max_depth}."
+        );
+    };
+    let parent = if parent_handle == MAIN_NAME {
+        format!("\"{MAIN_NAME}\"")
+    } else {
+        format!("\"{parent_name}\" ({parent_handle})")
+    };
+    let children = if topology.children.is_empty() {
+        "You have no children.".to_owned()
+    } else {
+        format!("Your children: {}.", child_list(&topology.children))
+    };
+    // A run that has children of its own is a parent too, and the same rule
+    // holds for it.
+    let children_report = if topology.children.is_empty() {
+        ""
+    } else {
+        " A sub-agent you started reports its result to you (it sends it to \"parent\") and its \
+         end wakes you, so keep working: never wait for it, never sleep to watch it, never poll \
+         it."
+    };
+    let cap = if at_cap {
+        " You are at the maximum depth: spawn(kind=\"agent\") will fail with DEPTH_LIMIT; do the work directly."
+    } else {
+        ""
+    };
+    let siblings = if siblings {
+        " You may message siblings by name or handle with send; runs(scope=\"all\") lists them."
+    } else {
+        " Messages to siblings are not enabled."
+    };
+    let report = if can_send {
+        "Send your result to your parent with send(to=\"parent\") before you finish, and a question or progress while you work; sending does not end your turn."
+    } else {
+        "Your final answer is the result your parent receives, so make it a self-contained summary."
+    };
+    let scope = "Your permission scope is the one you were started with and cannot be widened from inside this session, so a call that would need the user's approval is denied when nobody can answer it: do not retry such a call, say what you could not do instead.";
+    format!(
+        "Run topology changed. You are agent \"{name}\" ({handle}), depth {depth} of {max_depth}. Your parent is {parent}. {children}{children_report} {report} {scope} {siblings}{cap}"
+    )
+}
+
 /// The update that brings the model from `told` to `now`, if anything
 /// changed. It says only what changed, and stores only that.
 pub(crate) fn context_update(
     told: &LiveFacts,
     now: &LiveFacts,
     prompts: &ResolvedPrompts,
+    can_send: bool,
 ) -> Option<Message> {
     let update = told.changes_to(now);
     if update.is_empty() {
@@ -394,6 +492,9 @@ pub(crate) fn context_update(
         Some(PlanChange::Entered(path)) => parts.push(plan_text(path, prompts)),
         Some(PlanChange::Ended) => parts.push(PLAN_ENDED.to_owned()),
         None => {}
+    }
+    if let Some(topology) = &update.topology {
+        parts.push(topology_text(topology, can_send));
     }
     for (key, content) in &update.hints {
         parts.push(match content {
@@ -440,6 +541,7 @@ mod tests {
                 instructions: "\n\nProject instructions:\nbe nice".into(),
                 hints: BTreeMap::from([(HINT_KEY.into(), "tags: a, b".into())]),
             }),
+            topology: None,
         }
     }
 
@@ -449,7 +551,7 @@ mod tests {
 
     #[test]
     fn unchanged_facts_tell_nothing() {
-        assert!(context_update(&facts(), &facts(), &ResolvedPrompts::default()).is_none());
+        assert!(context_update(&facts(), &facts(), &ResolvedPrompts::default(), true).is_none());
     }
 
     #[test_case(|f: &mut LiveFacts| prompt(f).date = NEXT_DATE.into(), NEXT_DATE ; "date")]
@@ -462,7 +564,7 @@ mod tests {
     fn changed_fact_is_told(change: fn(&mut LiveFacts), says: &str) {
         let mut now = facts();
         change(&mut now);
-        let update = context_update(&facts(), &now, &ResolvedPrompts::default()).unwrap();
+        let update = context_update(&facts(), &now, &ResolvedPrompts::default(), true).unwrap();
         let mut heard = facts();
         heard.apply(update.facts_update().unwrap());
         assert_eq!(heard, now);
@@ -542,6 +644,180 @@ mod tests {
             fingerprint(&context("a", ""), Some(&mcp), &model(CLIENT_MODEL)),
             "a model without tool search shapes the MCP entries another way"
         );
+    }
+
+    /// The prompt states the build, and nothing corrects it, so a frame that
+    /// names another build does not fit the one running it.
+    #[test]
+    fn fingerprint_tracks_the_stated_build() {
+        let native = model(NATIVE_MODEL);
+        let base = context("a", "");
+        let mut other = context("a", "");
+        other.system = "Environment:\n- Maki version: 9.9.9-fork\n".to_owned();
+        assert_ne!(
+            fingerprint(&base, None, &native),
+            fingerprint(&other, None, &native),
+            "a session resumed after an upgrade must not keep the frame of the old build"
+        );
+        let mut dated = context("a", "");
+        dated.system = "Environment:\n- Maki version: 9.9.9-fork\n- Date: 2026-01-01\n".to_owned();
+        assert_ne!(
+            fingerprint(&base, None, &native),
+            fingerprint(&dated, None, &native),
+            "the date is a fact an update carries, but the build is not"
+        );
+    }
+
+    fn main_topology() -> TopologyFacts {
+        TopologyFacts {
+            me: ("main".into(), "main".into(), 0),
+            parent: None,
+            children: vec![
+                ("ag-k3x9ab".into(), "auditor".into(), 0),
+                ("sh-4m2q7z".into(), "build".into(), 1),
+            ],
+            limits: (2, false),
+        }
+    }
+
+    fn sub_topology() -> TopologyFacts {
+        TopologyFacts {
+            me: ("ag-k3x9ab".into(), "auditor".into(), 1),
+            parent: Some(("main".into(), "main".into())),
+            children: Vec::new(),
+            limits: (2, false),
+        }
+    }
+
+    #[test]
+    fn rendering_snapshot_main_and_sub() {
+        assert_eq!(
+            topology_text(&main_topology(), true),
+            "Run topology changed. You are \"main\". Runs you started: \"auditor\" (ag-k3x9ab, agent), \"build\" (sh-4m2q7z, shell). A sub-agent you started reports its result to you (it sends it to \"parent\") and its end wakes you, so keep working: never wait for it, never sleep to watch it, never poll it. A command's output arrives when it ends. Runs finish with a notice. Maximum depth 2."
+        );
+        assert_eq!(
+            topology_text(&sub_topology(), true),
+            "Run topology changed. You are agent \"auditor\" (ag-k3x9ab), depth 1 of 2. Your parent is \"main\". You have no children. Send your result to your parent with send(to=\"parent\") before you finish, and a question or progress while you work; sending does not end your turn. Your permission scope is the one you were started with and cannot be widened from inside this session, so a call that would need the user's approval is denied when nobody can answer it: do not retry such a call, say what you could not do instead.  Messages to siblings are not enabled."
+        );
+        let mut capped = sub_topology();
+        capped.me.2 = 2;
+        capped.parent = Some(("ag-aaaaaa".into(), "lead".into()));
+        capped.limits.1 = true;
+        let text = topology_text(&capped, true);
+        assert!(text.contains("Your parent is \"lead\" (ag-aaaaaa)."));
+        assert!(text.contains("You may message siblings by name or handle"));
+        assert!(text.ends_with("do the work directly."), "{text}");
+    }
+
+    #[test]
+    fn a_child_without_send_is_told_its_answer_is_the_result() {
+        let text = topology_text(&sub_topology(), false);
+        assert!(
+            text.contains("Your final answer is the result your parent receives"),
+            "{text}"
+        );
+        assert!(!text.contains("send(to="), "{text}");
+    }
+
+    #[test]
+    fn fact_changes_only_when_children_change() {
+        let at = |topology: Option<TopologyFacts>| LiveFacts {
+            topology,
+            ..facts()
+        };
+        let told = at(Some(main_topology()));
+        assert!(context_update(&told, &told.clone(), &ResolvedPrompts::default(), true).is_none());
+        let mut grown = main_topology();
+        grown.children.push(("ag-zzzzzz".into(), "zed".into(), 0));
+        let update = context_update(
+            &told,
+            &at(Some(grown.clone())),
+            &ResolvedPrompts::default(),
+            true,
+        )
+        .unwrap();
+        assert!(update.first_text_content().unwrap().contains("\"zed\""));
+        let mut heard = told;
+        heard.apply(update.facts_update().unwrap());
+        assert_eq!(heard.topology, Some(grown));
+    }
+
+    #[test]
+    fn retell_coalesced_per_drain() {
+        let mut now = facts();
+        let mut topology = main_topology();
+        topology.children.clear();
+        let mut told = facts();
+        for n in 0..5 {
+            topology
+                .children
+                .push((format!("ag-{n}"), format!("kid{n}"), 0));
+        }
+        now.topology = Some(topology);
+        // Five children appeared since the last drain: one update names all.
+        let update = context_update(&told, &now, &ResolvedPrompts::default(), true).unwrap();
+        let text = update.first_text_content().unwrap();
+        assert_eq!(text.matches("Run topology changed.").count(), 1);
+        assert!((0..5).all(|n| text.contains(&format!("kid{n}"))));
+        told.apply(update.facts_update().unwrap());
+        assert!(context_update(&told, &now, &ResolvedPrompts::default(), true).is_none());
+    }
+
+    /// A resumed session: the history says the main agent has children, the
+    /// hub is empty. The next update corrects the model; and replaying
+    /// several updates leaves the latest topology.
+    #[test]
+    fn resumed_session_is_corrected_and_latest_update_wins() {
+        let mut told = facts();
+        told.topology = Some(main_topology());
+        let now = facts();
+        let update = context_update(&told, &now, &ResolvedPrompts::default(), true).unwrap();
+        let text = update.first_text_content().unwrap();
+        assert!(text.contains("You have no unfinished runs."), "{text}");
+
+        let mut replayed = facts();
+        let mut grown = main_topology();
+        grown.children.push(("ag-zzzzzz".into(), "zed".into(), 0));
+        for topology in [main_topology(), grown.clone()] {
+            let mut step = replayed.clone();
+            step.topology = Some(topology);
+            let u = context_update(&replayed, &step, &ResolvedPrompts::default(), true).unwrap();
+            replayed.apply(u.facts_update().unwrap());
+        }
+        replayed.apply(update.facts_update().unwrap());
+        assert_eq!(replayed, now);
+    }
+
+    /// The cache key of a session is its system prompt and its tools. Telling
+    /// the topology appends a message and touches neither.
+    #[test]
+    fn topology_update_leaves_the_prefix_and_fingerprint_alone() {
+        let native = model(NATIVE_MODEL);
+        let mut history = History::new(Vec::new());
+        assert_eq!(
+            fit_frame(&mut history, context("a", "sys"), None, &native),
+            FrameFit::Built
+        );
+        let (system, tools) = history.request_prefix().unwrap();
+        let (system, tools) = (system.to_owned(), tools.to_string());
+        let fingerprint_before = history.frame().unwrap().fingerprint.clone();
+
+        let told = history.told().unwrap();
+        let now = LiveFacts {
+            topology: Some(sub_topology()),
+            ..told.clone()
+        };
+        history.push(context_update(&told, &now, &ResolvedPrompts::default(), true).unwrap());
+        assert_eq!(history.told().unwrap(), now);
+
+        assert_eq!(
+            fit_frame(&mut history, context("a", "sys"), None, &native),
+            FrameFit::Kept
+        );
+        let (system_after, tools_after) = history.request_prefix().unwrap();
+        assert_eq!(system_after, system);
+        assert_eq!(tools_after.to_string(), tools);
+        assert_eq!(history.frame().unwrap().fingerprint, fingerprint_before);
     }
 
     fn host_context(host: &HostPrompt) -> RunContext {

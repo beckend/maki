@@ -1,0 +1,3784 @@
+//! Native agent runs end to end: a hub, a scripted provider, the real driver.
+//! Nothing here sleeps; the provider hands out its answers through gates and
+//! the tests wait on hub state.
+
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use maki_providers::provider::{BoxFuture, Provider};
+use maki_providers::{
+    AgentError, ContentBlock, Message, Model, ProviderEvent, RequestOptions, Role, StopReason,
+    StreamResponse, TokenUsage,
+};
+use maki_storage::id::SessionRef;
+use serde_json::{Value, json};
+use tempfile::TempDir;
+use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+
+use super::agent::RESULT_LIMIT;
+use super::*;
+use crate::AgentMode;
+use crate::cancel::CancelToken;
+use crate::tools::ToolContext;
+use crate::tools::test_support::stub_ctx;
+
+pub(super) const PARENT: &str = "PARENT-SCRIPT";
+pub(super) const CHILD: &str = "CHILD-TASK";
+
+pub(super) enum Step {
+    Reply(StreamResponse),
+    Gate(flume::Receiver<()>, StreamResponse),
+    Hang,
+    /// The provider fails; the run must settle `failed`.
+    Fail(&'static str),
+    /// The provider drops the request: the stream ends without an answer and
+    /// without anything asking for it, the way a lost connection does.
+    Drop,
+    /// Blocks the executor thread until released, so a cancel cannot reach it.
+    Block(std::sync::mpsc::Receiver<()>),
+}
+
+/// Answers by the first user message: each route has its own queue, so two
+/// agents sharing the provider never steal each other's answers.
+pub(super) struct Script {
+    routes: Mutex<Vec<(&'static str, VecDeque<Step>)>>,
+    seen: Mutex<Vec<(String, Vec<Value>)>>,
+    /// Routes whose every request must come from a run that holds a slot.
+    watch: Mutex<Vec<(&'static str, Arc<UnitHub>, UnitId)>>,
+    /// Requests that came from a run holding none.
+    breaches: Mutex<Vec<String>>,
+}
+
+impl Script {
+    pub(super) fn new(routes: Vec<(&'static str, Vec<Step>)>) -> Arc<Self> {
+        Arc::new(Self {
+            routes: Mutex::new(routes.into_iter().map(|(k, v)| (k, v.into())).collect()),
+            seen: Mutex::default(),
+            watch: Mutex::default(),
+            breaches: Mutex::default(),
+        })
+    }
+
+    /// From now on a request on `route` without a slot for `id` is a breach.
+    pub(super) fn watch(&self, route: &'static str, hub: &Arc<UnitHub>, id: UnitId) {
+        self.watch
+            .lock()
+            .unwrap()
+            .push((route, Arc::clone(hub), id));
+    }
+
+    pub(super) fn assert_slots_held(&self) {
+        let breaches = self.breaches.lock().unwrap();
+        assert!(breaches.is_empty(), "requests without a slot: {breaches:?}");
+    }
+
+    pub(super) fn requests(&self, route: &str) -> usize {
+        self.seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(r, _)| r == route)
+            .count()
+    }
+
+    /// The routes of the requests in the order they came.
+    pub(super) fn order(&self) -> Vec<String> {
+        self.seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(r, _)| r.to_string())
+            .collect()
+    }
+
+    pub(super) fn messages_of(&self, route: &str, n: usize) -> Vec<Value> {
+        self.seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(r, _)| r == route)
+            .nth(n)
+            .map(|(_, m)| m.clone())
+            .unwrap()
+    }
+}
+
+impl Provider for Script {
+    fn stream_message<'a>(
+        &'a self,
+        _: &'a Model,
+        messages: &'a [Message],
+        _: &'a str,
+        _: &'a Value,
+        _: &'a UnboundedSender<ProviderEvent>,
+        _: RequestOptions,
+        _: Option<&'a SessionRef>,
+    ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+        Box::pin(async move {
+            let values: Vec<Value> = messages
+                .iter()
+                .map(|m| serde_json::to_value(m).unwrap())
+                .collect();
+            // The prompt, not a context update the host put ahead of it. The
+            // tag is a bare string now; older logs nested it.
+            let first = values
+                .iter()
+                .find(|m| match m.get("kind") {
+                    Some(Value::String(tag)) => tag != "context_update",
+                    Some(other) => other.get("context_update").is_none(),
+                    None => true,
+                })
+                .map(Value::to_string)
+                .unwrap_or_default();
+            let step = {
+                let mut routes = self.routes.lock().unwrap();
+                let route = routes
+                    .iter_mut()
+                    .find(|(needle, _)| first.contains(needle))
+                    .unwrap_or_else(|| panic!("no route for {first}"));
+                self.seen.lock().unwrap().push((route.0.to_owned(), values));
+                for (watched, hub, id) in self.watch.lock().unwrap().iter() {
+                    if *watched == route.0 && !hub.table().pool.holds(*id) {
+                        self.breaches.lock().unwrap().push(route.0.to_owned());
+                    }
+                }
+                route.1.pop_front().unwrap_or(Step::Hang)
+            };
+            match step {
+                Step::Reply(r) => Ok(r),
+                Step::Gate(gate, r) => {
+                    let _ = gate.recv_async().await;
+                    Ok(r)
+                }
+                Step::Hang => std::future::pending().await,
+                Step::Fail(message) => Err(AgentError::Config {
+                    message: message.to_owned(),
+                }),
+                Step::Drop => Err(AgentError::Cancelled),
+                Step::Block(release) => {
+                    // A blocking wait, on purpose: the runner is stuck inside
+                    // the provider call, so a cancel cannot reach it. The
+                    // test that uses it runs on a multi-thread runtime, so
+                    // the blocked worker does not starve the rest.
+                    let _ = release.recv();
+                    Ok(reply("late"))
+                }
+            }
+        })
+    }
+
+    fn list_models(&self) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, AgentError>> {
+        Box::pin(async { unimplemented!() })
+    }
+}
+
+pub(super) fn reply(text: &str) -> StreamResponse {
+    response(
+        vec![ContentBlock::Text { text: text.into() }],
+        StopReason::EndTurn,
+        TokenUsage::default(),
+    )
+}
+
+pub(super) fn tool_use(id: &str, name: &str, input: Value) -> StreamResponse {
+    response(
+        vec![ContentBlock::tool_use(id, name, input)],
+        StopReason::ToolUse,
+        TokenUsage::default(),
+    )
+}
+
+pub(super) fn response(
+    content: Vec<ContentBlock>,
+    stop: StopReason,
+    usage: TokenUsage,
+) -> StreamResponse {
+    StreamResponse {
+        message: Message {
+            role: Role::Assistant,
+            content,
+            ..Default::default()
+        },
+        usage,
+        stop_reason: Some(stop),
+        ..Default::default()
+    }
+}
+
+pub(super) struct Rig {
+    pub(super) ctx: ToolContext,
+    pub(super) hub: Arc<UnitHub>,
+    pub(super) events: AsyncMutex<UnboundedReceiver<Envelope>>,
+    pub(super) dir: TempDir,
+    pub(super) clock: Arc<ManualClock>,
+}
+
+pub(super) fn rig(script: &Arc<Script>) -> Rig {
+    rig_with(script, UnitLimits::default())
+}
+
+pub(super) fn rig_with(script: &Arc<Script>, limits: UnitLimits) -> Rig {
+    let mut ctx = stub_ctx(&AgentMode::Build);
+    ctx.provider = script.clone();
+    let registry = crate::tools::ToolRegistry::new();
+    registry
+        .register_many(
+            crate::tools::runs::all()
+                .into_iter()
+                .map(|tool| (tool, crate::tools::ToolSource::Native)),
+        )
+        .unwrap();
+    ctx.registry = Arc::new(registry);
+    let (tx, events) = unbounded_channel::<Envelope>();
+    let dir = TempDir::new().unwrap();
+    let clock = Arc::new(ManualClock::default());
+    let hub = UnitHub::with_shell_options(
+        limits,
+        EventSender::new(tx, 0),
+        clock.clone(),
+        ShellOptions {
+            dir: Some(dir.path().to_owned()),
+            ..ShellOptions::default()
+        },
+    );
+    ctx.runs = Some(RunsCtx {
+        hub: Arc::clone(&hub),
+        self_run: hub.main(),
+    });
+    Rig {
+        ctx,
+        hub,
+        events: AsyncMutex::new(events),
+        dir,
+        clock,
+    }
+}
+
+/// A rig whose runs cannot message each other: the host left `send` out of
+/// its tool set.
+pub(super) fn rig_without_send(script: &Arc<Script>) -> Rig {
+    let mut rig = rig(script);
+    let registry = crate::tools::ToolRegistry::new();
+    registry
+        .register_many(
+            crate::tools::runs::all()
+                .into_iter()
+                .filter(|tool| tool.name() != crate::tools::runs::SEND_TOOL_NAME)
+                .map(|tool| (tool, crate::tools::ToolSource::Native)),
+        )
+        .unwrap();
+    rig.ctx.registry = Arc::new(registry);
+    rig
+}
+
+pub(super) fn agent_req(prompt: &str, extra: Value) -> SpawnRequest {
+    // The rig spawns a continuable child, so a test can drive the idle and
+    // wake paths. A delegated child is one-shot (the product default) and is
+    // spawned with `one_shot: true`.
+    let mut input = json!({
+        "kind": "agent",
+        "description": "work",
+        "prompt": prompt,
+        "one_shot": false
+    });
+    input
+        .as_object_mut()
+        .unwrap()
+        .extend(extra.as_object().unwrap().clone());
+    serde_json::from_value(input).unwrap()
+}
+
+pub(super) async fn spawn_as(rig: &Rig, caller: UnitId, req: SpawnRequest) -> SpawnAck {
+    let spec = match req.clone().into_kind().unwrap() {
+        UnitKind::Agent(spec) => spec,
+        UnitKind::Shell(_) => unreachable!(),
+    };
+    let launch = AgentLaunch::prepare(&rig.ctx, &spec).await.unwrap();
+    rig.hub.spawn_agent(caller, req, launch).unwrap()
+}
+
+pub(super) async fn spawn(rig: &Rig, prompt: &str, extra: Value) -> SpawnAck {
+    spawn_as(rig, rig.hub.main(), agent_req(prompt, extra)).await
+}
+
+/// Settled means `Idle` or `Done`; the manual clock never fires the timeout.
+pub(super) async fn settle(rig: &Rig, id: UnitId) -> UnitView {
+    let views = rig
+        .hub
+        .wait(
+            rig.hub.main(),
+            &[id],
+            WaitMode::All,
+            Duration::from_secs(10_000_000),
+            &CancelToken::none(),
+        )
+        .await;
+    views.into_iter().next().unwrap()
+}
+
+/// Until the scripted provider has been asked `n` times; bounded, no sleeps.
+pub(super) async fn await_requests(script: &Script, route: &str, n: usize) {
+    for _ in 0..50_000_000u64 {
+        if script.requests(route) >= n {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+    panic!("provider never saw {n} requests on {route}");
+}
+
+pub(super) fn done_reason(view: &UnitView) -> DoneReason {
+    match &view.state {
+        UnitState::Done(t) => {
+            assert!(t.reason != DoneReason::Failed, "failed: {:?}", t.detail);
+            t.reason
+        }
+        other => panic!("not done: {}", other.label()),
+    }
+}
+
+pub(super) async fn finished_order(rig: &Rig) -> Vec<String> {
+    let mut events = rig.events.lock().await;
+    drain_events(&mut events)
+        .into_iter()
+        .filter_map(|e| match e.event {
+            AgentEvent::RunFinished { handle, .. } => Some(handle),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn completes_with_result_and_goes_idle() {
+    let script = Script::new(vec![(CHILD, vec![Step::Reply(reply("found it"))])]);
+    let rig = rig(&script);
+    let ack = spawn(&rig, CHILD, json!({})).await;
+    let view = settle(&rig, ack.id).await;
+    assert_eq!(view.state.label(), "idle");
+    let result = view.result.unwrap();
+    assert_eq!(result.summary, "found it");
+    assert_eq!(result.turns, 1);
+}
+
+/// An agent that finished its turn stays available for a follow-up, but it
+/// holds no slot and no room: it must not use up the owner's child budget.
+/// Otherwise a model that started eight sub-agents could not start a
+/// ninth, and every later spawn came back as SPAWN_LIMIT.
+#[tokio::test]
+async fn an_idle_agent_does_not_use_up_the_child_budget() {
+    const SECOND: &str = "SECOND-TASK";
+    let script = Script::new(vec![
+        (CHILD, vec![Step::Reply(reply("found it"))]),
+        (SECOND, vec![Step::Reply(reply("found that"))]),
+    ]);
+    let rig = rig_with(
+        &script,
+        UnitLimits {
+            max_children_per_run: 1,
+            ..UnitLimits::default()
+        },
+    );
+    let first = spawn(&rig, CHILD, json!({})).await;
+    let view = settle(&rig, first.id).await;
+    assert_eq!(view.state.label(), "idle");
+    // The second spawn must be admitted: the first one is finished.
+    let second = spawn(&rig, SECOND, json!({})).await;
+    let view = settle(&rig, second.id).await;
+    assert_eq!(view.state.label(), "idle");
+    assert_eq!(view.result.unwrap().summary, "found that");
+}
+
+/// An idle agent that is woken by a message takes a slot again, and the hub
+/// has to call it running again: a run that is still called idle cannot
+/// settle, so the answer of the new turn was dropped and the run was killed.
+#[tokio::test]
+async fn a_woken_idle_agent_keeps_its_answer() {
+    let script = Script::new(vec![(
+        CHILD,
+        vec![Step::Reply(reply("first")), Step::Reply(reply("second"))],
+    )]);
+    let rig = rig(&script);
+    let ack = spawn(&rig, CHILD, json!({})).await;
+    let view = settle(&rig, ack.id).await;
+    assert_eq!(view.state.label(), "idle");
+    assert_eq!(view.result.unwrap().summary, "first");
+    // A message wakes the run: it works again and answers.
+    say(&rig, rig.hub.main(), ack.id, "more", DeliveryKind::Steer);
+    await_requests(&script, CHILD, 2).await;
+    let view = settle(&rig, ack.id).await;
+    assert_eq!(view.state.label(), "idle");
+    assert_eq!(view.result.unwrap().summary, "second");
+}
+
+/// A delegated child ends after its turn: the parent is woken by the
+/// settlement notice, and the child does not park in `Idle` waiting for a
+/// message that would never come.
+#[tokio::test]
+async fn a_delegated_child_ends_after_its_turn() {
+    let script = Script::new(vec![(CHILD, vec![Step::Reply(reply("done"))])]);
+    let rig = rig(&script);
+    let ack = spawn(&rig, CHILD, json!({"one_shot": true})).await;
+    let view = settle(&rig, ack.id).await;
+    assert_eq!(done_reason(&view), DoneReason::Completed);
+    assert!(
+        rig.hub.claim_main_wake(),
+        "the child's end wakes the parent"
+    );
+}
+
+/// A request the provider dropped is not a decision: the transport lost it
+/// and nothing asked for the run to stop. The turn is tried again, and the
+/// work is not lost to a connection that hiccuped.
+#[tokio::test]
+async fn a_dropped_request_is_tried_again() {
+    let script = Script::new(vec![(CHILD, vec![Step::Drop, Step::Reply(reply("done"))])]);
+    let rig = rig(&script);
+    let ack = spawn(&rig, CHILD, json!({"one_shot": true})).await;
+    await_requests(&script, CHILD, 2).await;
+    let view = settle(&rig, ack.id).await;
+    assert_eq!(done_reason(&view), DoneReason::Completed);
+    // The retry's prompt must not claim the user cancelled anything.
+    let second = Value::Array(script.messages_of(CHILD, 1)).to_string();
+    assert!(
+        second.contains("the request was dropped"),
+        "the dropped request must say so: {second}"
+    );
+    assert!(
+        !second.contains("Cancelled by user"),
+        "nothing stopped the run: {second}"
+    );
+}
+
+/// A request that is dropped every time ends as a failure with a reason,
+/// not as a run "stopped before it finished": the parent has to learn that
+/// nothing stopped it, so it can try again instead of believing the user
+/// did.
+#[tokio::test]
+async fn a_dropped_request_that_never_lands_fails_with_a_reason() {
+    let script = Script::new(vec![(CHILD, vec![Step::Drop, Step::Drop])]);
+    let rig = rig(&script);
+    let ack = spawn(&rig, CHILD, json!({"one_shot": true})).await;
+    await_requests(&script, CHILD, 2).await;
+    let view = settle(&rig, ack.id).await;
+    let UnitState::Done(t) = &view.state else {
+        panic!("not done: {}", view.state.label());
+    };
+    assert_eq!(t.reason, DoneReason::Failed);
+    assert!(
+        t.detail.as_deref().unwrap_or_default().contains("dropped"),
+        "{:?}",
+        t.detail
+    );
+}
+
+/// A child whose host left `send` out is told that its final answer is
+/// the result: a promise to send a message would name a tool it does not have.
+#[tokio::test]
+async fn a_child_without_send_is_told_its_answer_is_the_result() {
+    let script = Script::new(vec![(CHILD, vec![Step::Reply(reply("done"))])]);
+    let rig = rig_without_send(&script);
+    let ack = spawn(&rig, CHILD, json!({})).await;
+    settle(&rig, ack.id).await;
+    let first = Value::Array(script.messages_of(CHILD, 0)).to_string();
+    assert!(
+        first.contains("Your final answer is the result your parent receives"),
+        "{first}"
+    );
+    assert!(!first.contains("send({ to ="), "{first}");
+}
+
+/// A delegated child is told, in its own task, that it is a sub-agent and
+/// where its result goes: the parent shares the workspace but not the
+/// transcript, so the child has to send the result itself.
+#[tokio::test]
+async fn a_delegated_child_is_told_to_report_to_its_parent() {
+    let script = Script::new(vec![(CHILD, vec![Step::Reply(reply("done"))])]);
+    let rig = rig(&script);
+    let ack = spawn(&rig, CHILD, json!({})).await;
+    settle(&rig, ack.id).await;
+    let messages = script.messages_of(CHILD, 0);
+    let first = Value::Array(messages).to_string();
+    assert!(
+        first.contains("You are a sub-agent"),
+        "the child is told what it is: {first}"
+    );
+    assert!(
+        first.contains("send({ to = \\\"parent\\\""),
+        "the child is told how to report: {first}"
+    );
+    assert!(
+        first.contains("Your parent is main"),
+        "the child is told who its parent is: {first}"
+    );
+}
+
+#[tokio::test]
+async fn one_shot_completes() {
+    let script = Script::new(vec![(CHILD, vec![Step::Reply(reply("all done"))])]);
+    let rig = rig(&script);
+    let ack = spawn(&rig, CHILD, json!({"one_shot": true})).await;
+    let view = settle(&rig, ack.id).await;
+    assert_eq!(done_reason(&view), DoneReason::Completed);
+    match view.state {
+        UnitState::Done(t) => assert_eq!(t.result.summary, "all done"),
+        _ => unreachable!(),
+    }
+}
+
+#[tokio::test]
+async fn survives_parent_turn_end() {
+    let (release, gate) = flume::bounded::<()>(1);
+    let script = Script::new(vec![(CHILD, vec![Step::Gate(gate, reply("still here"))])]);
+    let rig = rig(&script);
+    let ack = spawn(&rig, CHILD, json!({})).await;
+    // What the frontend does when the parent's turn ends.
+    rig.ctx.subagent_cancels.cancel_all();
+    assert_eq!(rig.hub.get(ack.id).unwrap().state.label(), "running");
+    release.send(()).unwrap();
+    let view = settle(&rig, ack.id).await;
+    assert_eq!(view.state.label(), "idle");
+    assert_eq!(view.result.unwrap().summary, "still here");
+}
+
+#[tokio::test]
+async fn cost_rolls_up_once() {
+    let usage = TokenUsage {
+        input: 1000,
+        output: 100,
+        ..Default::default()
+    };
+    let script = Script::new(vec![(
+        CHILD,
+        vec![Step::Reply(response(
+            vec![ContentBlock::Text { text: "ok".into() }],
+            StopReason::EndTurn,
+            usage,
+        ))],
+    )]);
+    let rig = rig(&script);
+    let ack = spawn(&rig, CHILD, json!({})).await;
+    let result = settle(&rig, ack.id).await.result.unwrap();
+    assert_eq!(result.usage.input, 1000);
+    let parent = rig.ctx.ledger.totals();
+    assert_eq!(parent.usage.input, 1000, "the chain adds a child once");
+    assert_eq!(parent.cost, Some(result.cost));
+}
+
+#[tokio::test]
+async fn structured_output_lands_in_result() {
+    let script = Script::new(vec![(
+        CHILD,
+        vec![
+            Step::Reply(tool_use("t1", "structured_output", json!({"answer": 42}))),
+            Step::Reply(reply("done")),
+        ],
+    )]);
+    let rig = rig(&script);
+    let schema = json!({"type": "object", "properties": {"answer": {"type": "integer"}}, "required": ["answer"]});
+    let ack = spawn(&rig, CHILD, json!({"output_schema": schema})).await;
+    let result = settle(&rig, ack.id).await.result.unwrap();
+    assert_eq!(result.structured, Some(json!({"answer": 42})));
+}
+
+#[tokio::test]
+async fn long_result_spills_to_disk() {
+    let long = "x".repeat(RESULT_LIMIT * 3);
+    let script = Script::new(vec![(CHILD, vec![Step::Reply(reply(&long))])]);
+    let rig = rig(&script);
+    let ack = spawn(&rig, CHILD, json!({})).await;
+    let result = settle(&rig, ack.id).await.result.unwrap();
+    assert!(result.truncated);
+    assert!(result.summary.len() < long.len());
+    let body = result.body_ref.expect("spilled");
+    assert!(body.0.starts_with(rig.dir.path()));
+    assert_eq!(std::fs::read_to_string(&body.0).unwrap(), long);
+}
+
+#[tokio::test]
+async fn wait_returns_on_idle() {
+    let (release, gate) = flume::bounded::<()>(1);
+    let script = Script::new(vec![(CHILD, vec![Step::Gate(gate, reply("hi"))])]);
+    let rig = rig(&script);
+    let ack = spawn(&rig, CHILD, json!({})).await;
+    release.send_async(()).await.unwrap();
+    let waited = rig
+        .hub
+        .wait(
+            rig.hub.main(),
+            &[ack.id],
+            WaitMode::Any,
+            Duration::from_secs(10_000_000),
+            &CancelToken::none(),
+        )
+        .await;
+    assert_eq!(waited[0].state.label(), "idle");
+}
+
+#[tokio::test]
+async fn stop_settles_killed_and_history_sanitized() {
+    let script = Script::new(vec![(CHILD, vec![Step::Hang])]);
+    let rig = rig(&script);
+    let ack = spawn(&rig, CHILD, json!({})).await;
+    await_requests(&script, CHILD, 1).await;
+    let outcomes = rig.hub.stop(rig.hub.main(), &[ack.id], StopOpts::default());
+    assert_eq!(outcomes[0].status, Ok(StopStatus::Requested));
+    let view = settle(&rig, ack.id).await;
+    assert_eq!(done_reason(&view), DoneReason::Killed);
+    let mut events = rig.events.lock().await;
+    let history: Vec<Message> = drain_events(&mut events)
+        .into_iter()
+        .find_map(|e| match e.event {
+            AgentEvent::SubagentHistory { messages, .. } => Some(messages),
+            _ => None,
+        })
+        .expect("the transcript is sent before the state change");
+    let calls = history
+        .iter()
+        .flat_map(|m| &m.content)
+        .filter(|b| matches!(b, ContentBlock::ToolUse { .. }))
+        .count();
+    let results = history
+        .iter()
+        .flat_map(|m| &m.content)
+        .filter(|b| matches!(b, ContentBlock::ToolResult { .. }))
+        .count();
+    assert_eq!(calls, results, "no dangling tool call");
+    assert_eq!(script.requests(CHILD), 1);
+}
+
+#[tokio::test]
+async fn stop_cascades_children_first() {
+    let spawn_child = tool_use(
+        "t1",
+        "spawn",
+        json!({"kind": "agent", "description": "kid", "prompt": CHILD}),
+    );
+    let script = Script::new(vec![
+        (PARENT, vec![Step::Reply(spawn_child), Step::Hang]),
+        (CHILD, vec![Step::Hang]),
+    ]);
+    let rig = rig(&script);
+    let parent = spawn(&rig, PARENT, json!({})).await;
+    // The parent's second request means its spawn call has returned.
+    await_requests(&script, PARENT, 2).await;
+    let kids = rig.hub.list(parent.id, Scope::Children);
+    assert_eq!(kids.len(), 1);
+    let kid = kids[0].id;
+    let outcomes = rig
+        .hub
+        .stop(rig.hub.main(), &[parent.id], StopOpts::default());
+    assert_eq!(outcomes[0].status, Ok(StopStatus::Requested));
+    let view = settle(&rig, parent.id).await;
+    assert_eq!(done_reason(&view), DoneReason::Killed);
+    assert_eq!(done_reason(&rig.hub.get(kid).unwrap()), DoneReason::Killed);
+    let order = finished_order(&rig).await;
+    let handles = (
+        rig.hub.get(kid).unwrap().handle.to_string(),
+        view.handle.to_string(),
+    );
+    assert_eq!(order, [handles.0, handles.1], "child settles before parent");
+}
+
+/// A stop that detaches leaves the children running: the user stopped the run
+/// in front of them, not the work below it. The child moves up to the run
+/// that stopped its parent, so it has an owner left.
+#[tokio::test]
+async fn a_detached_stop_leaves_the_children_running() {
+    let spawn_child = tool_use(
+        "t1",
+        "spawn",
+        json!({"kind": "agent", "description": "kid", "prompt": CHILD}),
+    );
+    let script = Script::new(vec![
+        (PARENT, vec![Step::Reply(spawn_child), Step::Hang]),
+        (CHILD, vec![Step::Hang]),
+    ]);
+    let rig = rig(&script);
+    let parent = spawn(&rig, PARENT, json!({})).await;
+    await_requests(&script, PARENT, 2).await;
+    let kids = rig.hub.list(parent.id, Scope::Children);
+    assert_eq!(kids.len(), 1);
+    let kid = kids[0].id;
+
+    let outcomes = rig.hub.stop(
+        rig.hub.main(),
+        &[parent.id],
+        StopOpts {
+            detach: true,
+            ..Default::default()
+        },
+    );
+    assert_eq!(outcomes[0].status, Ok(StopStatus::Requested));
+    let view = settle(&rig, parent.id).await;
+    assert_eq!(done_reason(&view), DoneReason::Killed);
+
+    let kid_view = rig.hub.get(kid).unwrap();
+    assert!(
+        !kid_view.state.is_done(),
+        "the child must go on working: {:?}",
+        kid_view.state
+    );
+    assert_eq!(
+        kid_view.parent,
+        rig.hub.main(),
+        "the child moves up to the run that stopped its parent"
+    );
+}
+
+#[tokio::test]
+async fn stopped_agent_makes_no_more_requests() {
+    let script = Script::new(vec![(CHILD, vec![Step::Reply(reply("one")), Step::Hang])]);
+    let rig = rig(&script);
+    let ack = spawn(&rig, CHILD, json!({})).await;
+    settle(&rig, ack.id).await;
+    rig.hub.stop(rig.hub.main(), &[ack.id], StopOpts::default());
+    let view = settle(&rig, ack.id).await;
+    assert_eq!(done_reason(&view), DoneReason::Killed);
+    assert_eq!(script.requests(CHILD), 1);
+}
+
+#[tokio::test]
+async fn fork_excludes_inflight_turn() {
+    let script = Script::new(vec![(
+        "EARLIER-QUESTION",
+        vec![Step::Reply(reply("forked"))],
+    )]);
+    let rig = rig(&script);
+    let earlier = vec![
+        Message::user("EARLIER-QUESTION".into()),
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Text {
+                text: "EARLIER-ANSWER".into(),
+            }],
+            ..Default::default()
+        },
+    ];
+    rig.hub
+        .publish_fork_snapshot(&["toolu_spawn".to_owned()], earlier);
+    let mut req = agent_req("FORK-TASK", json!({"context": "fork"}));
+    req.origin_tool_use_id = Some(Arc::from("toolu_spawn"));
+    let ack = spawn_as(&rig, rig.hub.main(), req).await;
+    settle(&rig, ack.id).await;
+    let sent = script.messages_of("EARLIER-QUESTION", 0);
+    let text = serde_json::to_string(&sent).unwrap();
+    // The fork prefix, the topology the child is told, then its task.
+    assert_eq!(sent.len(), 4, "{text}");
+    assert!(text.contains("EARLIER-ANSWER") && text.contains("FORK-TASK"));
+    assert!(
+        !text.contains("toolu_spawn"),
+        "the in-flight call is not copied"
+    );
+}
+
+#[tokio::test]
+async fn fork_without_a_snapshot_is_rejected() {
+    let script = Script::new(vec![(CHILD, vec![])]);
+    let rig = rig(&script);
+    let req = agent_req(CHILD, json!({"context": "fork"}));
+    let spec = match req.clone().into_kind().unwrap() {
+        UnitKind::Agent(spec) => spec,
+        UnitKind::Shell(_) => unreachable!(),
+    };
+    let launch = AgentLaunch::prepare(&rig.ctx, &spec).await.unwrap();
+    let err = rig
+        .hub
+        .spawn_agent(rig.hub.main(), req, launch)
+        .unwrap_err();
+    assert!(err.to_string().starts_with("BAD_FIELD"), "{err}");
+}
+
+#[tokio::test]
+async fn wait_and_stop_are_caller_scoped() {
+    let script = Script::new(vec![(CHILD, vec![Step::Hang])]);
+    let rig = rig(&script);
+    let a = spawn(&rig, CHILD, json!({})).await;
+    let b = spawn(&rig, CHILD, json!({"description": "other"})).await;
+    let waited = rig
+        .hub
+        .wait(
+            a.id,
+            &[b.id],
+            WaitMode::All,
+            Duration::from_secs(10_000_000),
+            &CancelToken::none(),
+        )
+        .await;
+    assert!(waited.is_empty(), "a sibling is out of scope");
+    assert!(!rig.hub.can_reach(a.id, b.id));
+    let outcomes = rig.hub.stop(a.id, &[b.id], StopOpts::default());
+    assert_eq!(outcomes[0].status, Err(UnitError::NotReachable));
+    assert_eq!(rig.hub.get(b.id).unwrap().state.label(), "running");
+    rig.hub
+        .stop(rig.hub.main(), &[a.id, b.id], StopOpts::default());
+}
+
+fn say(rig: &Rig, from: UnitId, to: UnitId, text: &str, kind: DeliveryKind) -> SendAck {
+    rig.hub.send(from, to, text.to_owned(), kind).unwrap()
+}
+
+/// Every request the route saw, as flat strings.
+fn seen_text(script: &Script, route: &str) -> Vec<String> {
+    script
+        .seen
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(r, _)| r == route)
+        .map(|(_, m)| Value::Array(m.clone()).to_string())
+        .collect()
+}
+
+mod inbox {
+    use super::*;
+
+    #[tokio::test]
+    async fn steer_extends_open_turn() {
+        let (release, gate) = flume::bounded::<()>(1);
+        let script = Script::new(vec![(
+            CHILD,
+            vec![
+                Step::Gate(gate, reply("first")),
+                Step::Reply(reply("second")),
+            ],
+        )]);
+        let rig = rig(&script);
+        let ack = spawn(&rig, CHILD, json!({})).await;
+        await_requests(&script, CHILD, 1).await;
+        let sent = say(
+            &rig,
+            rig.hub.main(),
+            ack.id,
+            "the secret code is X",
+            DeliveryKind::Steer,
+        );
+        assert_eq!(sent.state, "running");
+        release.send(()).unwrap();
+        let view = settle(&rig, ack.id).await;
+        assert_eq!(view.result.unwrap().summary, "second");
+        let second = &seen_text(&script, CHILD)[1];
+        assert!(
+            second.contains("<run-message from=\\\"main\\\""),
+            "{second}"
+        );
+        assert!(second.contains("the secret code is X"));
+        assert!(second.contains("delivered_step"));
+    }
+
+    #[tokio::test]
+    async fn steer_never_between_tool_use_and_result() {
+        let (release, gate) = flume::bounded::<()>(1);
+        let script = Script::new(vec![(
+            CHILD,
+            vec![
+                Step::Gate(gate, tool_use("t1", "runs", json!({}))),
+                Step::Reply(reply("done")),
+            ],
+        )]);
+        let rig = rig(&script);
+        let ack = spawn(&rig, CHILD, json!({})).await;
+        await_requests(&script, CHILD, 1).await;
+        say(
+            &rig,
+            rig.hub.main(),
+            ack.id,
+            "late note",
+            DeliveryKind::Steer,
+        );
+        release.send(()).unwrap();
+        settle(&rig, ack.id).await;
+        eprintln!("MARK settled");
+        let messages = script.messages_of(CHILD, 1);
+        let at = messages
+            .iter()
+            .position(|m| m.to_string().contains("\"tool_use\""))
+            .expect("the tool call is in the request");
+        assert!(
+            messages[at + 1].to_string().contains("tool_result"),
+            "the result follows its call directly"
+        );
+        assert!(
+            messages.last().unwrap().to_string().contains("late note"),
+            "the note lands after the result"
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_agent_woken_by_steer() {
+        let script = Script::new(vec![(
+            CHILD,
+            vec![Step::Reply(reply("first")), Step::Reply(reply("second"))],
+        )]);
+        let rig = rig(&script);
+        let ack = spawn(&rig, CHILD, json!({})).await;
+        assert_eq!(settle(&rig, ack.id).await.state.label(), "idle");
+        let sent = say(
+            &rig,
+            rig.hub.main(),
+            ack.id,
+            "again please",
+            DeliveryKind::Steer,
+        );
+        assert_eq!(sent.state, "idle");
+        // The woken turn may already be over here, so the state is not asserted.
+        let view = settle(&rig, ack.id).await;
+        assert_eq!(view.result.unwrap().summary, "second");
+        assert!(seen_text(&script, CHILD)[1].contains("again please"));
+    }
+
+    #[tokio::test]
+    async fn idle_agent_woken_by_followup() {
+        let script = Script::new(vec![(
+            CHILD,
+            vec![Step::Reply(reply("first")), Step::Reply(reply("second"))],
+        )]);
+        let rig = rig(&script);
+        let ack = spawn(&rig, CHILD, json!({})).await;
+        settle(&rig, ack.id).await;
+        say(
+            &rig,
+            rig.hub.main(),
+            ack.id,
+            "next job",
+            DeliveryKind::Followup,
+        );
+        assert_eq!(settle(&rig, ack.id).await.result.unwrap().summary, "second");
+    }
+
+    #[tokio::test]
+    async fn quiet_drains_at_next_model_request() {
+        let (release, gate) = flume::bounded::<()>(1);
+        let script = Script::new(vec![(
+            CHILD,
+            vec![
+                Step::Gate(gate, tool_use("t1", "runs", json!({}))),
+                Step::Reply(reply("done")),
+            ],
+        )]);
+        let rig = rig(&script);
+        let ack = spawn(&rig, CHILD, json!({})).await;
+        await_requests(&script, CHILD, 1).await;
+        say(&rig, rig.hub.main(), ack.id, "fyi", DeliveryKind::Quiet);
+        assert!(!seen_text(&script, CHILD)[0].contains("fyi"));
+        release.send(()).unwrap();
+        settle(&rig, ack.id).await;
+        assert!(seen_text(&script, CHILD)[1].contains("fyi"));
+
+        // An idle agent is not woken by a quiet note.
+        say(&rig, rig.hub.main(), ack.id, "later", DeliveryKind::Quiet);
+        let state = rig.hub.get(ack.id).unwrap().state.label();
+        assert_eq!(state, "idle");
+        assert_eq!(rig.hub.inbox_of(ack.id).unwrap().len(), 1);
+        assert_eq!(script.requests(CHILD), 2);
+    }
+
+    /// Whatever the interleaving of sends and the settle, every message
+    /// reaches the model and the agent ends up idle with an empty inbox.
+    #[tokio::test]
+    async fn message_arriving_during_settle_not_lost() {
+        let script = Script::new(vec![(
+            CHILD,
+            (0..16)
+                .map(|n| Step::Reply(reply(&format!("r{n}"))))
+                .collect(),
+        )]);
+        let rig = rig(&script);
+        let ack = spawn(&rig, CHILD, json!({})).await;
+        let hub = Arc::clone(&rig.hub);
+        let id = ack.id;
+        let sender = std::thread::spawn(move || {
+            for n in 0..6 {
+                hub.send(hub.main(), id, format!("note-{n}"), DeliveryKind::Steer)
+                    .unwrap();
+                std::thread::yield_now();
+            }
+        });
+        sender.join().unwrap();
+        let inbox = rig.hub.inbox_of(id).unwrap();
+        let mut idle = false;
+        for _ in 0..50_000_000u64 {
+            let seen = seen_text(&script, CHILD).join("");
+            let all = (0..6).all(|n| seen.contains(&format!("note-{n}")));
+            idle = rig.hub.get(id).unwrap().state.label() == "idle";
+            if all && idle && inbox.is_empty() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!(
+            "lost a message: idle={idle} state={} requests={} pending={} seen={:?}",
+            rig.hub.get(id).unwrap().state.label(),
+            script.requests(CHILD),
+            inbox.len(),
+            seen_text(&script, CHILD)
+                .iter()
+                .map(|s| s.len())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn child_to_parent_main_lands_in_main_inbox() {
+        let script = Script::new(vec![(CHILD, vec![Step::Reply(reply("ok"))])]);
+        let rig = rig(&script);
+        let ack = spawn(&rig, CHILD, json!({})).await;
+        settle(&rig, ack.id).await;
+        let to = rig.hub.resolve(ack.id, "parent").unwrap();
+        assert_eq!(to, rig.hub.main());
+        say(&rig, ack.id, to, "may I?", DeliveryKind::Steer);
+        let items: Vec<_> = rig
+            .hub
+            .inbox_of(to)
+            .unwrap()
+            .drain_step()
+            .into_iter()
+            .filter(|i| i.notice.is_none())
+            .collect();
+        assert_eq!(items.len(), 1);
+        let text = crate::runs::inbox::frame(&items, None);
+        assert!(text.starts_with("<run-message from=\"work\""), "{text}");
+    }
+
+    /// A child that reports to its parent must wake it: `main` has no turn of
+    /// its own to drain the inbox, so without the event the report waits for
+    /// the next turn that something else starts.
+    #[tokio::test]
+    async fn a_child_that_reports_wakes_its_parent() {
+        let script = Script::new(vec![(CHILD, vec![Step::Reply(reply("ok"))])]);
+        let rig = rig(&script);
+        let ack = spawn(&rig, CHILD, json!({})).await;
+        settle(&rig, ack.id).await;
+        // The settlement notice already woke the parent; that must not be
+        // what this test sees.
+        let mut events = rig.events.lock().await;
+        for _ in drain_events(&mut events) {}
+        drop(events);
+        let to = rig.hub.resolve(ack.id, "parent").unwrap();
+        say(&rig, ack.id, to, "the answer is 42", DeliveryKind::Steer);
+        let mut events = rig.events.lock().await;
+        let woke = drain_events(&mut events)
+            .into_iter()
+            .any(|e| matches!(e.event, crate::AgentEvent::RunNotice { wake: true }));
+        assert!(woke, "the parent's turn is started by the report");
+    }
+}
+
+mod hub {
+    use super::*;
+
+    pub(super) async fn pair(script: &Arc<Script>) -> (Rig, UnitId, UnitId) {
+        let rig = rig(script);
+        let a = spawn(&rig, "PARENT-A", json!({})).await;
+        let b = spawn_as(&rig, a.id, agent_req("CHILD-B", json!({"name": "kid"}))).await;
+        (rig, a.id, b.id)
+    }
+
+    #[tokio::test]
+    async fn pingpong_guard_holds_and_notifies_parent() {
+        let script = Script::new(vec![("PARENT-A", vec![]), ("CHILD-B", vec![])]);
+        let (rig, a, b) = pair(&script).await;
+        for n in 0..crate::runs::inbox::PAIR_BURST {
+            let sent = say(&rig, b, a, &format!("q{n}"), DeliveryKind::Quiet);
+            assert!(!sent.held);
+        }
+        let held = say(&rig, a, b, "held one", DeliveryKind::Quiet);
+        assert!(held.held);
+        assert_eq!(rig.hub.inbox_of(b).unwrap().len(), 0);
+        let notices = rig.hub.pending_notices(rig.hub.main());
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(notices[0].text.contains("exchanged 6 messages"));
+        // Held again: one notice per burst, not per message.
+        say(&rig, a, b, "held two", DeliveryKind::Quiet);
+        assert_eq!(rig.hub.pending_notices(rig.hub.main()).len(), 1);
+        // Other work by either side releases them.
+        rig.hub.note_work(b);
+        assert_eq!(rig.hub.inbox_of(b).unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn pingpong_held_messages_are_bounded() {
+        let script = Script::new(vec![("PARENT-A", vec![]), ("CHILD-B", vec![])]);
+        let (rig, a, b) = pair(&script).await;
+        for n in 0..crate::runs::inbox::PAIR_BURST {
+            say(&rig, b, a, &format!("q{n}"), DeliveryKind::Quiet);
+        }
+        for _ in 0..4 {
+            assert!(say(&rig, a, b, "h", DeliveryKind::Quiet).held);
+        }
+        let err = rig
+            .hub
+            .send(a, b, "h".into(), DeliveryKind::Quiet)
+            .unwrap_err();
+        assert!(matches!(err, UnitError::RateLimited { .. }), "{err}");
+    }
+
+    #[tokio::test]
+    async fn send_to_sibling_rejected_by_default() {
+        let script = Script::new(vec![("PARENT-A", vec![]), ("CHILD-B", vec![])]);
+        let rig = rig(&script);
+        let a = spawn(&rig, "PARENT-A", json!({})).await;
+        let b = spawn(&rig, "CHILD-B", json!({})).await;
+        let err = rig
+            .hub
+            .send(a.id, b.id, "hi".into(), DeliveryKind::Steer)
+            .unwrap_err();
+        assert_eq!(err, UnitError::NotReachable);
+    }
+
+    async fn siblings(on: bool) -> (Rig, UnitId, UnitId) {
+        // Hung in their first request: a running child would drain its inbox
+        // under the test.
+        let script = Script::new(vec![
+            ("SIB-A", vec![Step::Hang]),
+            ("SIB-B", vec![Step::Hang]),
+        ]);
+        let rig = rig_with(
+            &script,
+            UnitLimits {
+                siblings: on,
+                ..UnitLimits::default()
+            },
+        );
+        let a = spawn(&rig, "SIB-A", json!({"name": "alpha"})).await;
+        let b = spawn(&rig, "SIB-B", json!({"name": "beta"})).await;
+        await_requests(&script, "SIB-A", 1).await;
+        await_requests(&script, "SIB-B", 1).await;
+        (rig, a.id, b.id)
+    }
+
+    #[tokio::test]
+    async fn sibling_send_only_with_config() {
+        let (rig, a, b) = siblings(false).await;
+        let err = rig.hub.send(a, b, "hi".into(), DeliveryKind::Steer);
+        assert_eq!(err.unwrap_err(), UnitError::NotReachable);
+        let (rig, a, b) = siblings(true).await;
+        assert!(!say(&rig, a, b, "hi", DeliveryKind::Steer).held);
+        let items = rig.hub.inbox_of(b).unwrap().take_start();
+        assert_eq!(items[0].from, a);
+        assert_eq!(items[0].from_label, "alpha");
+        // Unrelated runs (a cousin under another parent) stay out of reach.
+        let cousin = spawn_as(&rig, a, agent_req("SIB-B", json!({"name": "cousin"}))).await;
+        let err = rig.hub.send(b, cousin.id, "x".into(), DeliveryKind::Steer);
+        assert_eq!(err.unwrap_err(), UnitError::NotReachable);
+    }
+
+    #[tokio::test]
+    async fn pingpong_guard_mandatory_with_siblings() {
+        let (rig, a, b) = siblings(true).await;
+        for n in 0..crate::runs::inbox::PAIR_BURST {
+            let from_to = if n % 2 == 0 { (a, b) } else { (b, a) };
+            assert!(!say(&rig, from_to.0, from_to.1, "x", DeliveryKind::Quiet).held);
+        }
+        // The children run and drain their inboxes, so the length of an inbox
+        // proves nothing; the ack record says where the message is.
+        let held_state = |rig: &Rig| rig.hub.acks_to(a, b).last().unwrap().state;
+        assert!(say(&rig, a, b, "again", DeliveryKind::Quiet).held);
+        assert_eq!(held_state(&rig), crate::runs::AckState::Held);
+        // Held messages release when either side works, and main hears once.
+        assert_eq!(rig.hub.pending_notices(rig.hub.main()).len(), 1);
+        rig.hub.note_work(b);
+        assert_ne!(held_state(&rig), crate::runs::AckState::Held);
+    }
+
+    #[tokio::test]
+    async fn send_errors_are_the_documented_codes() {
+        let script = Script::new(vec![(CHILD, vec![])]);
+        let rig = rig(&script);
+        let a = spawn(&rig, CHILD, json!({})).await;
+        let main = rig.hub.main();
+        let send = |to, text: String| rig.hub.send(main, to, text, DeliveryKind::Steer);
+        assert_eq!(send(main, "x".into()).unwrap_err(), UnitError::SelfSend);
+        let big = "x".repeat(crate::runs::inbox::MAX_MESSAGE_BYTES + 1);
+        assert_eq!(
+            send(a.id, big).unwrap_err().to_string(),
+            "TOO_LARGE max=16384"
+        );
+        assert_eq!(
+            send(UnitId::new(), "x".into()).unwrap_err(),
+            UnitError::UnknownRun
+        );
+        // The flood: 6 per pair, then the bucket says wait.
+        for _ in 0..crate::runs::inbox::PAIR_BURST {
+            send(a.id, "x".into()).unwrap();
+        }
+        assert_eq!(
+            send(a.id, "x".into()).unwrap_err().to_string(),
+            "RATE_LIMITED retry_after=2s"
+        );
+        rig.hub.stop(main, &[a.id], StopOpts::default());
+        assert_eq!(
+            send(a.id, "x".into()).unwrap_err(),
+            UnitError::RecipientTerminal
+        );
+    }
+}
+
+/// The driver's turn end -> settle -> Idle -> wake sequence, entered at every
+/// point by parking the driver (see `Driver::pause`); no sleeps.
+mod race {
+    use super::*;
+
+    type Held = (flume::Receiver<()>, flume::Sender<()>);
+
+    fn park(rig: &Rig, id: UnitId, at: &'static str) -> Held {
+        let (reached_tx, reached_rx) = flume::unbounded();
+        let (go_tx, go_rx) = flume::unbounded();
+        rig.hub
+            .table()
+            .agents
+            .get(&id)
+            .unwrap()
+            .pauses
+            .lock()
+            .unwrap()
+            .insert(at, (reached_tx, go_rx));
+        (reached_rx, go_tx)
+    }
+
+    async fn reached(held: &Held) {
+        held.0
+            .recv_async()
+            .await
+            .expect("the driver never reached the pause point");
+    }
+
+    async fn quiesce(rig: &Rig, script: &Script, id: UnitId, requests: usize) {
+        for _ in 0..50_000_000u64 {
+            let view = rig.hub.get(id).unwrap();
+            if script.requests(CHILD) >= requests
+                && view.state.label() == "idle"
+                && rig.hub.inbox_of(id).unwrap().is_empty()
+            {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("never quiesced: requests={}", script.requests(CHILD));
+    }
+
+    fn count(script: &Script, n: usize, needle: &str) -> usize {
+        script
+            .messages_of(CHILD, n)
+            .iter()
+            .map(Value::to_string)
+            .collect::<String>()
+            .matches(needle)
+            .count()
+    }
+
+    #[tokio::test]
+    async fn message_at_every_point_of_settle_is_delivered_once() {
+        for (point, expect_state) in [("before_settle", "running"), ("after_idle", "idle")] {
+            let (release, gate) = flume::bounded::<()>(1);
+            let script = Script::new(vec![(
+                CHILD,
+                vec![Step::Gate(gate, reply("r1")), Step::Reply(reply("r2"))],
+            )]);
+            let rig = rig(&script);
+            let ack = spawn(&rig, CHILD, json!({})).await;
+            await_requests(&script, CHILD, 1).await;
+            let held = park(&rig, ack.id, point);
+            release.send(()).unwrap();
+            reached(&held).await;
+            let marker = format!("ZZ-{point}");
+            let sent = say(&rig, rig.hub.main(), ack.id, &marker, DeliveryKind::Steer);
+            assert_eq!(sent.state, expect_state, "{point}");
+            held.1.send(()).unwrap();
+            quiesce(&rig, &script, ack.id, 2).await;
+            assert_eq!(script.requests(CHILD), 2, "{point}: no extra turn");
+            assert_eq!(count(&script, 0, &marker), 0);
+            assert_eq!(count(&script, 1, &marker), 1, "{point}: exactly once");
+            assert_eq!(rig.hub.get(ack.id).unwrap().state.label(), "idle");
+        }
+    }
+
+    #[tokio::test]
+    async fn two_messages_across_the_wake_coalesce_into_one_turn() {
+        let script = Script::new(vec![(
+            CHILD,
+            vec![Step::Reply(reply("r1")), Step::Reply(reply("r2"))],
+        )]);
+        let rig = rig(&script);
+        let ack = spawn(&rig, CHILD, json!({})).await;
+        settle(&rig, ack.id).await;
+        let held = park(&rig, ack.id, "woken");
+        let first = say(&rig, rig.hub.main(), ack.id, "ZZ-one", DeliveryKind::Steer);
+        assert_eq!(first.state, "idle");
+        reached(&held).await;
+        let second = say(
+            &rig,
+            rig.hub.main(),
+            ack.id,
+            "ZZ-two",
+            DeliveryKind::Followup,
+        );
+        assert_eq!(second.state, "running", "already woken: no second wake");
+        held.1.send(()).unwrap();
+        quiesce(&rig, &script, ack.id, 2).await;
+        assert_eq!(script.requests(CHILD), 2);
+        assert_eq!(count(&script, 1, "ZZ-one"), 1);
+        assert_eq!(count(&script, 1, "ZZ-two"), 1);
+    }
+
+    #[tokio::test]
+    async fn quiet_at_settle_never_wakes_and_waits_for_the_next_turn() {
+        let (release, gate) = flume::bounded::<()>(1);
+        let script = Script::new(vec![(
+            CHILD,
+            vec![Step::Gate(gate, reply("r1")), Step::Reply(reply("r2"))],
+        )]);
+        let rig = rig(&script);
+        let ack = spawn(&rig, CHILD, json!({})).await;
+        await_requests(&script, CHILD, 1).await;
+        let held = park(&rig, ack.id, "before_settle");
+        release.send(()).unwrap();
+        reached(&held).await;
+        say(
+            &rig,
+            rig.hub.main(),
+            ack.id,
+            "ZZ-quiet",
+            DeliveryKind::Quiet,
+        );
+        held.1.send(()).unwrap();
+        settle(&rig, ack.id).await;
+        assert_eq!(rig.hub.inbox_of(ack.id).unwrap().len(), 1);
+        assert_eq!(script.requests(CHILD), 1);
+        say(&rig, rig.hub.main(), ack.id, "ZZ-wake", DeliveryKind::Steer);
+        quiesce(&rig, &script, ack.id, 2).await;
+        assert_eq!(count(&script, 1, "ZZ-quiet"), 1);
+        assert_eq!(count(&script, 1, "ZZ-wake"), 1);
+    }
+
+    #[tokio::test]
+    async fn stopping_and_done_refuse_and_lose_nothing_silently() {
+        let (release, gate) = flume::bounded::<()>(1);
+        let script = Script::new(vec![(CHILD, vec![Step::Gate(gate, reply("r1"))])]);
+        let rig = rig(&script);
+        let ack = spawn(&rig, CHILD, json!({})).await;
+        await_requests(&script, CHILD, 1).await;
+        let held = park(&rig, ack.id, "before_settle");
+        release.send(()).unwrap();
+        reached(&held).await;
+        let main = rig.hub.main();
+        rig.hub.stop(main, &[ack.id], StopOpts::default());
+        let err = rig
+            .hub
+            .send(main, ack.id, "late".into(), DeliveryKind::Steer)
+            .unwrap_err();
+        assert_eq!(err, UnitError::RecipientTerminal);
+        held.1.send(()).unwrap();
+        settle(&rig, ack.id).await;
+        let err = rig
+            .hub
+            .send(main, ack.id, "later".into(), DeliveryKind::Steer)
+            .unwrap_err();
+        assert_eq!(err, UnitError::RecipientTerminal);
+        assert!(rig.hub.inbox_of(ack.id).unwrap().is_empty());
+        assert_eq!(script.requests(CHILD), 1);
+    }
+}
+
+mod topology {
+    use super::*;
+
+    fn flat(script: &Script, route: &str, n: usize) -> String {
+        Value::Array(script.messages_of(route, n)).to_string()
+    }
+
+    #[tokio::test]
+    async fn child_hears_its_place_and_main_hears_its_children() {
+        let script = Script::new(vec![
+            ("KID-ONE", vec![Step::Reply(reply("one"))]),
+            ("KID-TWO", vec![Step::Reply(reply("two"))]),
+            (PARENT, vec![]),
+        ]);
+        let rig = rig(&script);
+        let main = rig.hub.main();
+        assert_eq!(
+            rig.hub.topology_facts(main),
+            None,
+            "no runs, nothing to tell"
+        );
+        let one = spawn(&rig, "KID-ONE", json!({"name": "first"})).await;
+        let two = spawn(&rig, "KID-TWO", json!({"name": "second"})).await;
+        settle(&rig, one.id).await;
+        settle(&rig, two.id).await;
+
+        let text = flat(&script, "KID-ONE", 0);
+        assert!(text.contains("You are agent \\\"first\\\""), "{text}");
+        assert!(text.contains("Your parent is \\\"main\\\""), "{text}");
+        assert!(text.contains("You have no children."), "{text}");
+        assert!(
+            !text.contains("second"),
+            "siblings are not in the fact: {text}"
+        );
+
+        let facts = rig.hub.topology_facts(main).unwrap();
+        let names: Vec<_> = facts.children.iter().map(|c| c.1.as_str()).collect();
+        assert_eq!(names, ["first", "second"]);
+    }
+
+    #[tokio::test]
+    async fn no_siblings_in_fact() {
+        let script = Script::new(vec![
+            ("KID-A", vec![]),
+            ("KID-B", vec![]),
+            ("KID-C", vec![]),
+        ]);
+        let rig = rig(&script);
+        let a = spawn(&rig, "KID-A", json!({"name": "aa"})).await;
+        let b = spawn(&rig, "KID-B", json!({"name": "bb"})).await;
+        let c = spawn_as(&rig, a.id, agent_req("KID-C", json!({"name": "cc"}))).await;
+        let facts = rig.hub.topology_facts(a.id).unwrap();
+        assert_eq!(facts.parent.as_ref().unwrap().1, "main");
+        assert_eq!(facts.children.len(), 1);
+        assert_eq!(facts.children[0].1, "cc");
+        let facts = rig.hub.topology_facts(b.id).unwrap();
+        assert!(facts.children.is_empty());
+        assert_eq!(facts.me.2, 1);
+        assert_eq!(rig.hub.topology_facts(c.id).unwrap().me.2, 2);
+        let json = serde_json::to_string(&facts).unwrap();
+        // Quoted: a random handle such as `ag-cy0daa` may contain `aa`.
+        assert!(!json.contains("\"aa\""), "{json}");
+    }
+
+    #[tokio::test]
+    async fn finished_children_leave_the_fact() {
+        let script = Script::new(vec![("KID-A", vec![Step::Reply(reply("ok"))])]);
+        let rig = rig(&script);
+        let a = spawn(&rig, "KID-A", json!({"name": "aa"})).await;
+        settle(&rig, a.id).await;
+        assert!(rig.hub.topology_facts(rig.hub.main()).is_some());
+        rig.hub.stop(rig.hub.main(), &[a.id], StopOpts::default());
+        settle(&rig, a.id).await;
+        assert_eq!(rig.hub.topology_facts(rig.hub.main()), None);
+    }
+}
+
+mod ack {
+    use super::*;
+    use crate::runs::AckState;
+
+    fn state_of(rig: &Rig, from: UnitId, to: UnitId) -> Vec<AckState> {
+        rig.hub
+            .acks_to(from, to)
+            .into_iter()
+            .map(|r| r.state)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn accepted_then_delivered_order() {
+        let (release, gate) = flume::bounded::<()>(1);
+        let script = Script::new(vec![(
+            CHILD,
+            vec![
+                Step::Gate(gate, reply("first")),
+                Step::Reply(reply("second")),
+            ],
+        )]);
+        let rig = rig(&script);
+        let ack = spawn(&rig, CHILD, json!({})).await;
+        await_requests(&script, CHILD, 1).await;
+        let main = rig.hub.main();
+        say(&rig, main, ack.id, "note", DeliveryKind::Steer);
+        assert_eq!(state_of(&rig, main, ack.id), [AckState::Accepted]);
+        release.send(()).unwrap();
+        settle(&rig, ack.id).await;
+        let states = state_of(&rig, main, ack.id);
+        assert!(
+            matches!(states[..], [AckState::Delivered { step: Some(_) }]),
+            "{states:?}"
+        );
+        assert!(seen_text(&script, CHILD)[1].contains("note"));
+    }
+
+    #[tokio::test]
+    async fn dropped_when_recipient_stopped_notifies_sender() {
+        let script = Script::new(vec![(CHILD, vec![Step::Hang])]);
+        let rig = rig(&script);
+        let ack = spawn(&rig, CHILD, json!({})).await;
+        await_requests(&script, CHILD, 1).await;
+        let main = rig.hub.main();
+        let sent = say(&rig, main, ack.id, "too late", DeliveryKind::Steer);
+        rig.hub.stop(main, &[ack.id], StopOpts::default());
+        assert_eq!(
+            state_of(&rig, main, ack.id),
+            [AckState::Dropped("recipient_stopped")]
+        );
+        let notices = rig.hub.pending_notices(main);
+        let text = notices.iter().map(|n| n.text.as_str()).collect::<String>();
+        assert!(
+            text.contains(&format!("message {} to ", sent.id))
+                && text.contains("was dropped: recipient stopped"),
+            "{text}"
+        );
+        settle(&rig, ack.id).await;
+    }
+
+    #[tokio::test]
+    async fn guard_release_into_full_inbox_is_dropped_and_reported() {
+        let script = Script::new(vec![
+            ("PARENT-A", vec![Step::Hang]),
+            ("CHILD-B", vec![Step::Hang]),
+        ]);
+        let (rig, a, b) = super::hub::pair(&script).await;
+        await_requests(&script, "PARENT-A", 1).await;
+        await_requests(&script, "CHILD-B", 1).await;
+        for n in 0..crate::runs::inbox::PAIR_BURST {
+            say(&rig, b, a, &format!("q{n}"), DeliveryKind::Quiet);
+        }
+        let held = say(&rig, a, b, "held", DeliveryKind::Quiet);
+        assert!(held.held);
+        assert_eq!(state_of(&rig, a, b), [AckState::Held]);
+        let inbox = rig.hub.inbox_of(b).unwrap();
+        for n in 0..crate::runs::inbox::MAX_PENDING {
+            let item = InboxItem::new(
+                MessageId(900 + n as u64),
+                rig.hub.main(),
+                "main".into(),
+                DeliveryKind::Quiet,
+                "x".into(),
+                std::time::Instant::now(),
+            );
+            inbox
+                .lock()
+                .enqueue_with(item, std::time::Instant::now(), false)
+                .unwrap();
+        }
+        rig.hub.note_work(b);
+        assert_eq!(state_of(&rig, a, b), [AckState::Dropped("inbox_full")]);
+        let text = rig
+            .hub
+            .pending_notices(a)
+            .iter()
+            .map(|n| n.text.clone())
+            .collect::<String>();
+        assert!(text.contains("was dropped: inbox full"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn records_are_bounded_per_sender_and_never_regress() {
+        let script = Script::new(vec![(CHILD, vec![Step::Hang])]);
+        let rig = rig(&script);
+        let ack = spawn(&rig, CHILD, json!({})).await;
+        let main = rig.hub.main();
+        for n in 0..(crate::runs::ack::MAX_ACKS_PER_SENDER + 5) {
+            rig.hub
+                .send(main, ack.id, format!("m{n}"), DeliveryKind::Quiet)
+                .ok();
+        }
+        assert!(rig.hub.acks_to(main, ack.id).len() <= crate::runs::ack::MAX_ACKS_PER_SENDER);
+        rig.hub.stop(main, &[ack.id], StopOpts::default());
+        settle(&rig, ack.id).await;
+    }
+
+    #[tokio::test]
+    async fn slow_delivery_notice_after_sixty_seconds() {
+        let script = Script::new(vec![(CHILD, vec![Step::Hang])]);
+        let rig = rig(&script);
+        let ack = spawn(&rig, CHILD, json!({})).await;
+        await_requests(&script, CHILD, 1).await;
+        let main = rig.hub.main();
+        let sent = say(&rig, main, ack.id, "slow", DeliveryKind::Quiet);
+        rig.hub.slow_delivery(main, sent.id, ack.id);
+        let text = rig
+            .hub
+            .pending_notices(main)
+            .iter()
+            .map(|n| n.text.clone())
+            .collect::<String>();
+        assert!(text.contains("is not delivered after 60s"), "{text}");
+        rig.hub.stop(main, &[ack.id], StopOpts::default());
+        settle(&rig, ack.id).await;
+    }
+
+    fn dropped_notices(rig: &Rig, owner: UnitId) -> Vec<String> {
+        rig.hub
+            .pending_notices(owner)
+            .into_iter()
+            .map(|n| n.text)
+            .filter(|t| t.contains("dropped"))
+            .collect()
+    }
+
+    async fn wait_idle_after(rig: &Rig, script: &Script, id: UnitId, requests: usize) {
+        for _ in 0..50_000_000u64 {
+            if script.requests(CHILD) >= requests
+                && rig.hub.get(id).unwrap().state.label() == "idle"
+            {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("never idle after {requests} requests");
+    }
+
+    #[tokio::test]
+    async fn a_request_cancelled_before_it_returned_never_confirms_the_message() {
+        let script = Script::new(vec![(
+            CHILD,
+            vec![
+                Step::Reply(reply("r1")),
+                Step::Hang,
+                Step::Reply(reply("r3")),
+            ],
+        )]);
+        let rig = rig(&script);
+        let ack = spawn(&rig, CHILD, json!({})).await;
+        settle(&rig, ack.id).await;
+        let main = rig.hub.main();
+        // The idle child restarts on it: the message becomes the user message
+        // of a request that hangs, then is interrupted.
+        say(&rig, main, ack.id, "ZZ-first", DeliveryKind::Steer);
+        await_requests(&script, CHILD, 2).await;
+        assert_eq!(state_of(&rig, main, ack.id), [AckState::Accepted]);
+        rig.hub.stop(
+            main,
+            &[ack.id],
+            StopOpts {
+                soft: true,
+                ..StopOpts::default()
+            },
+        );
+        wait_idle_after(&rig, &script, ack.id, 2).await;
+        assert_eq!(
+            state_of(&rig, main, ack.id),
+            [AckState::Accepted],
+            "interrupted, not delivered, not lost"
+        );
+        // The history kept it; the next request that returns confirms it once.
+        say(&rig, main, ack.id, "ZZ-second", DeliveryKind::Steer);
+        wait_idle_after(&rig, &script, ack.id, 3).await;
+        let states = state_of(&rig, main, ack.id);
+        assert!(
+            matches!(states[..], [AckState::Delivered { .. }]),
+            "{states:?}"
+        );
+        assert_eq!(count_in(&script, 2, "ZZ-first"), 1, "carried, not repeated");
+        assert_eq!(count_in(&script, 2, "ZZ-second"), 1);
+    }
+
+    fn count_in(script: &Script, n: usize, needle: &str) -> usize {
+        script
+            .messages_of(CHILD, n)
+            .iter()
+            .map(serde_json::Value::to_string)
+            .collect::<String>()
+            .matches(needle)
+            .count()
+    }
+
+    fn pause_at(
+        rig: &Rig,
+        id: UnitId,
+        at: &'static str,
+    ) -> (flume::Receiver<()>, flume::Sender<()>) {
+        let (reached_tx, reached_rx) = flume::unbounded();
+        let (go_tx, go_rx) = flume::unbounded();
+        rig.hub
+            .table()
+            .agents
+            .get(&id)
+            .unwrap()
+            .pauses
+            .lock()
+            .unwrap()
+            .insert(at, (reached_tx, go_rx));
+        (reached_rx, go_tx)
+    }
+
+    #[tokio::test]
+    async fn stop_before_the_settle_drops_exactly_once() {
+        let (release, gate) = flume::bounded::<()>(1);
+        let script = Script::new(vec![(CHILD, vec![Step::Gate(gate, reply("r1"))])]);
+        let rig = rig(&script);
+        let ack = spawn(&rig, CHILD, json!({})).await;
+        await_requests(&script, CHILD, 1).await;
+        let held = pause_at(&rig, ack.id, "before_settle");
+        release.send(()).unwrap();
+        held.0.recv_async().await.unwrap();
+        let main = rig.hub.main();
+        say(&rig, main, ack.id, "late", DeliveryKind::Steer);
+        rig.hub.stop(main, &[ack.id], StopOpts::default());
+        held.1.send(()).unwrap();
+        settle(&rig, ack.id).await;
+        assert_eq!(
+            state_of(&rig, main, ack.id),
+            [AckState::Dropped("recipient_stopped")]
+        );
+        assert_eq!(dropped_notices(&rig, main).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn stop_after_the_restart_keeps_the_delivery() {
+        let (release, gate) = flume::bounded::<()>(1);
+        let script = Script::new(vec![(
+            CHILD,
+            vec![Step::Gate(gate, reply("r1")), Step::Reply(reply("r2"))],
+        )]);
+        let rig = rig(&script);
+        let ack = spawn(&rig, CHILD, json!({})).await;
+        await_requests(&script, CHILD, 1).await;
+        let held = pause_at(&rig, ack.id, "before_settle");
+        release.send(()).unwrap();
+        held.0.recv_async().await.unwrap();
+        let main = rig.hub.main();
+        say(&rig, main, ack.id, "early", DeliveryKind::Steer);
+        held.1.send(()).unwrap();
+        wait_idle_after(&rig, &script, ack.id, 2).await;
+        rig.hub.stop(main, &[ack.id], StopOpts::default());
+        settle(&rig, ack.id).await;
+        let states = state_of(&rig, main, ack.id);
+        assert!(
+            matches!(states[..], [AckState::Delivered { .. }]),
+            "{states:?}"
+        );
+        assert!(dropped_notices(&rig, main).is_empty());
+    }
+
+    #[tokio::test]
+    async fn many_drops_make_one_notice() {
+        let script = Script::new(vec![(CHILD, vec![Step::Hang])]);
+        let rig = rig(&script);
+        let ack = spawn(&rig, CHILD, json!({})).await;
+        await_requests(&script, CHILD, 1).await;
+        let main = rig.hub.main();
+        for n in 0..5 {
+            say(&rig, main, ack.id, &format!("q{n}"), DeliveryKind::Quiet);
+        }
+        rig.hub.stop(main, &[ack.id], StopOpts::default());
+        settle(&rig, ack.id).await;
+        let notices = dropped_notices(&rig, main);
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(notices[0].contains("5 messages"), "{notices:?}");
+        assert_eq!(rig.hub.acks_to(main, ack.id).len(), 5);
+    }
+}
+
+mod admit {
+    use super::*;
+
+    fn one_slot() -> UnitLimits {
+        UnitLimits {
+            max_agents: 1,
+            ..UnitLimits::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_agents_start_in_order_as_slots_free() {
+        let (open_a, gate_a) = flume::bounded::<()>(1);
+        let script = Script::new(vec![
+            ("AAA", vec![Step::Gate(gate_a, reply("a"))]),
+            ("BBB", vec![Step::Reply(reply("b"))]),
+            ("CCC", vec![Step::Reply(reply("c"))]),
+        ]);
+        let rig = rig_with(&script, one_slot());
+        let a = spawn(&rig, "AAA", json!({"one_shot": true})).await;
+        let b = spawn(&rig, "BBB", json!({"one_shot": true})).await;
+        let c = spawn(&rig, "CCC", json!({"one_shot": true})).await;
+        assert_eq!((a.queue_position, b.queue_position), (None, Some((1, 1))));
+        assert_eq!(c.queue_position, Some((2, 2)));
+        await_requests(&script, "AAA", 1).await;
+        assert_eq!(script.requests("BBB") + script.requests("CCC"), 0);
+        assert_eq!(
+            rig.hub.get(c.id).unwrap().state_label(),
+            "queued (position 2 of 2)"
+        );
+        open_a.send(()).unwrap();
+        for id in [a.id, b.id, c.id] {
+            assert_eq!(done_reason(&settle(&rig, id).await), DoneReason::Completed);
+        }
+        let order = finished_order(&rig).await;
+        let handles: Vec<String> = [&a, &b, &c].map(|x| x.handle.to_string()).into();
+        assert_eq!(order, handles, "FIFO");
+        assert_eq!(rig.hub.slots_in_use(), 0);
+    }
+
+    #[tokio::test]
+    async fn stop_queued_agent_never_requests() {
+        let script = Script::new(vec![
+            ("AAA", vec![Step::Hang]),
+            ("BBB", vec![Step::Reply(reply("b"))]),
+        ]);
+        let rig = rig_with(&script, one_slot());
+        let a = spawn(&rig, "AAA", json!({})).await;
+        let b = spawn(&rig, "BBB", json!({})).await;
+        await_requests(&script, "AAA", 1).await;
+        rig.hub.stop(rig.hub.main(), &[b.id], StopOpts::default());
+        assert_eq!(done_reason(&settle(&rig, b.id).await), DoneReason::Killed);
+        rig.hub.stop(rig.hub.main(), &[a.id], StopOpts::default());
+        assert_eq!(done_reason(&settle(&rig, a.id).await), DoneReason::Killed);
+        assert_eq!(script.requests("BBB"), 0);
+        assert_eq!(rig.hub.slots_in_use(), 0);
+    }
+
+    #[tokio::test]
+    async fn timeout_counts_from_start_not_from_queueing() {
+        let (open_a, gate_a) = flume::bounded::<()>(1);
+        let script = Script::new(vec![
+            ("AAA", vec![Step::Gate(gate_a, reply("a"))]),
+            ("BBB", vec![Step::Hang]),
+        ]);
+        let rig = rig_with(&script, one_slot());
+        let a = spawn(&rig, "AAA", json!({"one_shot": true})).await;
+        let b = spawn(&rig, "BBB", json!({"timeout_secs": 10})).await;
+        await_requests(&script, "AAA", 1).await;
+        rig.clock.advance(Duration::from_secs(100));
+        assert_eq!(rig.hub.get(b.id).unwrap().state.label(), "queued");
+        open_a.send(()).unwrap();
+        settle(&rig, a.id).await;
+        await_requests(&script, "BBB", 1).await;
+        rig.clock.advance(Duration::from_secs(11));
+        let view = settle(&rig, b.id).await;
+        assert_eq!(done_reason(&view), DoneReason::TimedOut);
+        assert_eq!(rig.hub.slots_in_use(), 0);
+    }
+
+    #[tokio::test]
+    async fn parent_waiting_on_queued_child_does_not_deadlock() {
+        let spawn_kid = tool_use(
+            "t1",
+            "spawn",
+            json!({
+                "kind": "agent", "description": "kid", "name": "kid", "prompt": CHILD,
+                // The child's notice would start a new turn in the parent,
+                // and this script does not answer one.
+                "notify": "never",
+            }),
+        );
+        let wait_kid = tool_use("t2", "wait", json!({"ids": ["kid"]}));
+        let script = Script::new(vec![
+            (
+                PARENT,
+                vec![
+                    Step::Reply(spawn_kid),
+                    Step::Reply(wait_kid),
+                    Step::Reply(reply("parent done")),
+                ],
+            ),
+            (CHILD, vec![Step::Reply(reply("kid done"))]),
+        ]);
+        let rig = rig_with(&script, one_slot());
+        let parent = spawn(&rig, PARENT, json!({})).await;
+        // The model's wait does not wait for an agent, so the parent's turn
+        // ends and the queued child takes the slot it was holding.
+        await_requests(&script, CHILD, 1).await;
+        let view = settle(&rig, parent.id).await;
+        assert_eq!(view.result.unwrap().summary, "parent done");
+        assert_eq!(script.requests(PARENT), 3);
+        // The child ran to the end, so the pool is empty again.
+        let kids = rig.hub.list(parent.id, Scope::Children);
+        assert_eq!(kids.len(), 1);
+        settle(&rig, kids[0].id).await;
+        rig.hub
+            .stop(rig.hub.main(), &[parent.id], StopOpts::default());
+        settle(&rig, parent.id).await;
+        assert_eq!(rig.hub.slots_in_use(), 0);
+    }
+
+    /// The script has no route for the first run's prompt, so its driver
+    /// panics. The run must fail and hand its slot to the queued one.
+    #[tokio::test]
+    async fn driver_panic_frees_the_slot() {
+        let script = Script::new(vec![("BBB", vec![Step::Reply(reply("b"))])]);
+        let rig = rig_with(&script, one_slot());
+        let a = spawn(&rig, "AAA", json!({})).await;
+        let b = spawn(&rig, "BBB", json!({"one_shot": true})).await;
+        let view = settle(&rig, a.id).await;
+        assert!(
+            matches!(&view.state, UnitState::Done(t) if t.reason == DoneReason::Failed),
+            "{:?}",
+            view.state
+        );
+        // The shared script is poisoned now, so `b` fails too; it did get a
+        // slot, which is the point.
+        let view = settle(&rig, b.id).await;
+        assert!(view.queue.is_none(), "{:?}", view.state);
+        assert_eq!(rig.hub.slots_in_use(), 0);
+    }
+
+    /// Stopping a parent whose children wait in the queue removes them; they
+    /// never send a request.
+    #[tokio::test]
+    async fn stopping_a_parent_dequeues_its_children() {
+        let script = Script::new(vec![
+            ("HHH", vec![Step::Hang]),
+            ("PPP", vec![Step::Hang]),
+            ("CC1", vec![Step::Reply(reply("c1"))]),
+            ("CC2", vec![Step::Reply(reply("c2"))]),
+        ]);
+        let rig = rig_with(
+            &script,
+            UnitLimits {
+                max_agents: 2,
+                ..UnitLimits::default()
+            },
+        );
+        let h = spawn(&rig, "HHH", json!({})).await;
+        let p = spawn(&rig, "PPP", json!({})).await;
+        await_requests(&script, "HHH", 1).await;
+        await_requests(&script, "PPP", 1).await;
+        let c1 = spawn_as(&rig, p.id, agent_req("CC1", json!({}))).await;
+        let c2 = spawn_as(&rig, p.id, agent_req("CC2", json!({}))).await;
+        assert_eq!(c2.queue_position, Some((2, 2)));
+        rig.hub.stop(rig.hub.main(), &[p.id], StopOpts::default());
+        for id in [c1.id, c2.id, p.id] {
+            assert_eq!(done_reason(&settle(&rig, id).await), DoneReason::Killed);
+        }
+        assert_eq!(script.requests("CC1") + script.requests("CC2"), 0);
+        rig.hub.stop(rig.hub.main(), &[h.id], StopOpts::default());
+        settle(&rig, h.id).await;
+        assert_eq!(rig.hub.slots_in_use(), 0);
+    }
+}
+
+mod perm {
+    use std::path::{Path, PathBuf};
+
+    use maki_config::{PermissionsConfig, ProjectConfig, UnattendedMode};
+
+    use super::*;
+    use crate::permissions::{PermissionAnswer, PermissionManager, TaggedAnswer};
+
+    const SECS_120: Duration = Duration::from_secs(120);
+
+    fn manager(yolo: bool) -> Arc<PermissionManager> {
+        Arc::new(PermissionManager::new(
+            PermissionsConfig {
+                yolo,
+                ..PermissionsConfig::default()
+            },
+            PathBuf::from("/tmp"),
+            ProjectConfig::discover(Path::new("/tmp")),
+            Arc::default(),
+        ))
+    }
+
+    /// A rig whose runs have no rule for `spawn`, so a shell spawn prompts.
+    fn prompting(script: &Arc<Script>, limits: UnitLimits) -> Rig {
+        let mut rig = rig_with(script, limits);
+        rig.ctx.permissions = manager(false);
+        rig
+    }
+
+    fn shell_call(id: &str, command: &str) -> StreamResponse {
+        tool_use(
+            id,
+            "spawn",
+            json!({"kind": "shell", "description": "d", "command": command}),
+        )
+    }
+
+    struct Prompt {
+        id: String,
+        scopes: Vec<String>,
+        info: SubagentInfo,
+    }
+
+    impl Prompt {
+        fn answer(&self, answer: PermissionAnswer) {
+            let tx = self.info.answer_tx.as_ref().expect("an answer channel");
+            tx.send(TaggedAnswer::new(&self.id, answer).encode())
+                .unwrap();
+        }
+    }
+
+    async fn next_event(rig: &Rig, mut hit: impl FnMut(&Envelope) -> bool) -> Envelope {
+        let mut events = rig.events.lock().await;
+        loop {
+            let envelope = events.recv().await.expect("the expected event never came");
+            if hit(&envelope) {
+                return envelope;
+            }
+        }
+    }
+
+    async fn next_prompt(rig: &Rig) -> Prompt {
+        let envelope = next_event(rig, |e| {
+            matches!(e.event, AgentEvent::PermissionRequest { .. })
+        })
+        .await;
+        let AgentEvent::PermissionRequest { id, scopes, .. } = envelope.event else {
+            unreachable!()
+        };
+        Prompt {
+            id,
+            scopes,
+            info: envelope.subagent.expect("a run's prompt is stamped"),
+        }
+    }
+
+    async fn withdrawn(rig: &Rig, id: &str) {
+        next_event(
+            rig,
+            |e| matches!(&e.event, AgentEvent::PermissionWithdrawn { id: got } if got == id),
+        )
+        .await;
+    }
+
+    fn last_text(script: &Script, route: &str, n: usize) -> String {
+        script
+            .messages_of(route, n)
+            .iter()
+            .map(Value::to_string)
+            .collect()
+    }
+
+    fn broker_of(rig: &Rig, id: UnitId) -> Arc<broker::PermissionBroker> {
+        Arc::clone(&rig.hub.table().agents.get(&id).unwrap().broker)
+    }
+
+    /// Nothing may be left behind once a run is settled, whatever happened.
+    fn assert_clean(rig: &Rig, ids: &[UnitId]) {
+        assert_eq!(rig.hub.slots_in_use(), 0, "slot leaked");
+        assert_eq!(rig.hub.prompts.load(Ordering::SeqCst), 0, "prompt leaked");
+        for id in ids {
+            assert_eq!(broker_of(rig, *id).pending_count(), 0);
+        }
+    }
+
+    fn one_prompt_script() -> Arc<Script> {
+        Script::new(vec![(
+            CHILD,
+            vec![
+                Step::Reply(shell_call("t1", "true")),
+                Step::Reply(reply("done")),
+            ],
+        )])
+    }
+
+    #[tokio::test]
+    async fn background_prompt_reaches_ui_with_run_name() {
+        let script = one_prompt_script();
+        let rig = prompting(&script, UnitLimits::default());
+        let ack = spawn(&rig, CHILD, json!({"name": "auditor"})).await;
+        script.watch(CHILD, &rig.hub, ack.id);
+        let prompt = next_prompt(&rig).await;
+        assert_eq!(prompt.info.name, "auditor");
+        assert_eq!(prompt.info.parent_tool_use_id, ack.handle.to_string());
+        assert_eq!(prompt.scopes, ["true"]);
+        assert_eq!(rig.hub.slots_in_use(), 0, "the prompt pins no slot");
+        prompt.answer(PermissionAnswer::AllowOnce);
+        assert_eq!(done_state(&settle(&rig, ack.id).await), "idle");
+        assert_eq!(script.requests(CHILD), 2);
+        assert!(
+            last_text(&script, CHILD, 1).contains("sh-"),
+            "the shell ran"
+        );
+        assert_clean(&rig, &[ack.id]);
+    }
+
+    fn done_state(view: &UnitView) -> &'static str {
+        match view.state {
+            UnitState::Idle => "idle",
+            _ => "other",
+        }
+    }
+
+    #[tokio::test]
+    async fn denied_by_the_user_tells_the_run() {
+        let script = one_prompt_script();
+        let rig = prompting(&script, UnitLimits::default());
+        let ack = spawn(&rig, CHILD, json!({})).await;
+        let prompt = next_prompt(&rig).await;
+        prompt.answer(PermissionAnswer::Deny);
+        settle(&rig, ack.id).await;
+        let text = last_text(&script, CHILD, 1);
+        assert!(text.contains("rejected by the user"), "{text}");
+        assert!(!text.contains("sh-"), "the shell must not have run");
+        assert_clean(&rig, &[ack.id]);
+    }
+
+    #[tokio::test]
+    async fn timeout_denies_and_run_continues() {
+        let script = one_prompt_script();
+        let rig = prompting(&script, UnitLimits::default());
+        let ack = spawn(&rig, CHILD, json!({})).await;
+        let prompt = next_prompt(&rig).await;
+        rig.clock.advance(SECS_120);
+        withdrawn(&rig, &prompt.id).await;
+        settle(&rig, ack.id).await;
+        let text = last_text(&script, CHILD, 1);
+        assert!(
+            text.contains("timed out after 120s; ask your parent via send if you need it"),
+            "{text}"
+        );
+        assert_clean(&rig, &[ack.id]);
+    }
+
+    #[tokio::test]
+    async fn a_late_answer_cannot_allow_a_timed_out_call() {
+        let script = Script::new(vec![(
+            CHILD,
+            vec![
+                Step::Reply(shell_call("t1", "true")),
+                Step::Reply(shell_call("t1", "true")),
+                Step::Hang,
+            ],
+        )]);
+        let rig = prompting(&script, UnitLimits::default());
+        let ack = spawn(&rig, CHILD, json!({})).await;
+        let first = next_prompt(&rig).await;
+        rig.clock.advance(SECS_120);
+        withdrawn(&rig, &first.id).await;
+        // The user was a moment too late; the run asks again with the same id.
+        first.answer(PermissionAnswer::AllowOnce);
+        let second = next_prompt(&rig).await;
+        assert_ne!(second.id, first.id, "each prompt is shown under a fresh id");
+        assert_eq!(
+            script.requests(CHILD),
+            2,
+            "the late allow did not carry over"
+        );
+        assert_eq!(broker_of(&rig, ack.id).pending_count(), 1);
+        rig.hub.stop(rig.hub.main(), &[ack.id], StopOpts::default());
+        settle(&rig, ack.id).await;
+        assert_clean(&rig, &[ack.id]);
+    }
+
+    #[tokio::test]
+    async fn slot_released_while_prompt_pending() {
+        let (open_b, gate_b) = flume::bounded::<()>(1);
+        let script = Script::new(vec![
+            (
+                "AAA",
+                vec![
+                    Step::Reply(shell_call("t1", "true")),
+                    Step::Reply(reply("a")),
+                ],
+            ),
+            ("BBB", vec![Step::Gate(gate_b, reply("b"))]),
+            ("CCC", vec![Step::Reply(reply("c"))]),
+        ]);
+        let rig = prompting(
+            &script,
+            UnitLimits {
+                max_agents: 1,
+                ..UnitLimits::default()
+            },
+        );
+        let a = spawn(&rig, "AAA", json!({"one_shot": true})).await;
+        script.watch("AAA", &rig.hub, a.id);
+        let b = spawn(&rig, "BBB", json!({"one_shot": true})).await;
+        let c = spawn(&rig, "CCC", json!({"one_shot": true})).await;
+        let prompt = next_prompt(&rig).await;
+        // B got A's slot while A waits for the user.
+        await_requests(&script, "BBB", 1).await;
+        assert_eq!(script.requests("CCC"), 0);
+        prompt.answer(PermissionAnswer::AllowOnce);
+        // A is back in line ahead of C, which never started. It asks for its
+        // slot when its call wakes, so B must not finish before that.
+        for _ in 0..50_000_000u64 {
+            if rig.hub.table().pool.is_waiting(a.id) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            rig.hub.table().pool.is_waiting(a.id),
+            "A never queued again"
+        );
+        open_b.send(()).unwrap();
+        await_requests(&script, "AAA", 2).await;
+        // C may run once A is done, but never ahead of A's second request.
+        let order = script.order();
+        let first_c = order.iter().position(|r| r == "CCC");
+        let second_a = order.iter().rposition(|r| r == "AAA").unwrap();
+        assert!(
+            first_c.is_none_or(|c| c > second_a),
+            "A resumes before C starts: {order:?}"
+        );
+        for id in [a.id, b.id, c.id] {
+            assert_eq!(done_reason(&settle(&rig, id).await), DoneReason::Completed);
+        }
+        script.assert_slots_held();
+        assert_clean(&rig, &[a.id, b.id, c.id]);
+    }
+
+    #[tokio::test]
+    async fn stop_while_prompt_pending_withdraws_it_and_leaks_nothing() {
+        let script = one_prompt_script();
+        let rig = prompting(&script, UnitLimits::default());
+        let ack = spawn(&rig, CHILD, json!({})).await;
+        let prompt = next_prompt(&rig).await;
+        rig.hub.stop(rig.hub.main(), &[ack.id], StopOpts::default());
+        withdrawn(&rig, &prompt.id).await;
+        assert_eq!(done_reason(&settle(&rig, ack.id).await), DoneReason::Killed);
+        assert_clean(&rig, &[ack.id]);
+        // An answer after the stop reaches nothing that runs.
+        prompt.answer(PermissionAnswer::AllowOnce);
+        assert_eq!(script.requests(CHILD), 1);
+    }
+
+    #[tokio::test]
+    async fn soft_stop_while_prompt_pending_leaves_the_run_idle_and_clean() {
+        let script = one_prompt_script();
+        let rig = prompting(&script, UnitLimits::default());
+        let ack = spawn(&rig, CHILD, json!({})).await;
+        let prompt = next_prompt(&rig).await;
+        rig.hub.stop(
+            rig.hub.main(),
+            &[ack.id],
+            StopOpts {
+                soft: true,
+                detach: false,
+            },
+        );
+        withdrawn(&rig, &prompt.id).await;
+        assert_eq!(done_state(&settle(&rig, ack.id).await), "idle");
+        assert_clean(&rig, &[ack.id]);
+        rig.hub.stop(rig.hub.main(), &[ack.id], StopOpts::default());
+        settle(&rig, ack.id).await;
+    }
+
+    #[tokio::test]
+    async fn answers_reach_only_the_run_that_asked() {
+        let script = Script::new(vec![
+            (
+                "AAA",
+                vec![Step::Reply(shell_call("same", "true")), Step::Hang],
+            ),
+            (
+                "BBB",
+                vec![Step::Reply(shell_call("same", "true")), Step::Hang],
+            ),
+        ]);
+        let rig = prompting(&script, UnitLimits::default());
+        let a = spawn(&rig, "AAA", json!({"name": "alpha"})).await;
+        let b = spawn(&rig, "BBB", json!({"name": "beta"})).await;
+        let first = next_prompt(&rig).await;
+        let second = next_prompt(&rig).await;
+        assert_eq!(first.id, second.id, "both runs used the same call id");
+        let (alpha, beta) = if first.info.name == "alpha" {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        alpha.answer(PermissionAnswer::AllowAlwaysProject);
+        await_requests(&script, "AAA", 2).await;
+        assert_eq!(script.requests("BBB"), 1, "beta is still waiting");
+        assert_eq!(broker_of(&rig, b.id).pending_count(), 1);
+        beta.answer(PermissionAnswer::Deny);
+        await_requests(&script, "BBB", 2).await;
+        for id in [a.id, b.id] {
+            rig.hub.stop(rig.hub.main(), &[id], StopOpts::default());
+            settle(&rig, id).await;
+        }
+        assert_clean(&rig, &[a.id, b.id]);
+    }
+
+    #[tokio::test]
+    async fn unattended_deny_text_mentions_send() {
+        let script = one_prompt_script();
+        let rig = prompting(&script, UnitLimits::default());
+        rig.hub.set_attended(false);
+        let ack = spawn(&rig, CHILD, json!({})).await;
+        settle(&rig, ack.id).await;
+        let text = last_text(&script, CHILD, 1);
+        assert!(
+            text.contains("report this to your parent with send"),
+            "{text}"
+        );
+        let mut events = rig.events.lock().await;
+        assert!(
+            !drain_events(&mut events)
+                .into_iter()
+                .any(|e| matches!(e.event, AgentEvent::PermissionRequest { .. })),
+            "nothing is shown to a user who is not there"
+        );
+        assert_clean(&rig, &[ack.id]);
+    }
+
+    /// What the broker answers a prompt nobody can see, as the run reads it.
+    fn unattended_answer(unattended: UnattendedMode, yolo: bool) -> PermissionAnswer {
+        let script = Script::new(vec![]);
+        let rig = rig_with(
+            &script,
+            UnitLimits {
+                unattended,
+                ..UnitLimits::default()
+            },
+        );
+        rig.hub.set_attended(false);
+        let broker = broker::PermissionBroker::new(Arc::default());
+        let clock: Arc<dyn Clock> = rig.clock.clone();
+        let info = SubagentInfo {
+            parent_tool_use_id: "ag-test".into(),
+            name: "x".into(),
+            prompt: None,
+            model: None,
+            subagent_type: None,
+            opts: None,
+            answer_tx: None,
+            control: Arc::default(),
+            parent_call: None,
+        };
+        let shown = broker.begin(broker::Begin {
+            hub: &rig.hub,
+            run: rig.hub.main(),
+            info: &info,
+            clock: &clock,
+            request: "r1",
+            scope: "echo".into(),
+            yolo,
+        });
+        assert!(
+            shown.is_none(),
+            "an unattended prompt is answered, not shown"
+        );
+        let raw = broker.receiver().try_lock().unwrap().try_recv().unwrap();
+        let tagged = TaggedAnswer::decode(&raw).unwrap();
+        assert_eq!(tagged.request_id, "r1");
+        tagged.answer
+    }
+
+    #[tokio::test]
+    async fn headless_allow_under_yolo_allows() {
+        use UnattendedMode::{AllowUnderYolo, Deny};
+        assert_eq!(
+            unattended_answer(AllowUnderYolo, true),
+            PermissionAnswer::AllowOnce
+        );
+        for (mode, yolo) in [(Deny, true), (Deny, false), (AllowUnderYolo, false)] {
+            assert!(
+                matches!(
+                    unattended_answer(mode, yolo),
+                    PermissionAnswer::Unavailable(_)
+                ),
+                "{mode:?} yolo={yolo}"
+            );
+        }
+    }
+
+    /// `maki -p --yolo` needs no policy: the rules already allow the call.
+    #[tokio::test]
+    async fn yolo_run_is_allowed_without_a_prompt() {
+        let script = one_prompt_script();
+        let mut rig = rig_with(&script, UnitLimits::default());
+        rig.ctx.permissions = manager(true);
+        rig.hub.set_attended(false);
+        let ack = spawn(&rig, CHILD, json!({})).await;
+        settle(&rig, ack.id).await;
+        assert!(last_text(&script, CHILD, 1).contains("sh-"));
+    }
+
+    #[tokio::test]
+    async fn too_many_pending_prompts_are_denied_not_queued() {
+        let total = broker::MAX_PENDING_PROMPTS;
+        let routes: Vec<&'static str> = [
+            "P00", "P01", "P02", "P03", "P04", "P05", "P06", "P07", "P08",
+        ]
+        .into_iter()
+        .collect();
+        let script = Script::new(
+            routes
+                .iter()
+                .map(|route| {
+                    (
+                        *route,
+                        vec![Step::Reply(shell_call("t1", "true")), Step::Hang],
+                    )
+                })
+                .collect(),
+        );
+        let rig = prompting(
+            &script,
+            UnitLimits {
+                max_agents: 16,
+                max_children_per_run: 16,
+                ..UnitLimits::default()
+            },
+        );
+        let mut acks: Vec<SpawnAck> = Vec::new();
+        for route in &routes {
+            acks.push(spawn(&rig, route, json!({})).await);
+        }
+        let mut prompts: Vec<Prompt> = Vec::new();
+        for _ in 0..total {
+            prompts.push(next_prompt(&rig).await);
+        }
+        // The ninth run is denied at once and goes on to its next request.
+        for _ in 0..50_000_000u64 {
+            let sent: usize = routes.iter().map(|r| script.requests(r)).sum();
+            if sent > routes.len() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let denied: Vec<&&str> = routes
+            .iter()
+            .filter(|route| script.requests(route) == 2)
+            .collect();
+        assert_eq!(denied.len(), 1, "exactly one run was refused a prompt");
+        let text = last_text(&script, denied[0], 1);
+        assert!(text.contains("too many permission prompts"), "{text}");
+        assert_eq!(rig.hub.prompts.load(Ordering::SeqCst), total);
+        for prompt in &prompts {
+            prompt.answer(PermissionAnswer::Deny);
+        }
+        for ack in &acks {
+            rig.hub.stop(rig.hub.main(), &[ack.id], StopOpts::default());
+            settle(&rig, ack.id).await;
+        }
+        let ids: Vec<UnitId> = acks.iter().map(|a| a.id).collect();
+        assert_clean(&rig, &ids);
+    }
+
+    #[tokio::test]
+    async fn a_turn_never_runs_without_a_slot() {
+        // Idle, woken by a follow-up, and a prompt in between: every request
+        // of the run comes while it holds a slot.
+        let script = Script::new(vec![(
+            CHILD,
+            vec![
+                Step::Reply(shell_call("t1", "true")),
+                Step::Reply(reply("first")),
+                Step::Reply(reply("second")),
+            ],
+        )]);
+        let rig = prompting(
+            &script,
+            UnitLimits {
+                max_agents: 1,
+                ..UnitLimits::default()
+            },
+        );
+        let ack = spawn(&rig, CHILD, json!({})).await;
+        script.watch(CHILD, &rig.hub, ack.id);
+        let prompt = next_prompt(&rig).await;
+        prompt.answer(PermissionAnswer::AllowOnce);
+        assert_eq!(done_state(&settle(&rig, ack.id).await), "idle");
+        // The shell's own notice may already have woken the run, so state and
+        // slot are read under one lock: Idle never comes with a slot.
+        {
+            let table = rig.hub.table();
+            let idle = matches!(table.units[&ack.id].state, UnitState::Idle);
+            assert!(
+                !(idle && table.pool.holds(ack.id)),
+                "an idle agent holds no slot"
+            );
+        }
+        say(
+            &rig,
+            rig.hub.main(),
+            ack.id,
+            "again",
+            DeliveryKind::Followup,
+        );
+        await_requests(&script, CHILD, 3).await;
+        script.assert_slots_held();
+        rig.hub.stop(rig.hub.main(), &[ack.id], StopOpts::default());
+        settle(&rig, ack.id).await;
+        assert_clean(&rig, &[ack.id]);
+    }
+}
+
+/// Cold revive and eviction (design 7.4).
+mod revive {
+    use maki_storage::runs::{JournalOptions, JournalRecord, MsgRec, RunJournal, SpawnRec};
+
+    use super::*;
+    use crate::runs::transcript;
+
+    fn journaled(script: &Arc<Script>, limits: UnitLimits) -> (Rig, std::path::PathBuf) {
+        let rig = rig_with(script, limits);
+        let dir = rig.dir.path().join("journal");
+        std::fs::create_dir_all(&dir).unwrap();
+        let journal = RunJournal::open_in(dir.clone(), JournalOptions::default()).unwrap();
+        rig.hub.attach_journal(Arc::new(journal));
+        (rig, dir)
+    }
+
+    fn text_message(role: Role, text: &str) -> Message {
+        Message {
+            role,
+            content: vec![ContentBlock::Text { text: text.into() }],
+            ..Default::default()
+        }
+    }
+
+    /// What the `send` tool does for a finished agent.
+    async fn revive(rig: &Rig, to: UnitId, text: &str) -> Result<SendAck, UnitError> {
+        let main = rig.hub.main();
+        let plan = rig.hub.revive_plan(main, to)?.expect("not live");
+        let transcript = rig.hub.load_transcript(plan.handle.as_str()).unwrap();
+        let launch = AgentLaunch::prepare(&rig.ctx, &plan.spec).await.unwrap();
+        rig.hub.revive(
+            main,
+            plan,
+            launch,
+            transcript,
+            text.to_owned(),
+            DeliveryKind::Steer,
+        )
+    }
+
+    async fn stop(rig: &Rig, id: UnitId) {
+        rig.hub.stop(rig.hub.main(), &[id], StopOpts::default());
+        settle(rig, id).await;
+    }
+
+    #[tokio::test]
+    async fn completed_agent_cold_resumes_from_transcript() {
+        let script = Script::new(vec![(
+            CHILD,
+            vec![
+                Step::Reply(reply("first answer")),
+                Step::Reply(reply("second answer")),
+            ],
+        )]);
+        let (rig, dir) = journaled(&script, UnitLimits::default());
+        let ack = spawn(&rig, CHILD, json!({})).await;
+        assert_eq!(settle(&rig, ack.id).await.state.label(), "idle");
+        stop(&rig, ack.id).await;
+        let path = maki_storage::runs::transcript_path(&dir, ack.handle.as_str());
+        let transcript_before = transcript::load(&path).unwrap();
+        let first_turn = transcript_before.len();
+        assert!(first_turn >= 2, "the prompt and the reply are saved");
+        let sent = revive(&rig, ack.id, "follow up please").await.unwrap();
+        assert_eq!(sent.state, "revived");
+        let view = settle(&rig, ack.id).await;
+        assert_eq!(view.state.label(), "idle");
+        assert_eq!(view.result.unwrap().summary, "second answer");
+        let second = seen_text(&script, CHILD).remove(1);
+        assert!(
+            second.contains("first answer"),
+            "history restored: {second}"
+        );
+        assert!(
+            second.contains("follow up please"),
+            "message delivered: {second}"
+        );
+        // The second turn was appended, not rewritten.
+        let saved = transcript::load(&path).unwrap();
+        assert!(saved.len() > first_turn);
+        assert_eq!(saved[..first_turn], transcript_before[..]);
+        assert_eq!(saved.len(), first_turn + 2, "the follow-up and its reply");
+        // Same identity.
+        assert_eq!(rig.hub.get(ack.id).unwrap().handle, ack.handle);
+    }
+
+    /// A run the journal lost is taken back from what the session kept: the
+    /// hub knows it again, and a message revives it from its transcript.
+    #[tokio::test]
+    async fn a_remembered_run_can_be_revived() {
+        let script = Script::new(vec![(CHILD, vec![Step::Reply(reply("the answer"))])]);
+        let (rig, _dir) = journaled(&script, UnitLimits::default());
+        let spec = AgentSpec {
+            prompt: String::new(),
+            subagent_type: "general".into(),
+            model_tier: None,
+            thinking: None,
+            output_schema: None,
+            fork: false,
+            one_shot: true,
+            timeout_secs: 600,
+        };
+        let history = vec![text_message(
+            Role::User,
+            &format!("{CHILD} the first question"),
+        )];
+        let id = rig
+            .hub
+            .remember_run("ag-lost01", "lost", spec, rig.hub.main(), history)
+            .unwrap();
+        // The hub knows the run again.
+        assert_eq!(rig.hub.resolve(rig.hub.main(), "ag-lost01").unwrap(), id);
+        let plan = rig
+            .hub
+            .revive_plan(rig.hub.main(), id)
+            .unwrap()
+            .expect("a remembered run is revivable");
+        let transcript = rig.hub.load_transcript(plan.handle.as_str()).unwrap();
+        let launch = AgentLaunch::prepare(&rig.ctx, &plan.spec).await.unwrap();
+        let sent = rig
+            .hub
+            .revive(
+                rig.hub.main(),
+                plan,
+                launch,
+                transcript,
+                "go on".to_owned(),
+                DeliveryKind::Steer,
+            )
+            .unwrap();
+        assert_eq!(sent.state, "revived");
+        let view = settle(&rig, id).await;
+        assert_eq!(view.result.unwrap().summary, "the answer");
+        let request = seen_text(&script, CHILD).remove(0);
+        assert!(
+            request.contains("the first question"),
+            "the history came back: {request}"
+        );
+        assert!(
+            request.contains("go on"),
+            "the message was delivered: {request}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_completed_one_shot_agent_is_revivable() {
+        let script = Script::new(vec![(
+            CHILD,
+            vec![
+                Step::Reply(reply("first answer")),
+                Step::Reply(reply("second answer")),
+            ],
+        )]);
+        let (rig, _dir) = journaled(&script, UnitLimits::default());
+        let ack = spawn(&rig, CHILD, json!({"one_shot": true})).await;
+        assert_eq!(
+            done_reason(&settle(&rig, ack.id).await),
+            DoneReason::Completed
+        );
+        // A one-shot agent ends after its turn, but it is resumable: the
+        // transcript is what it comes back with.
+        let plan = rig.hub.revive_plan(rig.hub.main(), ack.id).unwrap();
+        assert!(plan.is_some());
+        let sent = revive(&rig, ack.id, "follow up please").await.unwrap();
+        assert_eq!(sent.state, "revived");
+        let view = settle(&rig, ack.id).await;
+        assert_eq!(done_reason(&view), DoneReason::Completed);
+        assert_eq!(view.result.unwrap().summary, "second answer");
+        let second = seen_text(&script, CHILD).remove(1);
+        assert!(
+            second.contains("first answer"),
+            "history restored: {second}"
+        );
+        assert!(second.contains("follow up please"), "message delivered");
+    }
+
+    /// A remembered run reaches its parent: the session took it back, and the
+    /// parent is the agent that started it.
+    #[tokio::test]
+    async fn a_remembered_run_can_send_to_its_parent() {
+        let script = Script::new(vec![(CHILD, vec![Step::Reply(reply("the answer"))])]);
+        let (rig, _dir) = journaled(&script, UnitLimits::default());
+        let spec = AgentSpec {
+            prompt: String::new(),
+            subagent_type: "general".into(),
+            model_tier: None,
+            thinking: None,
+            output_schema: None,
+            fork: false,
+            one_shot: true,
+            timeout_secs: 600,
+        };
+        let history = vec![text_message(
+            Role::User,
+            &format!("{CHILD} the first question"),
+        )];
+        let id = rig
+            .hub
+            .remember_run("ag-lost01", "lost", spec, rig.hub.main(), history)
+            .unwrap();
+        let plan = rig
+            .hub
+            .revive_plan(rig.hub.main(), id)
+            .unwrap()
+            .expect("a remembered run is revivable");
+        let transcript = rig.hub.load_transcript(plan.handle.as_str()).unwrap();
+        let launch = AgentLaunch::prepare(&rig.ctx, &plan.spec).await.unwrap();
+        rig.hub
+            .revive(
+                rig.hub.main(),
+                plan,
+                launch,
+                transcript,
+                "go on".to_owned(),
+                DeliveryKind::Steer,
+            )
+            .unwrap();
+        // The parent is the agent that started it, and the run reaches it.
+        let to = rig.hub.resolve(id, "parent").unwrap();
+        assert_eq!(to, rig.hub.main());
+        let ack = rig
+            .hub
+            .send(id, to, "the result".to_owned(), DeliveryKind::Steer)
+            .unwrap();
+        assert!(!ack.held);
+    }
+
+    /// A remembered run that is revived twice still reaches its parent: the
+    /// second revive must not leave the run behind.
+    #[tokio::test]
+    async fn a_remembered_run_revived_twice_can_send_to_its_parent() {
+        let script = Script::new(vec![(
+            CHILD,
+            vec![
+                Step::Reply(reply("first answer")),
+                Step::Reply(reply("second answer")),
+            ],
+        )]);
+        let (rig, _dir) = journaled(&script, UnitLimits::default());
+        let spec = AgentSpec {
+            prompt: String::new(),
+            subagent_type: "general".into(),
+            model_tier: None,
+            thinking: None,
+            output_schema: None,
+            fork: false,
+            one_shot: true,
+            timeout_secs: 600,
+        };
+        let history = vec![text_message(
+            Role::User,
+            &format!("{CHILD} the first question"),
+        )];
+        let id = rig
+            .hub
+            .remember_run("ag-lost01", "lost", spec, rig.hub.main(), history)
+            .unwrap();
+        for round in 0..2 {
+            let plan = rig
+                .hub
+                .revive_plan(rig.hub.main(), id)
+                .unwrap()
+                .expect("a remembered run is revivable");
+            let transcript = rig.hub.load_transcript(plan.handle.as_str()).unwrap();
+            let launch = AgentLaunch::prepare(&rig.ctx, &plan.spec).await.unwrap();
+            rig.hub
+                .revive(
+                    rig.hub.main(),
+                    plan,
+                    launch,
+                    transcript,
+                    format!("round {round}"),
+                    DeliveryKind::Steer,
+                )
+                .unwrap();
+            // The run works and reports to its parent.
+            let to = rig.hub.resolve(id, "parent").unwrap();
+            assert_eq!(to, rig.hub.main());
+            rig.hub
+                .send(id, to, format!("the result {round}"), DeliveryKind::Steer)
+                .unwrap();
+            let view = settle(&rig, id).await;
+            assert_eq!(done_reason(&view), DoneReason::Completed);
+        }
+    }
+
+    /// A remembered run reports to its parent with the `send` tool: the tool
+    /// sends as the run, not as the user who resumed it.
+    #[tokio::test]
+    async fn a_remembered_run_sends_its_result_to_its_parent() {
+        let script = Script::new(vec![(
+            CHILD,
+            vec![
+                Step::Reply(tool_use(
+                    "call_1",
+                    "send",
+                    json!({"to": "parent", "message": "the result"}),
+                )),
+                Step::Reply(reply("sent")),
+            ],
+        )]);
+        let (rig, _dir) = journaled(&script, UnitLimits::default());
+        let spec = AgentSpec {
+            prompt: String::new(),
+            subagent_type: "general".into(),
+            model_tier: None,
+            thinking: None,
+            output_schema: None,
+            fork: false,
+            one_shot: true,
+            timeout_secs: 600,
+        };
+        let history = vec![text_message(
+            Role::User,
+            &format!("{CHILD} the first question"),
+        )];
+        let id = rig
+            .hub
+            .remember_run("ag-lost01", "lost", spec, rig.hub.main(), history)
+            .unwrap();
+        let plan = rig
+            .hub
+            .revive_plan(rig.hub.main(), id)
+            .unwrap()
+            .expect("a remembered run is revivable");
+        let transcript = rig.hub.load_transcript(plan.handle.as_str()).unwrap();
+        let launch = AgentLaunch::prepare(&rig.ctx, &plan.spec).await.unwrap();
+        rig.hub
+            .revive(
+                rig.hub.main(),
+                plan,
+                launch,
+                transcript,
+                "go on".to_owned(),
+                DeliveryKind::Steer,
+            )
+            .unwrap();
+        let view = settle(&rig, id).await;
+        assert_eq!(done_reason(&view), DoneReason::Completed);
+        assert!(
+            rig.hub
+                .inbox_of(rig.hub.main())
+                .is_some_and(|inbox| !inbox.is_empty()),
+            "the result reached the parent"
+        );
+    }
+
+    /// A run that was revived while the force-settle timer of its stop was
+    /// still waiting is not ended by that timer: the timer watches the run it
+    /// started for, and the revived run is a different one.
+    #[tokio::test]
+    async fn a_revived_run_is_not_force_settled_by_the_old_timer() {
+        let script = Script::new(vec![(CHILD, vec![Step::Reply(reply("the answer"))])]);
+        let (rig, _dir) = journaled(&script, UnitLimits::default());
+        let ack = spawn(&rig, CHILD, json!({"one_shot": true})).await;
+        settle(&rig, ack.id).await;
+        // The run a stop of this run would watch.
+        let watched = rig.hub.table().agents.get(&ack.id).cloned().unwrap();
+        // The run is revived: a new one takes its place, and it works.
+        revive(&rig, ack.id, "go on").await.unwrap();
+        assert_eq!(rig.hub.get(ack.id).unwrap().state.label(), "running");
+        // The old timer fires and must leave the revived run alone.
+        rig.hub.force_settle_run(ack.id, &watched);
+        assert_eq!(
+            rig.hub.get(ack.id).unwrap().state.label(),
+            "running",
+            "the force settle of the stopped run ended the revived one"
+        );
+    }
+
+    /// The user typing in a run's tab is the UI's path into the hub: the
+    /// revive is asked for the user, not for a run.
+    #[tokio::test]
+    async fn the_user_can_revive_a_finished_agent() {
+        let script = Script::new(vec![(
+            CHILD,
+            vec![
+                Step::Reply(reply("first answer")),
+                Step::Reply(reply("second answer")),
+            ],
+        )]);
+        let (rig, _dir) = journaled(&script, UnitLimits::default());
+        let ack = spawn(&rig, CHILD, json!({"one_shot": true})).await;
+        assert_eq!(
+            done_reason(&settle(&rig, ack.id).await),
+            DoneReason::Completed
+        );
+        let user = rig.hub.user();
+        let plan = rig
+            .hub
+            .revive_plan(user, ack.id)
+            .unwrap()
+            .expect("a finished agent is revivable");
+        let transcript = rig.hub.load_transcript(plan.handle.as_str()).unwrap();
+        let launch = AgentLaunch::prepare(&rig.ctx, &plan.spec).await.unwrap();
+        let sent = rig
+            .hub
+            .revive(
+                user,
+                plan,
+                launch,
+                transcript,
+                "resume please".to_owned(),
+                DeliveryKind::Steer,
+            )
+            .unwrap();
+        assert_eq!(sent.state, "revived");
+        let view = settle(&rig, ack.id).await;
+        assert_eq!(view.result.unwrap().summary, "second answer");
+        let second = seen_text(&script, CHILD).remove(1);
+        assert!(
+            second.contains("resume please"),
+            "message delivered: {second}"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_transcript_is_not_revivable() {
+        let script = Script::new(vec![(CHILD, vec![Step::Hang])]);
+        let (rig, dir) = journaled(&script, UnitLimits::default());
+        let ack = spawn(&rig, CHILD, json!({})).await;
+        await_requests(&script, CHILD, 1).await;
+        stop(&rig, ack.id).await;
+        let path = maki_storage::runs::transcript_path(&dir, ack.handle.as_str());
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(
+            rig.hub.revive_plan(rig.hub.main(), ack.id).unwrap_err(),
+            UnitError::RecipientTerminal
+        );
+    }
+
+    #[tokio::test]
+    async fn spec_restored_model_tools_schema() {
+        let script = Script::new(vec![(CHILD, vec![Step::Reply(reply("ok"))])]);
+        let (rig, _dir) = journaled(&script, UnitLimits::default());
+        let schema = json!({"type": "object", "properties": {"n": {"type": "integer"}}});
+        let req = agent_req(
+            CHILD,
+            json!({
+                "subagent_type": "research",
+                "output_schema": schema,
+                "thinking": "off",
+                "timeout_secs": 90,
+                "one_shot": false,
+            }),
+        );
+        let spec = match req.clone().into_kind().unwrap() {
+            UnitKind::Agent(spec) => spec,
+            UnitKind::Shell(_) => unreachable!(),
+        };
+        let unit = Unit {
+            id: UnitId::new(),
+            handle: UnitHandle("ag-spec01".into()),
+            name: UnitName("spec".into()),
+            owner: rig.hub.main(),
+            parent: rig.hub.main(),
+            depth: 1,
+            kind: UnitKind::Agent(spec.clone()),
+            description: "d".into(),
+            origin_tool_use_id: None,
+            state: UnitState::Queued,
+            created_at: SystemTime::now(),
+            started_at: None,
+            finished_at: None,
+            last_activity: Instant::now(),
+            progress: None,
+            usage: Default::default(),
+            cost: 0.0,
+            notice_policy: NoticePolicy::Wake,
+        };
+        let rec = super::super::journal::spawn_record(&unit, Some("anthropic/some-model"));
+        assert_eq!(rec.spec["model"], "anthropic/some-model");
+        let back = super::super::journal::agent_spec_from_json(&rec.spec);
+        assert_eq!(back.subagent_type, "research");
+        assert_eq!(back.output_schema, spec.output_schema);
+        assert_eq!(back.thinking, spec.thinking);
+        assert_eq!(back.timeout_secs, 90);
+        assert_eq!(back.prompt, CHILD);
+        assert_eq!(back.model_tier, spec.model_tier);
+        // And the rebuilt launch carries the structured-output tool of the schema.
+        let launch = AgentLaunch::prepare(&rig.ctx, &back).await.unwrap();
+        assert!(launch.has_schema());
+        assert_eq!(launch.model_spec, rig.ctx.model.spec());
+    }
+
+    #[tokio::test]
+    async fn evicted_tombstone_still_revivable() {
+        let script = Script::new(vec![
+            (
+                "OLD-TASK",
+                vec![
+                    Step::Reply(reply("old one")),
+                    Step::Reply(reply("old again")),
+                ],
+            ),
+            ("NEW-TASK", vec![Step::Reply(reply("new one"))]),
+        ]);
+        let limits = UnitLimits {
+            max_retained: 1,
+            ..UnitLimits::default()
+        };
+        let (rig, _dir) = journaled(&script, limits);
+        let old = spawn_as(
+            &rig,
+            rig.hub.main(),
+            agent_req("OLD-TASK", json!({"name": "oldie"})),
+        )
+        .await;
+        settle(&rig, old.id).await;
+        let new = spawn_as(&rig, rig.hub.main(), agent_req("NEW-TASK", json!({}))).await;
+        settle(&rig, new.id).await;
+        stop(&rig, old.id).await;
+        stop(&rig, new.id).await;
+        rig.hub.sweep();
+        assert!(rig.hub.get(old.id).is_none(), "the oldest left the table");
+        assert!(rig.hub.get(new.id).is_some());
+        let tombs = rig.hub.tombstones(rig.hub.main());
+        assert_eq!(tombs.len(), 1);
+        assert_eq!(tombs[0].handle, old.handle);
+        assert!(tombs[0].revivable);
+        // By name, through the same path the send tool takes.
+        let id = rig.hub.resolve(rig.hub.main(), "oldie").unwrap();
+        assert_eq!(id, old.id);
+        revive(&rig, id, "back again").await.unwrap();
+        let view = settle(&rig, id).await;
+        assert_eq!(view.result.unwrap().summary, "old again");
+        assert!(
+            rig.hub
+                .tombstones(rig.hub.main())
+                .iter()
+                .all(|t| t.id != id)
+        );
+        // Session accounting still counts it.
+        assert!(rig.hub.session_usage().0 >= 2);
+    }
+
+    #[tokio::test]
+    async fn idle_timeout_and_max_idle_evict_silently() {
+        let script = Script::new(vec![
+            ("A-TASK", vec![Step::Reply(reply("a"))]),
+            ("B-TASK", vec![Step::Reply(reply("b"))]),
+        ]);
+        let limits = UnitLimits {
+            max_idle: 1,
+            idle_timeout: Duration::from_secs(60),
+            ..UnitLimits::default()
+        };
+        let (rig, _dir) = journaled(&script, limits);
+        let a = spawn_as(&rig, rig.hub.main(), agent_req("A-TASK", json!({}))).await;
+        settle(&rig, a.id).await;
+        let notices = rig.hub.pending_notices(rig.hub.main()).len();
+        rig.clock.advance(Duration::from_secs(1));
+        let b = spawn_as(&rig, rig.hub.main(), agent_req("B-TASK", json!({}))).await;
+        settle(&rig, b.id).await;
+        // Two idle agents, room for one: the least recently active leaves.
+        rig.hub.sweep();
+        assert_eq!(
+            done_reason(&rig.hub.get(a.id).unwrap()),
+            DoneReason::Completed
+        );
+        assert_eq!(rig.hub.get(b.id).unwrap().state.label(), "idle");
+        // The timeout takes the other one.
+        rig.clock.advance(Duration::from_secs(61));
+        rig.hub.sweep();
+        assert_eq!(
+            done_reason(&rig.hub.get(b.id).unwrap()),
+            DoneReason::Completed
+        );
+        // Nothing was said about either leaving: only the idle notices of the turns.
+        let after = rig.hub.pending_notices(rig.hub.main());
+        assert!(
+            after.len() <= notices + 1,
+            "no settlement notice: {after:?}"
+        );
+        assert!(
+            !after.iter().any(|n| n.text.contains("completed")),
+            "{after:?}"
+        );
+        // Both come back when messaged.
+        revive_and_check(&rig, &script, a.id).await;
+    }
+
+    /// Runs the real `send` tool as `main`.
+    async fn send_tool(rig: &Rig, to: &str, message: &str) -> Result<String, String> {
+        let tool = crate::tools::runs::all()
+            .into_iter()
+            .find(|t| t.name() == "send")
+            .unwrap();
+        let input = json!({"to": to, "message": message});
+        let invocation = tool.parse(&input).map_err(|e| e.to_string())?;
+        match invocation.execute(&rig.ctx).await.output? {
+            crate::ToolOutput::Plain(t) => Ok(t.text),
+            other => panic!("unexpected output {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn send_tool_revives_finished_and_evicted_agents() {
+        let script = Script::new(vec![
+            ("B-TASK", vec![Step::Reply(reply("b"))]),
+            (
+                CHILD,
+                vec![
+                    Step::Reply(reply("first answer")),
+                    Step::Reply(reply("second answer")),
+                    Step::Reply(reply("third answer")),
+                ],
+            ),
+        ]);
+        let limits = UnitLimits {
+            max_retained: 1,
+            ..UnitLimits::default()
+        };
+        let (rig, _dir) = journaled(&script, limits);
+        let ack = spawn(&rig, CHILD, json!({})).await;
+        settle(&rig, ack.id).await;
+        stop(&rig, ack.id).await;
+        // Stopped, so a finished run; by handle.
+        let out = send_tool(&rig, ack.handle.as_str(), "follow up please")
+            .await
+            .unwrap();
+        assert!(out.contains("revived"), "{out}");
+        assert_eq!(settle(&rig, ack.id).await.state.label(), "idle");
+        assert!(seen_text(&script, CHILD)[1].contains("first answer"));
+        // Evicted to a tombstone (a newer finished run pushes it out), then by name.
+        stop(&rig, ack.id).await;
+        let b = spawn(&rig, "B-TASK", json!({})).await;
+        settle(&rig, b.id).await;
+        stop(&rig, b.id).await;
+        rig.hub.sweep(); // the settle's own sweep may still be running
+        assert!(rig.hub.get(ack.id).is_none(), "tombstoned");
+        let name = rig.hub.tombstones(rig.hub.main())[0].name.to_string();
+        let out = send_tool(&rig, &name, "once more").await.unwrap();
+        assert!(out.contains("revived"), "{out}");
+        assert_eq!(settle(&rig, ack.id).await.state.label(), "idle");
+        assert!(seen_text(&script, CHILD)[2].contains("second answer"));
+        // A second send now goes to the live run, not another revive.
+        let out = send_tool(&rig, &name, "and again").await.unwrap();
+        assert!(!out.contains("revived"), "{out}");
+    }
+
+    async fn revive_and_check(rig: &Rig, script: &Arc<Script>, id: UnitId) {
+        // The route has no step left, so the revived run just hangs on its
+        // request: it is live again, which is all this checks.
+        revive(rig, id, "wake up").await.unwrap();
+        await_requests(script, "A-TASK", 2).await;
+        assert!(matches!(rig.hub.get(id).unwrap().state, UnitState::Running));
+        stop(rig, id).await;
+    }
+
+    #[tokio::test]
+    async fn pending_messages_redelivered() {
+        let script = Script::new(vec![(CHILD, vec![Step::Reply(reply("caught up"))])]);
+        let rig = rig(&script);
+        let dir = rig.dir.path().join("journal");
+        std::fs::create_dir_all(&dir).unwrap();
+        // What a dead process left: a running agent with one turn saved and a
+        // message it never read.
+        let journal = RunJournal::open_in(dir.clone(), JournalOptions::default()).unwrap();
+        journal.append(JournalRecord::Spawn(SpawnRec {
+            id: UnitId::new().0.to_string(),
+            handle: "ag-lost01".into(),
+            name: "lostone".into(),
+            kind: "agent".into(),
+            owner: rig.hub.main().0.to_string(),
+            parent: rig.hub.main().0.to_string(),
+            depth: 1,
+            desc: "d".into(),
+            notify: "wake".into(),
+            spec: json!({"prompt": CHILD, "subagent_type": "general", "one_shot": false, "timeout_secs": 600}),
+            ..SpawnRec::default()
+        }));
+        journal.append(JournalRecord::Msg(MsgRec {
+            id: "9".into(),
+            from: "main".into(),
+            to: "ag-lost01".into(),
+            kind: "steer".into(),
+            stage: "accepted".into(),
+            body: Some("unread before the crash".into()),
+            ..MsgRec::default()
+        }));
+        journal.flush();
+        drop(journal);
+        transcript::append(
+            &maki_storage::runs::transcript_path(&dir, "ag-lost01"),
+            &[
+                text_message(Role::User, CHILD),
+                text_message(Role::Assistant, "earlier work"),
+            ],
+        )
+        .unwrap();
+        rig.hub.attach_journal(Arc::new(
+            RunJournal::open_in(dir.clone(), JournalOptions::default()).unwrap(),
+        ));
+        let report = rig.hub.reconcile();
+        assert_eq!(report.lost, vec!["ag-lost01".to_owned()]);
+        let id = rig.hub.resolve(rig.hub.main(), "lostone").unwrap();
+        assert_eq!(rig.hub.get(id).unwrap().state.label(), "lost");
+        revive(&rig, id, "are you there").await.unwrap();
+        let view = settle(&rig, id).await;
+        assert_eq!(view.result.unwrap().summary, "caught up");
+        let seen = seen_text(&script, CHILD).remove(0);
+        assert!(seen.contains("earlier work"), "{seen}");
+        assert!(seen.contains("unread before the crash"), "{seen}");
+        assert!(seen.contains("are you there"), "{seen}");
+        // The old record is settled and a crash now loses the run again.
+        let replay = rig.hub.journal.get().unwrap().replay();
+        let run = replay
+            .runs
+            .iter()
+            .find(|r| r.spawn.handle == "ag-lost01")
+            .unwrap();
+        assert!(run.term.is_none(), "revived runs are unfinished");
+        assert!(
+            replay
+                .messages
+                .iter()
+                .all(|m| m.rec.id != "9" || !m.pending())
+        );
+    }
+
+    /// Writes a finished agent and its transcript to the rig's journal dir
+    /// as an earlier process would have, and attaches the journal.
+    fn adopt_finished_agent(rig: &Rig) {
+        let dir = rig.dir.path().join("journal");
+        std::fs::create_dir_all(&dir).unwrap();
+        let journal = RunJournal::open_in(dir.clone(), JournalOptions::default()).unwrap();
+        journal.append(JournalRecord::Spawn(SpawnRec {
+            id: UnitId::new().0.to_string(),
+            handle: "ag-done01".into(),
+            name: "doneone".into(),
+            kind: "agent".into(),
+            owner: rig.hub.main().0.to_string(),
+            parent: rig.hub.main().0.to_string(),
+            depth: 1,
+            notify: "wake".into(),
+            spec: json!({"prompt": CHILD, "subagent_type": "general", "one_shot": false, "timeout_secs": 600}),
+            ..SpawnRec::default()
+        }));
+        journal.append(JournalRecord::Term(maki_storage::runs::TermRec {
+            handle: "ag-done01".into(),
+            reason: "completed".into(),
+            ..Default::default()
+        }));
+        journal.flush();
+        drop(journal);
+        transcript::append(
+            &maki_storage::runs::transcript_path(&dir, "ag-done01"),
+            &[
+                text_message(Role::User, CHILD),
+                text_message(Role::Assistant, "ok"),
+            ],
+        )
+        .unwrap();
+        rig.hub.attach_journal(Arc::new(
+            RunJournal::open_in(dir, JournalOptions::default()).unwrap(),
+        ));
+    }
+
+    #[tokio::test]
+    async fn finished_runs_of_an_earlier_process_are_tombstones() {
+        let script = Script::new(vec![(CHILD, vec![Step::Reply(reply("again"))])]);
+        let rig = rig(&script);
+        adopt_finished_agent(&rig);
+        assert!(rig.hub.reconcile().lost.is_empty());
+        let tombs = rig.hub.tombstones(rig.hub.main());
+        assert_eq!(tombs.len(), 1);
+        assert_eq!(tombs[0].reason, "completed");
+        let id = tombs[0].id;
+        revive(&rig, id, "hello again").await.unwrap();
+        assert_eq!(settle(&rig, id).await.result.unwrap().summary, "again");
+    }
+
+    #[tokio::test]
+    async fn adopted_tombstones_do_not_use_up_the_session_run_cap() {
+        let script = Script::new(vec![(CHILD, vec![Step::Reply(reply("fine"))])]);
+        let rig = rig_with(
+            &script,
+            UnitLimits {
+                session_max_runs: 1,
+                ..UnitLimits::default()
+            },
+        );
+        adopt_finished_agent(&rig);
+        assert!(rig.hub.reconcile().lost.is_empty());
+        assert_eq!(rig.hub.tombstones(rig.hub.main()).len(), 1);
+        // One spawn of this process is allowed; the earlier run does not count.
+        let ack = spawn(&rig, CHILD, json!({})).await;
+        assert_eq!(settle(&rig, ack.id).await.result.unwrap().summary, "fine");
+        // The cap itself holds, and it is what bounds tombstones made here.
+        let spec = match agent_req(CHILD, json!({})).into_kind().unwrap() {
+            UnitKind::Agent(spec) => spec,
+            UnitKind::Shell(_) => unreachable!(),
+        };
+        let launch = AgentLaunch::prepare(&rig.ctx, &spec).await.unwrap();
+        let err = rig
+            .hub
+            .spawn_agent(rig.hub.main(), agent_req(CHILD, json!({})), launch)
+            .unwrap_err();
+        assert_eq!(err, UnitError::SpawnLimit);
+    }
+}
+
+/// Random operations and fault injection over real agent runs. Nothing is
+/// scripted per run: a seeded provider answers, hangs, yields or fails, and
+/// the tests only check what must hold whatever happened.
+mod chaos {
+    use std::collections::{HashMap, HashSet};
+    use std::time::Instant;
+
+    use maki_storage::runs::{JournalOptions, RunJournal};
+
+    use super::*;
+
+    const SEEDS: u64 = 12;
+    const OPS: usize = 150;
+    const MAX_AGENTS: u8 = 3;
+    const WATCHDOG: Duration = Duration::from_secs(180);
+
+    struct Chaos {
+        state: Mutex<u64>,
+        requests: Mutex<usize>,
+    }
+
+    impl Chaos {
+        fn new(seed: u64) -> Arc<Self> {
+            Arc::new(Self {
+                state: Mutex::new(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1),
+                requests: Mutex::new(0),
+            })
+        }
+    }
+
+    fn next(state: &Mutex<u64>) -> u64 {
+        let mut s = state.lock().unwrap();
+        *s ^= *s << 13;
+        *s ^= *s >> 7;
+        *s ^= *s << 17;
+        *s
+    }
+
+    impl Provider for Chaos {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            _: &'a [Message],
+            _: &'a str,
+            _: &'a Value,
+            _: &'a UnboundedSender<ProviderEvent>,
+            _: RequestOptions,
+            _: Option<&'a SessionRef>,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            let roll = next(&self.state) % 100;
+            *self.requests.lock().unwrap() += 1;
+            Box::pin(async move {
+                match roll {
+                    0..=49 => Ok(reply("done")),
+                    50..=69 => {
+                        tokio::task::yield_now().await;
+                        Ok(reply("done after a yield"))
+                    }
+                    70..=89 => std::future::pending().await,
+                    _ => Err(AgentError::Config {
+                        message: "injected".into(),
+                    }),
+                }
+            })
+        }
+
+        fn list_models(&self) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, AgentError>> {
+            Box::pin(async { unimplemented!() })
+        }
+    }
+
+    fn limits() -> UnitLimits {
+        UnitLimits {
+            max_agents: MAX_AGENTS,
+            max_children_per_run: 2,
+            max_depth: 2,
+            max_queue: 4,
+            spawn_per_minute: u8::MAX,
+            session_max_runs: u16::MAX,
+            ..UnitLimits::default()
+        }
+    }
+
+    async fn revive_by_hand(rig: &Rig, to: UnitId) -> bool {
+        let main = rig.hub.main();
+        let Ok(Some(plan)) = rig.hub.revive_plan(main, to) else {
+            return false;
+        };
+        let Some(history) = rig.hub.load_transcript(plan.handle.as_str()) else {
+            return false;
+        };
+        let Ok(launch) = AgentLaunch::prepare(&rig.ctx, &plan.spec).await else {
+            return false;
+        };
+        rig.hub
+            .revive(
+                main,
+                plan,
+                launch,
+                history,
+                "again".into(),
+                DeliveryKind::Steer,
+            )
+            .is_ok()
+    }
+
+    /// Fails loudly instead of hanging the suite when the hub deadlocks.
+    struct Watchdog(flume::Sender<()>);
+
+    fn watchdog(what: String) -> Watchdog {
+        let (tx, rx) = flume::bounded::<()>(1);
+        std::thread::spawn(move || {
+            if matches!(
+                rx.recv_timeout(WATCHDOG),
+                Err(flume::RecvTimeoutError::Timeout)
+            ) {
+                eprintln!("deadlock: {what}");
+                std::process::abort();
+            }
+        });
+        Watchdog(tx)
+    }
+
+    impl Drop for Watchdog {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
+
+    /// Every observation of the table must be reachable from the last one:
+    /// a settled run stays settled unless it was revived, and a run that has
+    /// started never goes back to the queue.
+    fn check_transitions(
+        seen: &mut HashMap<UnitId, &'static str>,
+        revived: &HashSet<UnitId>,
+        rig: &Rig,
+        seed: u64,
+    ) {
+        for view in rig.hub.list(rig.hub.main(), Scope::All) {
+            let now = view.state.label();
+            let done_now = view.state.is_done();
+            if let Some(&before) = seen.get(&view.id) {
+                let was_done = !matches!(before, "queued" | "running" | "idle" | "stopping");
+                if was_done && !done_now {
+                    assert!(
+                        revived.contains(&view.id),
+                        "seed {seed}: {} went from {before} to {now} without a revive",
+                        view.handle
+                    );
+                }
+            }
+            seen.insert(view.id, now);
+        }
+    }
+
+    async fn one_sequence(seed: u64) {
+        let chaos = Chaos::new(seed);
+        let mut ctx_rig = {
+            let script = Script::new(vec![]);
+            rig_with(&script, limits())
+        };
+        ctx_rig.ctx.provider = chaos.clone();
+        let rig = ctx_rig;
+        let dir = rig.dir.path().join("journal");
+        std::fs::create_dir_all(&dir).unwrap();
+        rig.hub.attach_journal(Arc::new(
+            RunJournal::open_in(dir, JournalOptions::default()).unwrap(),
+        ));
+        let _guard = watchdog(format!("seed {seed}"));
+        let rng = Mutex::new(seed.wrapping_add(7).wrapping_mul(0xD1B5_4A32_D192_ED03) | 1);
+        let pick = |n: usize| (next(&rng) % n.max(1) as u64) as usize;
+        let mut seen = HashMap::new();
+        let mut revived = HashSet::new();
+        let mut ids: Vec<UnitId> = Vec::new();
+        for n in 0..OPS {
+            let live: Vec<UnitId> = rig
+                .hub
+                .list(rig.hub.main(), Scope::All)
+                .into_iter()
+                .filter(|u| !u.state.is_done() && u.kind == RunKind::Agent)
+                .map(|u| u.id)
+                .collect();
+            match pick(10) {
+                0..=3 => {
+                    // Under main, or under a random live agent to hit the depth
+                    // and fan-out caps.
+                    let caller = match live.is_empty() || pick(2) == 0 {
+                        true => rig.hub.main(),
+                        false => live[pick(live.len())],
+                    };
+                    let req = agent_req(&format!("op {n}"), json!({}));
+                    let UnitKind::Agent(spec) = req.clone().into_kind().unwrap() else {
+                        unreachable!()
+                    };
+                    if let Ok(launch) = AgentLaunch::prepare(&rig.ctx, &spec).await
+                        && let Ok(ack) = rig.hub.spawn_agent(caller, req, launch)
+                    {
+                        ids.push(ack.id);
+                    }
+                }
+                4 | 5 if !ids.is_empty() => {
+                    let to = ids[pick(ids.len())];
+                    let kind = match pick(2) {
+                        0 => DeliveryKind::Steer,
+                        _ => DeliveryKind::Followup,
+                    };
+                    let _ = rig.hub.send(rig.hub.main(), to, format!("m{n}"), kind);
+                }
+                6 if !ids.is_empty() => {
+                    let opts = StopOpts {
+                        soft: pick(2) == 0,
+                        detach: false,
+                    };
+                    rig.hub.stop(rig.hub.main(), &[ids[pick(ids.len())]], opts);
+                }
+                7 if !ids.is_empty() => {
+                    // A bounded wait: the manual clock never fires it, so cancel does.
+                    let (trigger, cancel) = CancelToken::new();
+                    let targets = [ids[pick(ids.len())]];
+                    let waiter = rig.hub.wait(
+                        rig.hub.main(),
+                        &targets,
+                        WaitMode::Any,
+                        Duration::from_secs(60),
+                        &cancel,
+                    );
+                    tokio::select! {
+                        biased;
+                        _ = waiter => {}
+                        _ = async {
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                            trigger.cancel();
+                            std::future::pending::<()>().await
+                        } => {}
+                    }
+                }
+                8 if !ids.is_empty() => {
+                    let id = ids[pick(ids.len())];
+                    if revive_by_hand(&rig, id).await {
+                        revived.insert(id);
+                    }
+                }
+                _ => tokio::task::yield_now().await,
+            }
+            assert!(
+                rig.hub.slots_in_use() <= usize::from(MAX_AGENTS),
+                "seed {seed}: {} slots in use",
+                rig.hub.slots_in_use()
+            );
+            check_transitions(&mut seen, &revived, &rig, seed);
+        }
+        // Everything stops, everything settles, nothing holds a slot.
+        let all: Vec<UnitId> = rig
+            .hub
+            .list(rig.hub.main(), Scope::All)
+            .into_iter()
+            .map(|u| u.id)
+            .collect();
+        for _ in 0..4 {
+            rig.hub.stop(rig.hub.main(), &all, StopOpts::default());
+            let views = rig
+                .hub
+                .wait(
+                    rig.hub.main(),
+                    &all,
+                    WaitMode::All,
+                    Duration::from_secs(10_000_000),
+                    &CancelToken::none(),
+                )
+                .await;
+            if views
+                .iter()
+                .all(|v| v.state.is_done() || v.state.label() == "idle")
+            {
+                break;
+            }
+        }
+        let tail: Vec<UnitId> = rig
+            .hub
+            .list(rig.hub.main(), Scope::All)
+            .into_iter()
+            .filter(|u| !u.state.is_done())
+            .map(|u| u.id)
+            .collect();
+        rig.hub.stop(rig.hub.main(), &tail, StopOpts::default());
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while rig
+            .hub
+            .list(rig.hub.main(), Scope::All)
+            .iter()
+            .any(|u| !u.state.is_done())
+        {
+            assert!(Instant::now() < deadline, "seed {seed}: runs never settled");
+            rig.clock.advance(Duration::from_secs(6));
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        check_transitions(&mut seen, &revived, &rig, seed);
+        assert_eq!(rig.hub.slots_in_use(), 0, "seed {seed}: leaked slots");
+        let mut finished: HashMap<String, usize> = HashMap::new();
+        {
+            let mut events = rig.events.lock().await;
+            for e in drain_events(&mut events) {
+                if let AgentEvent::RunFinished { handle, .. } = e.event {
+                    *finished.entry(handle).or_default() += 1;
+                }
+            }
+        }
+        for view in rig.hub.list(rig.hub.main(), Scope::All) {
+            let revives = usize::from(revived.contains(&view.id));
+            let n = finished.get(view.handle.as_str()).copied().unwrap_or(0);
+            // A revive can settle again, so the bound is per revive in the worst case.
+            assert!(
+                n <= 1 + revives * OPS,
+                "seed {seed}: {} finished {n} times",
+                view.handle
+            );
+        }
+        // Dropping the rig drops the hub; any task still holding it leaks it.
+        let weak = Arc::downgrade(&rig.hub);
+        rig.hub.shutdown();
+        drop(rig);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while weak.strong_count() > 0 {
+            assert!(
+                Instant::now() < deadline,
+                "seed {seed}: a task keeps the hub alive"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn invariants_hold_over_random_ops() {
+        for seed in 1..=SEEDS {
+            one_sequence(seed).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_error_mid_run_settles_failed_and_frees_the_slot() {
+        let script = Script::new(vec![
+            (
+                CHILD,
+                vec![
+                    Step::Reply(tool_use("t1", "runs", json!({}))),
+                    Step::Fail("boom"),
+                ],
+            ),
+            ("AFTER-TASK", vec![Step::Reply(reply("fine"))]),
+        ]);
+        let rig = rig(&script);
+        let ack = spawn(&rig, CHILD, json!({})).await;
+        let view = settle(&rig, ack.id).await;
+        let UnitState::Done(term) = &view.state else {
+            panic!("not done: {}", view.state.label());
+        };
+        assert_eq!(term.reason, DoneReason::Failed);
+        assert!(term.detail.as_deref().unwrap_or("").contains("boom"));
+        assert_eq!(rig.hub.slots_in_use(), 0);
+        // The hub keeps working after a failed run.
+        let next = spawn(&rig, "AFTER-TASK", json!({})).await;
+        assert_eq!(settle(&rig, next.id).await.result.unwrap().summary, "fine");
+    }
+
+    /// Twenty agents against `max_agents` 4: the rest queue, the pool never
+    /// holds more than four, every queued agent starts as a slot frees, and all
+    /// twenty complete.
+    #[tokio::test]
+    async fn twenty_agent_fan_out_with_four_slots_queues_and_completes() {
+        const N: usize = 20;
+        const SLOTS: usize = 4;
+        let names: Vec<&'static str> = (0..N)
+            .map(|i| &*Box::leak(format!("FAN-{i:02}").into_boxed_str()))
+            .collect();
+        let mut gates = Vec::new();
+        let mut routes = Vec::new();
+        for name in &names {
+            let (tx, rx) = flume::unbounded::<()>();
+            gates.push(tx);
+            routes.push((*name, vec![Step::Gate(rx, reply(&format!("done {name}")))]));
+        }
+        let script = Script::new(routes);
+        let rig = rig_with(
+            &script,
+            UnitLimits {
+                max_agents: SLOTS as u8,
+                max_children_per_run: 30,
+                max_queue: 50,
+                spawn_per_minute: 100,
+                session_max_runs: 64,
+                ..UnitLimits::default()
+            },
+        );
+        let mut ids = Vec::new();
+        for name in &names {
+            let ack = spawn(&rig, name, json!({"one_shot": true})).await;
+            script.watch(name, &rig.hub, ack.id);
+            ids.push(ack.id);
+        }
+        let started = async |n: usize| {
+            for _ in 0..50_000_000u64 {
+                if script.order().len() >= n {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+            panic!("only {} of {n} agents started", script.order().len());
+        };
+        started(SLOTS).await;
+        // Give any wrongly admitted fifth agent a chance to show up.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(script.order().len(), SLOTS, "queued agents ran early");
+        assert_eq!(rig.hub.slots_in_use(), SLOTS);
+        assert_eq!(rig.hub.table().pool.queued_len(), N - SLOTS);
+        let index_of = |route: &str| names.iter().position(|n| *n == route).unwrap();
+        // Finish them one at a time; each finish promotes exactly one.
+        for step in 0..N - SLOTS {
+            let route = script.order()[step].clone();
+            gates[index_of(&route)].send(()).unwrap();
+            started(SLOTS + step + 1).await;
+            assert!(rig.hub.slots_in_use() <= SLOTS);
+        }
+        for gate in &gates {
+            let _ = gate.send(());
+        }
+        for (id, name) in ids.iter().zip(&names) {
+            let view = settle(&rig, *id).await;
+            let UnitState::Done(term) = &view.state else {
+                panic!("{name} not done: {}", view.state.label());
+            };
+            assert_eq!(term.reason, DoneReason::Completed, "{name}");
+            assert_eq!(term.result.summary, format!("done {name}"));
+        }
+        assert_eq!(script.order().len(), N);
+        assert_eq!(rig.hub.slots_in_use(), 0);
+        assert_eq!(rig.hub.table().pool.queued_len(), 0);
+        script.assert_slots_held();
+    }
+
+    /// Any journal record after the clean mark voids it, so a running agent
+    /// must have written its end before `shutdown` writes the mark.
+    #[tokio::test]
+    async fn shutdown_writes_the_clean_mark_after_a_running_agent_ends() {
+        use maki_storage::runs::{JournalOptions, Replay, RunJournal};
+        let script = Script::new(vec![(CHILD, vec![Step::Hang])]);
+        let rig = rig(&script);
+        let dir = rig.dir.path().join("journal");
+        std::fs::create_dir_all(&dir).unwrap();
+        rig.hub.attach_journal(Arc::new(
+            RunJournal::open_in(dir.clone(), JournalOptions::default()).unwrap(),
+        ));
+        let ack = spawn(&rig, CHILD, json!({})).await;
+        await_requests(&script, CHILD, 1).await;
+        rig.hub.shutdown();
+        let replay = Replay::read(&dir);
+        assert!(replay.clean_mark, "a record followed the mark");
+        let run = replay
+            .runs
+            .iter()
+            .find(|r| r.spawn.handle == ack.handle.to_string())
+            .expect("the agent is in the journal");
+        assert_eq!(run.term.as_ref().unwrap().reason, "killed");
+    }
+
+    /// The runner blocks a worker thread inside the provider call, so the
+    /// test needs more than one of them.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn runner_ignoring_cancel_is_force_settled_once() {
+        let (release, blocked) = std::sync::mpsc::channel::<()>();
+        let script = Script::new(vec![(CHILD, vec![Step::Block(blocked)])]);
+        let rig = rig(&script);
+        let ack = spawn(&rig, CHILD, json!({})).await;
+        await_requests(&script, CHILD, 1).await;
+        rig.hub.stop(rig.hub.main(), &[ack.id], StopOpts::default());
+        // The runner is stuck inside the provider call and holds a thread, so
+        // the stop leaves the run `stopping`. The real timer (on its own
+        // thread) must still fire once the clock passes the deadline.
+        assert_eq!(rig.hub.get(ack.id).unwrap().state.label(), "stopping");
+        let started = std::time::Instant::now();
+        while rig.hub.get(ack.id).unwrap().state.label() == "stopping" {
+            rig.clock.advance(Duration::from_secs(6));
+            assert!(
+                started.elapsed() < Duration::from_secs(20),
+                "timer never fired"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let view = rig.hub.get(ack.id).unwrap();
+        let UnitState::Done(term) = &view.state else {
+            unreachable!()
+        };
+        assert_eq!(term.reason, DoneReason::Killed);
+        assert_eq!(term.detail.as_deref(), Some("forced"));
+        assert_eq!(rig.hub.slots_in_use(), 0);
+        // Releasing the runner afterwards must not settle it a second time.
+        release.send(()).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(finished_order(&rig).await.len(), 1);
+        let after = rig.hub.get(ack.id).unwrap();
+        assert_eq!(after.state.label(), "killed");
+    }
+}

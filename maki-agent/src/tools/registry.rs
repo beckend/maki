@@ -91,14 +91,32 @@ impl ToolAudience {
     }
 }
 
+/// Who a registered tool belongs to. MCP tools live in [`crate::mcp`] and
+/// never reach the registry, so a tool here comes from a Lua plugin or from
+/// Rust itself.
 #[derive(Clone, Debug)]
-pub struct ToolSource {
-    pub plugin: Arc<str>,
+pub enum ToolSource {
+    /// A tool a Lua plugin registered.
+    Lua { plugin: Arc<str> },
+    /// A Rust built-in, registered by `runs::sync_registration`.
+    Native,
 }
 
 impl ToolSource {
     pub fn as_log_field(&self) -> Cow<'static, str> {
-        Cow::Owned(format!("lua:{}", self.plugin))
+        match self {
+            Self::Lua { plugin } => Cow::Owned(format!("lua:{plugin}")),
+            Self::Native => Cow::Borrowed("native"),
+        }
+    }
+
+    /// The plugin a tool belongs to, `None` for a Rust built-in: no plugin
+    /// owns it, so no plugin may clear it.
+    fn plugin(&self) -> Option<&Arc<str>> {
+        match self {
+            Self::Lua { plugin } => Some(plugin),
+            Self::Native => None,
+        }
     }
 }
 
@@ -413,6 +431,39 @@ impl ToolRegistry {
         Ok(())
     }
 
+    /// All-or-nothing: a name clash rolls back the whole batch, so the
+    /// native run tools never end up half-registered.
+    pub fn register_many(
+        &self,
+        entries: impl IntoIterator<Item = (Arc<dyn Tool>, ToolSource)>,
+    ) -> Result<(), RegistryError> {
+        let entries: Vec<_> = entries.into_iter().collect();
+        let mut conflict = None;
+        self.tools.rcu(|current| {
+            conflict = None;
+            let mut next = Vec::clone(current);
+            for (tool, source) in &entries {
+                let name = tool.name();
+                if let Some(existing) = next.iter().find(|t| t.name() == name) {
+                    conflict = Some(RegistryError::NameConflict {
+                        name: name.to_owned(),
+                        existing: existing.source.as_log_field().into_owned(),
+                    });
+                    return Vec::clone(current);
+                }
+                next.push(RegisteredTool {
+                    tool: Arc::clone(tool),
+                    source: source.clone(),
+                });
+            }
+            next
+        });
+        if let Some(e) = conflict {
+            return Err(e);
+        }
+        Ok(())
+    }
+
     pub fn replace_plugin(
         &self,
         plugin: &str,
@@ -423,7 +474,9 @@ impl ToolRegistry {
             conflict = None;
             let mut next: Vec<RegisteredTool> = current
                 .iter()
-                .filter(|t| t.source.plugin.as_ref() != plugin)
+                .filter(
+                    |t| !matches!(&t.source, ToolSource::Lua { plugin: p } if p.as_ref() == plugin),
+                )
                 .cloned()
                 .collect();
             for (tool, source) in &new_entries {
@@ -448,15 +501,35 @@ impl ToolRegistry {
         Ok(())
     }
 
+    pub fn clear_native(&self) {
+        self.tools.rcu(|current| {
+            current
+                .iter()
+                .filter(|t| !matches!(t.source, ToolSource::Native))
+                .cloned()
+                .collect::<Vec<_>>()
+        });
+    }
+
+    /// Drops the tools of every Lua plugin. A Rust built-in belongs to no
+    /// plugin, so it stays: the native run tools outlive a plugin reload.
     pub fn clear_lua(&self) {
-        self.tools.store(Arc::default());
+        self.tools.rcu(|current| {
+            current
+                .iter()
+                .filter(|t| matches!(t.source, ToolSource::Native))
+                .cloned()
+                .collect::<Vec<_>>()
+        });
     }
 
     pub fn clear_plugin(&self, plugin: &str) {
         self.tools.rcu(|current| {
             current
                 .iter()
-                .filter(|t| t.source.plugin.as_ref() != plugin)
+                .filter(
+                    |t| !matches!(&t.source, ToolSource::Lua { plugin: p } if p.as_ref() == plugin),
+                )
                 .cloned()
                 .collect::<Vec<_>>()
         });
@@ -482,7 +555,9 @@ impl ToolRegistry {
         let tools = self.tools.load();
         let mut visible: BTreeMap<&Arc<str>, bool> = BTreeMap::new();
         for tool in tools.iter() {
-            *visible.entry(&tool.source.plugin).or_default() |= filter.matches(tool.name());
+            if let Some(plugin) = tool.source.plugin() {
+                *visible.entry(plugin).or_default() |= filter.matches(tool.name());
+            }
         }
         visible
             .into_iter()
@@ -605,7 +680,7 @@ mod tests {
     }
 
     fn lua_source(plugin: &str) -> ToolSource {
-        ToolSource {
+        ToolSource::Lua {
             plugin: plugin.into(),
         }
     }
@@ -709,7 +784,7 @@ mod tests {
             .unwrap();
 
         let entry = reg.get("mytool").unwrap();
-        assert_eq!(entry.source.plugin.as_ref(), "myplugin");
+        assert_eq!(entry.source.plugin().unwrap().as_ref(), "myplugin");
 
         reg.clear_plugin("myplugin");
         assert!(!reg.has("mytool"));
@@ -784,5 +859,100 @@ mod tests {
         let result: ToolExecResult = base.into();
         let result = result.with_written_path(path);
         assert_eq!(result.written_path.as_deref(), expected);
+    }
+
+    fn native_registry(enabled: bool) -> ToolRegistry {
+        let reg = ToolRegistry::new();
+        let config = maki_config::RunsConfig {
+            enabled,
+            ..Default::default()
+        };
+        crate::runs::sync_registration(&reg, &config).unwrap();
+        reg
+    }
+
+    #[test]
+    fn native_tool_logs_source() {
+        let reg = native_registry(true);
+        let spawn = reg.get("spawn").unwrap();
+        assert!(matches!(spawn.source, ToolSource::Native));
+        assert_eq!(spawn.source.as_log_field(), "native");
+    }
+
+    #[test]
+    fn native_tools_declare_reach() {
+        let reg = native_registry(true);
+        let snapshot = reg.iter();
+        assert_eq!(snapshot.len(), 5);
+        for entry in snapshot.iter() {
+            let reach = entry.tool.reach().unwrap_or_else(|| {
+                panic!("native tool {} leaves its reach undeclared", entry.name())
+            });
+            let ToolReach::Capability {
+                permission,
+                prompted,
+            } = reach
+            else {
+                panic!("native tool {} claims to reach nothing", entry.name());
+            };
+            let spawn = entry.name() == "spawn";
+            assert_eq!(prompted, spawn, "{}", entry.name());
+            let expected = if spawn {
+                Permission::Run
+            } else {
+                Permission::Agent
+            };
+            assert_eq!(permission, expected, "{}", entry.name());
+        }
+    }
+
+    #[test_case(ToolAudience::MAIN, &["send", "runs", "spawn", "stop", "wait"] ; "main")]
+    #[test_case(ToolAudience::GENERAL_SUB, &["send", "runs", "spawn", "stop", "wait"] ; "general_sub")]
+    // A research child may spawn its own children and stop what it started:
+    // the delegation surface is the same for every audience that has one.
+    #[test_case(ToolAudience::RESEARCH_SUB, &["send", "runs", "spawn", "stop", "wait"] ; "research_sub")]
+    #[test_case(ToolAudience::INTERPRETER, &[] ; "interpreter")]
+    fn native_run_tools_per_audience(audience: ToolAudience, expected: &[&str]) {
+        let mut names: Vec<String> = crate::runs::native_run_tools(audience)
+            .iter()
+            .map(|t| t.name().to_owned())
+            .collect();
+        names.sort();
+        let mut expected: Vec<&str> = expected.to_vec();
+        expected.sort();
+        assert_eq!(names, expected);
+    }
+
+    #[test]
+    fn sync_registration_follows_the_flag() {
+        let reg = native_registry(false);
+        assert!(reg.iter().is_empty());
+        let on = maki_config::RunsConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        crate::runs::sync_registration(&reg, &on).unwrap();
+        crate::runs::sync_registration(&reg, &on).unwrap();
+        assert_eq!(reg.iter().len(), 5);
+        crate::runs::sync_registration(&reg, &Default::default()).unwrap();
+        assert!(reg.iter().is_empty());
+    }
+
+    /// A plugin reload drops the Lua tools. The native ones belong to no
+    /// plugin, so they outlive it.
+    #[test]
+    fn clearing_the_lua_tools_keeps_the_native_ones() {
+        let reg = native_registry(true);
+        reg.register(mock("lua_a"), lua_source("p1")).unwrap();
+
+        reg.clear_lua();
+        assert!(!reg.has("lua_a"));
+        assert!(reg.has("spawn"));
+
+        reg.clear_plugin("p1");
+        assert!(reg.has("spawn"));
+
+        reg.clear_native();
+        assert!(!reg.has("spawn"));
     }
 }

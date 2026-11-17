@@ -11,6 +11,7 @@ pub mod grep;
 pub mod hook;
 pub mod interpreter_bridge;
 pub mod registry;
+pub mod runs;
 pub mod schema;
 
 use crate::Envelope;
@@ -46,6 +47,7 @@ use crate::live_session::SessionMailbox;
 use crate::mcp::McpSession;
 use crate::permissions::PermissionManager;
 use crate::prompt::ResolvedPrompts;
+use crate::runs::RunsCtx;
 use crate::{AgentConfig, AgentMode, EventSender, RunLedger, SharedBuf};
 use maki_config::{ModelPolicy, ToolOutputLines};
 use maki_providers::Model;
@@ -164,18 +166,36 @@ impl ToolFilter {
         let base = if config.allowed_tools.is_empty() {
             Self::All
         } else {
-            Self::Only(
-                config
-                    .allowed_tools
-                    .iter()
-                    .filter(|s| is_builtin_tool(s))
-                    .cloned()
-                    .collect(),
-            )
+            let mut allowed: Vec<String> = config
+                .allowed_tools
+                .iter()
+                .filter(|s| is_builtin_tool(s))
+                .cloned()
+                .collect();
+            if config.runs.enabled {
+                // Native runs are the delegation surface: without `spawn` the
+                // parent cannot delegate at all, and without `send` a child
+                // cannot report back. A host that narrows the tool list must
+                // not be able to break that silently; `disabled_tools` is the
+                // explicit way to say no.
+                for name in runs::RUN_TOOL_NAMES {
+                    if !allowed.iter().any(|n| n == name) {
+                        allowed.push(name.to_owned());
+                    }
+                }
+            }
+            Self::Only(allowed)
         };
         let mut exclude: Vec<&str> = extra_exclude.to_vec();
         exclude.extend(capability_exclusions(model));
         exclude.extend(config.disabled_tools.iter().map(|s| s.as_str()));
+        // The native `spawn` is the delegation tool while native runs are on,
+        // and it does not wait: the `task` plugin's tool would offer the model
+        // a second way to delegate, the one that blocks on the child. The
+        // plugin keeps it for the runs-off path and for the `/tasks` picker.
+        if config.runs.enabled {
+            exclude.push(TASK_TOOL_NAME);
+        }
         base.excluding(&exclude)
     }
 }
@@ -421,6 +441,8 @@ pub struct ToolContext {
     /// clears it, and each caller sets it for its own call only.
     pub live_sink: Option<UnboundedSender<ToolLive>>,
     pub model_policy: Arc<ModelPolicy>,
+    /// `None` for `maki index` and tests, or when `[agent.runs]` is off.
+    pub runs: Option<RunsCtx>,
 }
 
 /// Live progress of a dispatched child tool, streamed while it runs.
@@ -599,7 +621,9 @@ fn registers_a_tool(name: &str) -> bool {
 }
 
 pub fn is_builtin_tool(name: &str) -> bool {
-    registers_a_tool(name) || maki_config::EDIT_SUB_TOOLS.contains(&name)
+    registers_a_tool(name)
+        || maki_config::EDIT_SUB_TOOLS.contains(&name)
+        || (crate::runs::run_names_reserved() && runs::RUN_TOOL_NAMES.contains(&name))
 }
 
 pub fn all_builtin_tool_names() -> Vec<&'static str> {
@@ -607,6 +631,12 @@ pub fn all_builtin_tool_names() -> Vec<&'static str> {
         .iter()
         .filter(|name| registers_a_tool(name))
         .chain(maki_config::EDIT_SUB_TOOLS.iter())
+        .chain(
+            crate::runs::run_names_reserved()
+                .then_some(runs::RUN_TOOL_NAMES.iter())
+                .into_iter()
+                .flatten(),
+        )
         .copied()
         .collect()
 }
@@ -684,6 +714,7 @@ pub fn interpreter_ctx(
         local_tools: LocalTools::default(),
         live_sink: None,
         model_policy: Arc::new(ModelPolicy::default()),
+        runs: None,
     }
 }
 
@@ -1337,5 +1368,76 @@ mod tests {
             assert!(!is_builtin_tool(name), "{name}");
             assert!(!all_builtin_tool_names().contains(&name), "{name}");
         }
+    }
+
+    /// A host that narrows the tool list must not be able to take the
+    /// delegation surface away: without `spawn` the parent cannot delegate,
+    /// and without `send` a child cannot report back.
+    #[test]
+    fn a_narrowed_tool_list_keeps_the_run_tools() {
+        let model = Model::from_spec("anthropic/claude-opus-4-8").unwrap();
+        let config = AgentConfig {
+            allowed_tools: vec!["read".to_owned(), "bash".to_owned()],
+            runs: maki_config::RunsConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let filter = ToolFilter::from_config(&config, &model, &[]);
+        for name in runs::RUN_TOOL_NAMES {
+            assert!(filter.matches(name), "{name} is the delegation surface");
+        }
+        // With native runs off the list is the host's, and `send` is not a
+        // tool then.
+        let off = AgentConfig {
+            allowed_tools: vec!["read".to_owned(), "bash".to_owned()],
+            ..Default::default()
+        };
+        let filter = ToolFilter::from_config(&off, &model, &[]);
+        assert!(!filter.matches("send"));
+        assert!(filter.matches("read"));
+    }
+
+    #[test]
+    fn run_names_are_reserved_only_while_enabled() {
+        let reg = ToolRegistry::new();
+        let on = maki_config::RunsConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        crate::runs::sync_registration(&reg, &Default::default()).unwrap();
+        assert!(!is_builtin_tool("spawn"));
+        assert!(!all_builtin_tool_names().contains(&"wait"));
+        crate::runs::sync_registration(&reg, &on).unwrap();
+        assert!(is_builtin_tool("spawn"));
+        assert!(all_builtin_tool_names().contains(&"wait"));
+        crate::runs::sync_registration(&reg, &Default::default()).unwrap();
+        assert!(!is_builtin_tool("stop"));
+    }
+
+    /// The native `spawn` is the delegation tool while native runs are on,
+    /// and it does not wait. The `task` plugin's tool would offer the model a
+    /// second way to delegate, the one that blocks on the child, so it leaves
+    /// the model's list; with runs off it is the only delegation there is.
+    #[test]
+    fn the_task_tool_is_not_offered_while_runs_are_on() {
+        let model = Model::from_spec("anthropic/claude-opus-4-8").unwrap();
+        let off = AgentConfig::default();
+        assert!(
+            ToolFilter::from_config(&off, &model, &[]).matches(TASK_TOOL_NAME),
+            "the legacy path keeps the task tool"
+        );
+        let on = AgentConfig {
+            runs: maki_config::RunsConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ..AgentConfig::default()
+        };
+        assert!(
+            !ToolFilter::from_config(&on, &model, &[]).matches(TASK_TOOL_NAME),
+            "the native spawn replaces the task tool"
+        );
     }
 }

@@ -540,11 +540,31 @@ fn validate_array(
     let Value::Array(arr) = coerce_container(value, ParamKind::Array, path)? else {
         unreachable!("coerce_container(_, Array) returns an Array")
     };
-    arr.into_iter()
+    unwrap_nested_array(arr, item_schema)
+        .into_iter()
         .enumerate()
         .map(|(i, item)| path.with_index(i, |p| walk(item_schema, item, p)))
         .collect::<Result<Vec<_>, _>>()
         .map(Value::Array)
+}
+
+/// A provider that cannot type a nested value sends an array inside a value
+/// it has no schema for, and it wraps that array again: the edits of a
+/// multiedit arrive as `[[{...}, {...}]]`. When the items are known and are
+/// not arrays themselves, the outer layer is the wrapper and the inner one
+/// is what the caller meant. An item of no known shape keeps its own.
+fn unwrap_nested_array(arr: Vec<Value>, item_schema: &ParamSchema) -> Vec<Value> {
+    if arr.len() != 1 {
+        return arr;
+    }
+    match item_schema {
+        ParamSchema::Any { .. } | ParamSchema::Array { .. } => return arr,
+        _ => {}
+    }
+    let Value::Array(inner) = &arr[0] else {
+        return arr;
+    };
+    inner.clone()
 }
 
 fn schema_type_name(schema: &ParamSchema) -> &'static str {
@@ -605,6 +625,25 @@ fn validate_object(
     Ok(Value::Object(out))
 }
 
+/// The key a provider falls back to when it cannot type a nested value.
+/// An array inside a value it has no schema for arrives as `{"item": [...]}`
+/// for many elements and as `{"item": x}` for exactly one, so a batch child
+/// asked for `ids: ["a", "b"]` reaches the tool as `{"ids": {"item": [...]}}`.
+const WRAPPER_KEY: &str = "item";
+
+/// A provider that cannot type a nested value encodes an array as a one-item
+/// wrapper. Only a single-key object holding that key counts: any other shape
+/// is the caller's own data and must not be read as an array.
+fn one_item_wrapper(value: &Value) -> Option<Value> {
+    let Value::Object(map) = value else {
+        return None;
+    };
+    if map.len() != 1 {
+        return None;
+    }
+    map.get(WRAPPER_KEY).cloned()
+}
+
 /// Models sometimes stringify arrays and objects, so we try parsing the
 /// string as JSON before giving up.
 fn coerce_container(
@@ -622,6 +661,20 @@ fn coerce_container(
         return Ok(parsed);
     }
     if expected == ParamKind::Array {
+        if let Some(inner) = one_item_wrapper(&value) {
+            let unwrapped = match inner {
+                Value::Array(_) => inner,
+                one => Value::Array(vec![one]),
+            };
+            log_coercion(
+                path,
+                ParamKind::Object,
+                ParamKind::Array,
+                &value,
+                &unwrapped,
+            );
+            return Ok(unwrapped);
+        }
         let single = match &value {
             v if ParamKind::of(v) == ParamKind::Object => Some(value.clone()),
             Value::String(s) => coerce_str_to(s, ParamKind::Object),
@@ -927,6 +980,132 @@ mod tests {
         variants: &["research", "general"],
         description: "",
     };
+
+    /// A schema whose one parameter is an array of strings, like the run
+    /// tools' `ids`.
+    const IDS_ARRAY: ParamSchema = ParamSchema::Array {
+        items: &STR_PRIM,
+        description: "",
+    };
+
+    const IDS_LIKE: ParamSchema = ParamSchema::Object {
+        properties: &[("ids", &IDS_ARRAY, true, &[])],
+        description: "",
+    };
+
+    #[test]
+    fn a_one_item_wrapper_holding_an_array_is_read_as_that_array() {
+        // A provider that cannot type a nested value sends an array of many
+        // elements as `{"item": [...]}`.
+        let out = validate(&IDS_LIKE, json!({"ids": {"item": ["a", "b"]}})).unwrap();
+        assert_eq!(out["ids"], json!(["a", "b"]));
+    }
+
+    #[test]
+    fn a_one_item_wrapper_holding_one_element_is_read_as_a_one_element_array() {
+        // The same wrapper with exactly one element arrives unwrapped.
+        let out = validate(&IDS_LIKE, json!({"ids": {"item": "a"}})).unwrap();
+        assert_eq!(out["ids"], json!(["a"]));
+    }
+
+    #[test]
+    fn a_one_item_wrapper_holding_an_object_is_read_as_a_one_element_array() {
+        let out = validate(
+            &MULTIEDIT_LIKE,
+            json!({"path": "/x", "edits": {"item": {"old_string": "a", "new_string": "b"}}}),
+        )
+        .unwrap();
+        assert_eq!(
+            out["edits"],
+            json!([{"old_string": "a", "new_string": "b"}])
+        );
+    }
+
+    #[test]
+    fn a_nested_array_is_read_as_the_array_it_wraps() {
+        // A provider that cannot type a nested value wraps the array again:
+        // the edits of a multiedit arrive as [[{...}, {...}]].
+        let out = validate(
+            &MULTIEDIT_LIKE,
+            json!({
+                "path": "/x",
+                "edits": [[{"old_string": "a", "new_string": "b"}]]
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            out["edits"],
+            json!([{"old_string": "a", "new_string": "b"}])
+        );
+    }
+
+    #[test]
+    fn an_array_of_arrays_keeps_its_shape() {
+        // The items are arrays themselves, so the outer layer is data.
+        const MATRIX: ParamSchema = ParamSchema::Object {
+            properties: &[(
+                "rows",
+                &ParamSchema::Array {
+                    items: &ParamSchema::Array {
+                        items: &STR_PRIM,
+                        description: "",
+                    },
+                    description: "",
+                },
+                true,
+                &[],
+            )],
+            description: "",
+        };
+        let out = validate(&MATRIX, json!({"rows": [["a"]]})).unwrap();
+        assert_eq!(out["rows"], json!([["a"]]));
+    }
+
+    #[test]
+    fn a_nested_array_under_an_unknown_item_keeps_its_shape() {
+        // Nothing is known about the items, so the shape may be the caller's.
+        const OPEN: ParamSchema = ParamSchema::Object {
+            properties: &[(
+                "rows",
+                &ParamSchema::Array {
+                    items: &ParamSchema::Any { description: "" },
+                    description: "",
+                },
+                true,
+                &[],
+            )],
+            description: "",
+        };
+        let out = validate(&OPEN, json!({"rows": [["a"]]})).unwrap();
+        assert_eq!(out["rows"], json!([["a"]]));
+    }
+
+    #[test]
+    fn an_object_with_another_single_key_is_not_a_wrapper() {
+        // Only the wrapper key counts: the caller's own data keeps its shape,
+        // so the object still fails as an object where a string belongs.
+        let err = validate(&IDS_LIKE, json!({"ids": {"ids": ["a"]}})).unwrap_err();
+        assert_eq!(err.path.to_string(), "ids[0]");
+        assert!(matches!(err.kind, ToolInputErrorKind::TypeMismatch { .. }));
+    }
+
+    #[test]
+    fn a_wrapper_next_to_another_key_is_not_a_wrapper() {
+        let err = validate(&IDS_LIKE, json!({"ids": {"item": ["a"], "other": 1}})).unwrap_err();
+        assert_eq!(err.path.to_string(), "ids[0]");
+        assert!(matches!(err.kind, ToolInputErrorKind::TypeMismatch { .. }));
+    }
+
+    #[test]
+    fn a_wrapper_is_left_alone_where_an_object_is_expected() {
+        // An object parameter keeps the wrapper: only arrays unwrap it.
+        const WRAPPED_OBJECT: ParamSchema = ParamSchema::Object {
+            properties: &[("item", &STR_PRIM, false, &[])],
+            description: "",
+        };
+        let out = validate(&WRAPPED_OBJECT, json!({"item": "a"})).unwrap();
+        assert_eq!(out, json!({"item": "a"}));
+    }
 
     #[test]
     fn param_kind_distinguishes_integer_from_number() {

@@ -4,9 +4,9 @@ use std::env;
 use jiff::Zoned;
 
 /// What every prompt states about where it runs, the main one and subagents'
-/// alike, so none of them can drift out of step.
-const ENVIRONMENT: &str =
-    "Environment:\n- Working directory: {cwd}\n- Platform: {platform}\n- Date: {date}";
+/// alike, so none of them can drift out of step. The version is in it so a
+/// model can say which build it is talking to.
+const ENVIRONMENT: &str = "Environment:\n- Working directory: {cwd}\n- Platform: {platform}\n- Maki version: {maki_version}\n- Date: {date}";
 
 /// `{environment}` goes first, so the placeholders it brings in are filled by
 /// the vars after it.
@@ -19,6 +19,7 @@ pub fn env_vars() -> Vars {
         .set("{environment}", ENVIRONMENT)
         .set("{cwd}", cwd)
         .set("{platform}", env::consts::OS)
+        .set("{maki_version}", env!("CARGO_PKG_VERSION"))
         .set("{date}", date)
 }
 
@@ -66,6 +67,17 @@ mod tests {
             .set("{platform}", "linux")
             .set("{x}", "42");
         assert_eq!(vars.apply(input).as_ref(), expected);
+    }
+
+    /// Every prompt states the build, so a model can say which maki it is
+    /// talking to.
+    #[test]
+    fn the_environment_states_the_running_build() {
+        let text = env_vars().apply("{environment}").into_owned();
+        assert!(
+            text.contains(&format!("- Maki version: {}", env!("CARGO_PKG_VERSION"))),
+            "{text}"
+        );
     }
 
     #[test_case(0,             "1970-01-01" ; "unix_epoch")]

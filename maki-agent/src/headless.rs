@@ -510,6 +510,17 @@ pub async fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle,
     let (model_tx, mut model_rx) = unbounded_channel::<Model>();
     let (mode_tx, mode_rx) = unbounded_channel::<AgentMode>();
 
+    let runs = crate::runs::start_session(
+        &params.config.runs,
+        base_tx.clone(),
+        params.resumed.id.id(),
+        false,
+    );
+    // A run the journal lost is still in the session, with what it was and
+    // what it said, so the hub takes it back and a message revives it.
+    if let (Some(runs), Some(session)) = (runs.as_ref(), params.resumed.session.as_ref()) {
+        crate::runs::remember_session_runs(&runs.hub, session);
+    }
     let session_ref = params.resumed.id.clone();
     let mailbox = open_mailbox(&params.resumed);
 
@@ -645,8 +656,10 @@ pub async fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle,
                     prompt_slots: Arc::clone(&params.prompt_slots),
                     subagent_cancels: Arc::new(CancelMap::new()),
                     ledger: turn.ledger(),
+                    registry: Arc::clone(ToolRegistry::global_arc()),
                     audience: ToolAudience::MAIN,
                     model_policy: Arc::clone(&params.model_policy),
+                    runs: runs.clone(),
                 },
                 turn.run_params(event_tx, Arc::clone(&context)),
             )

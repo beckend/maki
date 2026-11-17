@@ -1238,7 +1238,7 @@ async fn gate(
         }
         pending().await
     };
-    let allowed_by = ctx
+    let decided = ctx
         .deadline
         .paused_while(async {
             tokio::select! {
@@ -1246,8 +1246,19 @@ async fn gate(
                 never = withdrawn => never,
             }
         })
-        .await
-        .map_err(|e| e.to_string())?;
+        .await;
+    // A background run.s prompt gave its slot up while it waited.
+    if let Some(runs) = &ctx.runs {
+        runs.hub
+            .prompt_resolved(
+                runs.self_run,
+                id,
+                ctx.user_response_rx.as_ref(),
+                &ctx.cancel,
+            )
+            .await;
+    }
+    let allowed_by = decided.map_err(|e| e.to_string())?;
     if let Some(plugin) = allowed_by {
         mark_allowed_by(ctx, plugin);
     }
@@ -1355,6 +1366,35 @@ pub(super) async fn process_tool_calls(
         .map(|(id, name, input)| (id.to_owned(), name.to_owned(), input.clone()))
         .collect();
 
+    // A `context=fork` spawn copies the history as it stands now: everything
+    // before this assistant turn, which ends on a complete user or tool result
+    // boundary. The turn in flight is pushed only after the copy.
+    if let Some(runs) = &ctx.runs {
+        // Work other than talking resets the ping-pong guard (design 4.7).
+        if tool_uses.iter().any(|(_, name, _)| {
+            !matches!(
+                name.as_str(),
+                crate::tools::runs::SEND_TOOL_NAME
+                    | crate::tools::runs::RUNS_TOOL_NAME
+                    | crate::tools::runs::WAIT_TOOL_NAME
+            )
+        }) {
+            runs.hub.note_work(runs.self_run);
+        }
+        let forks: Vec<String> = tool_uses
+            .iter()
+            .filter(|(_, name, input)| {
+                name == crate::tools::runs::SPAWN_TOOL_NAME
+                    && input.get("context").and_then(Value::as_str) == Some("fork")
+            })
+            .map(|(id, ..)| id.clone())
+            .collect();
+        if !forks.is_empty() {
+            runs.hub
+                .publish_fork_snapshot(&forks, history.as_slice().to_vec());
+        }
+    }
+
     history.push(response.message);
 
     let mut immediate_errors: Vec<ToolDoneEvent> = Vec::new();
@@ -1419,10 +1459,23 @@ pub(super) async fn process_tool_calls(
     let moved = results.iter().any(|done| done.backgrounded);
     let mut all_results = results;
     all_results.extend(immediate_errors);
+    let result_ids: Vec<String> = all_results.iter().map(|r| r.id.clone()).collect();
     let tool_msg = crate::types::tool_results(all_results);
-    event_tx.send(AgentEvent::ToolResultsSubmitted {
+    let submitted = event_tx.send(AgentEvent::ToolResultsSubmitted {
         message: Box::new(tool_msg.clone()),
-    })?;
+    });
+    if let Some(runs) = &ctx.runs {
+        // A read's claim on a notice becomes consumption only here, once the
+        // result that carries it is in history (design 4.8).
+        if submitted.is_ok() {
+            history.push(tool_msg);
+            runs.hub.commit_claims(runs.self_run, &result_ids);
+        } else {
+            runs.hub.release_claims(&result_ids);
+        }
+        return submitted.map(|()| moved);
+    }
+    submitted?;
     history.push(tool_msg);
     Ok(moved)
 }
@@ -1681,7 +1734,7 @@ mod tests {
         registry
             .register(
                 tool,
-                ToolSource {
+                ToolSource::Lua {
                     plugin: TEST_PLUGIN.into(),
                 },
             )
