@@ -32,6 +32,12 @@ pub(crate) mod uv;
 pub(crate) mod version;
 pub(crate) mod yaml;
 
+/// The tier assignments live in a process-global registry, so the tests that
+/// write one and the tests that read a tier must not overlap. One lock for
+/// the whole api, or a test in one namespace waits for nothing in another.
+#[cfg(test)]
+pub(crate) static TIER_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 use std::sync::Arc;
 
 use mlua::{Lua, Result as LuaResult, Table, Value};

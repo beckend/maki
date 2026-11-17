@@ -86,6 +86,7 @@ mod tests {
     #[test_case("unknown_service", None; "sdk_fallback")]
     #[test_case(ENV_NAME, Some(ENV_NAME); "named_in_the_environment")]
     fn takes_only_a_service_the_environment_names(detected: &str, expected: Option<&str>) {
+        let _env = crate::EnvGuard::take();
         let resource = Resource::builder_empty()
             .with_service_name(detected.to_string())
             .build();
@@ -95,6 +96,7 @@ mod tests {
     #[test_case("OTEL_SERVICE_NAME", ENV_NAME; "service_name")]
     #[test_case("OTEL_RESOURCE_ATTRIBUTES", "service.name=billing"; "resource_attributes")]
     fn a_service_the_environment_names_beats_lua(env: &str, raw: &str) {
+        let _env = crate::EnvGuard::take();
         // Sound because nextest runs each test in its own process.
         unsafe { std::env::set_var(env, raw) };
         let resource = build(&TelemetryConfig {
@@ -110,6 +112,7 @@ mod tests {
 
     #[test]
     fn lua_service_name_beats_lua_attributes() {
+        let _env = crate::EnvGuard::take();
         let resource = build(&TelemetryConfig {
             service_name: Some(LUA_NAME.to_string()),
             resource_attributes: Some(BTreeMap::from([

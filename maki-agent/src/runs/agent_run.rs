@@ -1938,8 +1938,6 @@ mod admit {
 }
 
 mod perm {
-    use std::path::{Path, PathBuf};
-
     use maki_config::{PermissionsConfig, ProjectConfig, UnattendedMode};
 
     use super::*;
@@ -1947,14 +1945,21 @@ mod perm {
 
     const SECS_120: Duration = Duration::from_secs(120);
 
+    /// A permission manager of its own, over a project of its own.
+    ///
+    /// The project is where the trust of a folder is looked up, and the trust
+    /// store is one process-wide file: a manager over a shared folder would
+    /// be trusted by whatever another test trusted, and the permission the
+    /// test is waiting for would be allowed instead of asked for.
     fn manager(yolo: bool) -> Arc<PermissionManager> {
+        let project = tempfile::TempDir::new().unwrap();
         Arc::new(PermissionManager::new(
             PermissionsConfig {
                 yolo,
                 ..PermissionsConfig::default()
             },
-            PathBuf::from("/tmp"),
-            ProjectConfig::discover(Path::new("/tmp")),
+            project.path().to_path_buf(),
+            ProjectConfig::discover(project.path()),
             Arc::default(),
         ))
     }
@@ -1988,10 +1993,18 @@ mod perm {
         }
     }
 
+    /// How long a test waits for the event it is after. A test that waits for
+    /// an event that never comes must say so, not hang the whole suite.
+    const EVENT_WAIT: Duration = Duration::from_secs(60);
+    const NO_EVENT: &str = "the event the test waits for never came";
+
     async fn next_event(rig: &Rig, mut hit: impl FnMut(&Envelope) -> bool) -> Envelope {
         let mut events = rig.events.lock().await;
         loop {
-            let envelope = events.recv().await.expect("the expected event never came");
+            let envelope = tokio::time::timeout(EVENT_WAIT, events.recv())
+                .await
+                .expect(NO_EVENT)
+                .expect(NO_EVENT);
             if hit(&envelope) {
                 return envelope;
             }
@@ -2484,6 +2497,32 @@ mod revive {
 
     use super::*;
     use crate::runs::transcript;
+
+    /// How long a reopen waits for the lock of the journal it just dropped.
+    const REOPEN_WAIT_SECS: u64 = 10;
+
+    /// Opens the journal of {dir} again, asking until the lock is free.
+    ///
+    /// The lock is held for as long as the journal is, and the journal that
+    /// held it was dropped a moment ago, so the reopen can find the lock
+    /// still held and answer that the journal is in use. A directory of the
+    /// test's own is never held by another process, so the lock comes free
+    /// and the reopen asks again until it does.
+    fn reopen_journal(dir: PathBuf) -> RunJournal {
+        let deadline = Instant::now() + Duration::from_secs(REOPEN_WAIT_SECS);
+        loop {
+            match RunJournal::open_in(dir.clone(), JournalOptions::default()) {
+                Ok(journal) => return journal,
+                Err(e) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "the journal lock never came free: {e}"
+                    );
+                    std::thread::yield_now();
+                }
+            }
+        }
+    }
 
     fn journaled(script: &Arc<Script>, limits: UnitLimits) -> (Rig, std::path::PathBuf) {
         let rig = rig_with(script, limits);
@@ -3168,9 +3207,8 @@ mod revive {
             ],
         )
         .unwrap();
-        rig.hub.attach_journal(Arc::new(
-            RunJournal::open_in(dir.clone(), JournalOptions::default()).unwrap(),
-        ));
+        rig.hub
+            .attach_journal(Arc::new(reopen_journal(dir.clone())));
         let report = rig.hub.reconcile();
         assert_eq!(report.lost, vec!["ag-lost01".to_owned()]);
         let id = rig.hub.resolve(rig.hub.main(), "lostone").unwrap();
@@ -3231,9 +3269,7 @@ mod revive {
             ],
         )
         .unwrap();
-        rig.hub.attach_journal(Arc::new(
-            RunJournal::open_in(dir, JournalOptions::default()).unwrap(),
-        ));
+        rig.hub.attach_journal(Arc::new(reopen_journal(dir)));
     }
 
     #[tokio::test]

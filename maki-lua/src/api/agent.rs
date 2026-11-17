@@ -2489,7 +2489,11 @@ mod tests {
     async fn notify_reaches_a_subagent_by_its_task_id() {
         let lua = Lua::new();
         let parent = MakiId::generate();
-        let mut ctx = stub_ctx_with(&AgentMode::Build, None, Some(PARENT_ID));
+        // The task registry is process-wide and keyed by the task id, so this
+        // test's task id is its own: the task of another test that carries the
+        // same name would be the one the notification reaches.
+        let task_id = format!("task-{}", MakiId::generate());
+        let mut ctx = stub_ctx_with(&AgentMode::Build, None, Some(&task_id));
         ctx.session_id = Some(SessionRef::from(parent));
         let sess = native_session(&lua, &ctx).await;
         let mailbox = sess
@@ -2499,13 +2503,13 @@ mod tests {
             .mailbox
             .clone();
 
-        SessionMailbox::notify_task(parent, PARENT_ID, NUDGE.into(), None, true).unwrap();
+        SessionMailbox::notify_task(parent, &task_id, NUDGE.into(), None, true).unwrap();
 
         assert_eq!(mailbox.claim_wake().len(), 1);
         close(lua.clone(), sess.borrow().unwrap(), None)
             .await
             .unwrap();
-        assert!(SessionMailbox::notify_task(parent, PARENT_ID, NUDGE.into(), None, true).is_err());
+        assert!(SessionMailbox::notify_task(parent, &task_id, NUDGE.into(), None, true).is_err());
     }
 
     #[test_case(None, Ok(TOOL_OUTPUT.into()) ; "answer")]
@@ -3601,21 +3605,25 @@ mod tests {
     #[test_case(Some(STALE_SPEC) ; "stale_assignment_fails_instead_of_falling_back")]
     #[tokio::test]
     async fn task_model_selection_follows_the_tier_assignment(assigned: Option<&str>) {
+        let _tier = crate::api::TIER_LOCK.lock().await;
         let mut ctx = stub_ctx_with(&AgentMode::Build, None, Some(PARENT_ID));
         ctx.model = Arc::new(Model::from_spec(SESSION_SPEC).unwrap());
         let ctx = AgentContext::from(&ctx);
         let dir = tempfile::TempDir::new().unwrap();
+        let storage = maki_storage::StateDir::from_path(dir.path().to_path_buf());
         if let Some(spec) = assigned {
-            model_registry::set_and_persist(
-                spec.into(),
-                ModelTier::Weak,
-                &maki_storage::StateDir::from_path(dir.path().to_path_buf()),
-            );
+            model_registry::set_and_persist(spec.into(), ModelTier::Weak, &storage);
         }
 
         let resolved = resolve_model_from_ctx(&ctx, Some(ModelTier::Weak.to_string().as_str()))
             .await
             .map(|(model, tier)| (model.spec(), tier));
+        // The assignment is a process-global one, so it is given back before
+        // the asserts: a failing assert must not leave a tier pointing at a
+        // model the next test would then resolve.
+        if let Some(spec) = assigned {
+            model_registry::unset_and_persist(spec, ModelTier::Weak, &storage);
+        }
         match assigned.map(|spec| (spec, Model::from_spec(spec))) {
             None => {
                 let (spec, tier) = resolved.unwrap();

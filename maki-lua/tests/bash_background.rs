@@ -25,11 +25,10 @@ use maki_agent::{
 use maki_config::{PluginFileConfig, PluginsConfig};
 use maki_lua::test_support::runtime;
 use maki_lua::{EventHandle, MoveOutcome, PluginHost};
-use maki_providers::test_support::isolated_home;
+use maki_providers::test_support::{IsolatedHome, isolated_home};
 use maki_storage::id::MakiId;
 use maki_storage::paths::{session_data_dir, state_dir};
 use serde_json::{Value, json};
-use tempfile::TempDir;
 use test_case::test_case;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::mpsc::unbounded_channel;
@@ -103,7 +102,11 @@ struct Run {
     thread: Option<JoinHandle<()>>,
     _seed: Arc<AgentSeed>,
     _run_trigger: CancelTrigger,
-    _home: TempDir,
+    _home: IsolatedHome,
+    /// Where the run wrote its files. The home is a process-wide environment
+    /// variable, so another test's home would move it under this run: the
+    /// state dir is read once, while this run's home is the one in place.
+    state: PathBuf,
 }
 
 impl Run {
@@ -130,6 +133,7 @@ impl Run {
     /// Isolates the home before the call's thread starts.
     fn launch(opts: Value, tool: &str, input: Value, gate: Gate) -> Self {
         let home = isolated_home();
+        let state = state_dir().expect("the state dir is the home's");
         let Chat {
             id: session,
             mailbox,
@@ -193,11 +197,12 @@ impl Run {
             _seed: seed,
             _run_trigger: run_trigger,
             _home: home,
+            state,
         }
     }
 
     fn log_path(&self) -> PathBuf {
-        session_data_dir(&state_dir().unwrap(), self.session)
+        session_data_dir(&self.state, self.session)
             .join(BASH_DIR)
             .join(format!("{}.log", self.call_id))
     }
@@ -523,7 +528,7 @@ fn a_bash_in_a_moved_batch_logs_the_output_it_prints_after_the_move() {
     run.release();
     let notice = run.final_notice();
 
-    let logs = session_data_dir(&state_dir().unwrap(), run.session).join(BASH_DIR);
+    let logs = session_data_dir(&run.state, run.session).join(BASH_DIR);
     let log_path = notice
         .split_once(LOG_LABEL)
         .and_then(|(_, rest)| rest.lines().next())

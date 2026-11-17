@@ -15,7 +15,7 @@ use std::io::Cursor;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::ops::Index;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 #[cfg(test)]
 use std::time::Duration;
 
@@ -287,10 +287,24 @@ fn write_canned(mut stream: &TcpStream, canned: &Canned) {
     stream.flush().expect(IO_FAILED);
 }
 
+/// The provider registrations are staged in one process-wide window that a
+/// load replaces whole, so a test that registers a provider and a test that
+/// loads the bundled plugins take turns at it: two loads at once stage over
+/// each other, and the registration of the loser is refused.
+static PROVIDER_LOAD: Mutex<()> = Mutex::new(());
+
+/// Runs a plugin load with the provider registrations it makes to itself, so
+/// two tests that load plugins do not stage over each other.
+pub fn with_provider_load<T>(load: impl FnOnce() -> T) -> T {
+    let _guard = PROVIDER_LOAD.lock().unwrap_or_else(|e| e.into_inner());
+    load()
+}
+
 /// Registers `authored` like a bundled plugin load would, with `host` as its
 /// only net host. Each call is a whole load, so it replaces whatever the last
 /// call registered.
 pub fn register_bundled(authored: Value, host: &str) {
+    let _guard = PROVIDER_LOAD.lock().unwrap_or_else(|e| e.into_inner());
     let mut decl: ProviderDecl = serde_json::from_value(authored).expect(BAD_DECLARATION);
     decl.net_hosts = vec![host.to_owned()];
     plugin::begin_load();
@@ -370,10 +384,11 @@ pub(crate) mod transport {
 /// stay, API keys and host overrides like `OLLAMA_HOST` included. Call it
 /// first, since the base dirs are resolved once per process, and keep the
 /// guard for the whole test.
-pub fn isolated_home() -> TempDir {
+pub fn isolated_home() -> IsolatedHome {
     let home = TempDir::new().expect(TEMPDIR_FAILED);
-    // SAFETY: Nextest runs each test in its own process. Callers set up the
-    // environment before starting work that can read it.
+    // SAFETY: The environment is process-wide, and the lock below is what
+    // keeps another test from reading it while this one works. Callers set up
+    // the environment before starting work that can read it.
     unsafe {
         for (key, _) in std::env::vars_os() {
             if key
@@ -390,7 +405,36 @@ pub fn isolated_home() -> TempDir {
             std::env::set_var(var, home.path().join(dir));
         }
     }
-    home
+    IsolatedHome {
+        home,
+        _guard: Some(home_lock()),
+    }
+}
+
+/// A home of its own, with the environment pointing at it.
+///
+/// The environment is process-wide, so the tests that need a home take turns
+/// at it: two tests at once would read each other's home, and the files they
+/// write would land in the wrong place. The guard is held for as long as the
+/// home is, so the environment keeps pointing at it while the test works.
+pub struct IsolatedHome {
+    home: TempDir,
+    _guard: Option<MutexGuard<'static, ()>>,
+}
+
+impl IsolatedHome {
+    /// The home the environment points at.
+    pub fn path(&self) -> &std::path::Path {
+        self.home.path()
+    }
+}
+
+/// The one home at a time, in the process. A test that asks for a second one
+/// waits for the first to be done with it.
+static HOME_LOCK: Mutex<()> = Mutex::new(());
+
+fn home_lock() -> MutexGuard<'static, ()> {
+    HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 #[cfg(test)]

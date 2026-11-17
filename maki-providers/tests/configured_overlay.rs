@@ -12,11 +12,10 @@ use maki_providers::plugin::{
     self, DeclAuthority, PlanDecl, ProviderDecl, RegisterError, Registration,
 };
 use maki_providers::spec::Owner;
-use maki_providers::test_support::isolated_home;
+use maki_providers::test_support::{IsolatedHome, isolated_home};
 use maki_storage::StateDir;
 use maki_storage::auth::{ProviderCredentials, save_provider_credentials};
 use serde_json::json;
-use tempfile::TempDir;
 use test_case::test_case;
 
 const PROVIDERS_FILE: &str = "providers.toml";
@@ -49,7 +48,7 @@ const PLAN_KEY_ENV: &str = "MAKI_TEST_PLANNED_PROVIDER_KEY";
 /// so no case reads this machine's config. The file goes wherever maki's own
 /// path resolution says it lives, so a test can never quietly write somewhere
 /// nothing reads.
-fn isolated(providers_toml: &str) -> TempDir {
+fn isolated(providers_toml: &str) -> IsolatedHome {
     let dir = isolated_home();
     let config = maki_storage::paths::config_dir().expect(CONFIG_DIR_FAILED);
     fs::write(config.join(PROVIDERS_FILE), providers_toml).expect(WRITE_FAILED);
@@ -194,7 +193,7 @@ const CREDENTIALS_LOST: &str = "the takeover must hand the plugin the saved key"
 
 /// The takeover's whole point, and its risk: `maki auth login` saved the key
 /// under the slug, and the plugin that replaced the catalog provider sends it.
-fn saved_catalog_key() -> TempDir {
+fn saved_catalog_key() -> IsolatedHome {
     let home = isolated("");
     let cache = maki_storage::paths::cache_dir().unwrap();
     fs::write(

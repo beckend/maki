@@ -1416,8 +1416,10 @@ mod tests {
     fn jit_off_loads_builtins_and_registers_tools() {
         let reg = Arc::new(ToolRegistry::new());
         let mut host = PluginHost::start(Arc::clone(&reg), Interaction::Tty, false).unwrap();
-        host.load_builtins(&PluginsConfig::from_plugins(HashMap::new()))
-            .unwrap();
+        maki_providers::test_support::with_provider_load(|| {
+            host.load_builtins(&PluginsConfig::from_plugins(HashMap::new()))
+        })
+        .unwrap();
         assert!(reg.has("glob"));
     }
 
@@ -1498,7 +1500,10 @@ mod tests {
     #[test]
     fn memory_builtin_registers_command() {
         let reg = Arc::new(ToolRegistry::new());
-        let host = PluginHost::with_all_builtins(Arc::clone(&reg)).unwrap();
+        let host = maki_providers::test_support::with_provider_load(|| {
+            PluginHost::with_all_builtins(Arc::clone(&reg))
+        })
+        .unwrap();
         let reader = host.command_reader();
         let snap = reader.load();
         let found = snap.commands.iter().any(|c| c.name.as_ref() == "/memory");
@@ -3185,8 +3190,10 @@ mod bundled_manifests {
     fn bundled_reaches() -> Vec<(String, String, Option<ToolReach>)> {
         let registry = Arc::new(ToolRegistry::new());
         let mut host = PluginHost::new(Arc::clone(&registry)).expect("host starts");
-        host.load_builtins(&PluginsConfig::from_plugins(HashMap::new()))
-            .expect("every bundled plugin loads");
+        maki_providers::test_support::with_provider_load(|| {
+            host.load_builtins(&PluginsConfig::from_plugins(HashMap::new()))
+        })
+        .expect("every bundled plugin loads");
         registry
             .iter()
             .iter()

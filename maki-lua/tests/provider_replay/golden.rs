@@ -40,7 +40,9 @@ use maki_providers::model::ModelInfo;
 use maki_providers::model_registry;
 use maki_providers::plugin;
 use maki_providers::provider::Provider;
-use maki_providers::test_support::{Canned, Recorded, Requests, is_routed, isolated_home, serve};
+use maki_providers::test_support::{
+    Canned, IsolatedHome, Recorded, Requests, is_routed, isolated_home, serve,
+};
 use maki_providers::{
     AgentError, Message, Model, ProviderEvent, RequestOptions, StreamResponse, ThinkingSupport,
     Timeouts,
@@ -49,7 +51,6 @@ use maki_storage::id::SessionRef;
 use maki_storage::sessions::StoredThinking;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use tempfile::TempDir;
 
 use super::load_bundled_with_opts;
 
@@ -321,7 +322,7 @@ struct Replay {
     requests: Requests,
     script: &'static [Canned],
     _host: PluginHost,
-    _home: TempDir,
+    _home: IsolatedHome,
 }
 
 impl Replay {

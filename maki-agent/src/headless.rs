@@ -1004,6 +1004,12 @@ mod tests {
     const DISCOVERY_HEALS: &str =
         "discovery that lands after a failed listing reaches the next turn";
 
+    /// The provider registry is one process-wide map that a load replaces
+    /// whole, so a test that loads providers takes the providers another test
+    /// loaded away, and the model it registered is no longer registered. The
+    /// tests that load one run one at a time.
+    static PLUGIN_LOAD: Mutex<()> = Mutex::const_new(());
+
     type Listed = BoxFuture<'static, Result<Vec<ModelInfo>, AgentError>>;
 
     struct ListingProvider(fn() -> Listed);
@@ -1164,6 +1170,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_session_lists_per_model_and_a_cancel_ends_the_wait() {
+        let _load = PLUGIN_LOAD.lock().await;
         plugin::begin_load();
         let answered = register_listed(ANSWERING_SLUG, lists_window);
         let mut hung = register_listed(HANGING_SLUG, hangs);
@@ -1197,6 +1204,7 @@ mod tests {
     /// fallback window for good.
     #[tokio::test]
     async fn a_failed_listing_heals_when_discovery_lands() {
+        let _load = PLUGIN_LOAD.lock().await;
         plugin::begin_load();
         let listed = register_listed(FAILING_SLUG, fails);
         plugin::commit_load();

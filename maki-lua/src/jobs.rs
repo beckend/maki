@@ -1150,6 +1150,8 @@ mod tests {
 
     const TEST_PLUGIN: &str = "test-plugin";
     const JOB_EXIT_TIMEOUT: Duration = Duration::from_secs(30);
+    /// How long a test waits for a job to produce the event it reads.
+    const JOB_EVENT_TIMEOUT: Duration = Duration::from_secs(10);
     const JOB_POLL_INTERVAL: Duration = Duration::from_millis(10);
     #[cfg(unix)]
     const EXIT_WITHOUT_REAP: &str =
@@ -1247,6 +1249,21 @@ mod tests {
         store
             .start(JobSpec::new(task_owner(1), "echo hello"))
             .unwrap()
+    }
+
+    /// A job that prints and then waits, so an adoption finds it running with
+    /// an event to take: a job that exits at once is gone by the time the
+    /// test asks for it, and its events with it.
+    fn start_adoptable(store: &mut JobStore) -> u32 {
+        let id = store
+            .start(JobSpec::new(task_owner(1), "echo hello; sleep 30"))
+            .unwrap();
+        let deadline = Instant::now() + JOB_EVENT_TIMEOUT;
+        while !store.jobs.get(&id).is_some_and(|job| job.has_pending()) {
+            assert!(Instant::now() < deadline, "the job never produced an event");
+            std::thread::sleep(JOB_POLL_INTERVAL);
+        }
+        id
     }
 
     #[cfg(unix)]
@@ -1354,7 +1371,7 @@ mod tests {
     #[test]
     fn an_adoption_takes_the_events_and_a_refusal_gives_them_back() {
         let mut store = make_store();
-        let id = start_echo(&mut store);
+        let id = start_adoptable(&mut store);
 
         assert!(
             store.take_for_adoption(id, Some(2)).is_none(),

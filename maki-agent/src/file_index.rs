@@ -1291,7 +1291,8 @@ mod tests {
     const MANY: usize = 200;
     const DETACHED_ROOT: &str = "/detached";
     const WALKER_PANIC: &str = "the walker fell over";
-    const NO_PERMIT: &str = "the whole walk budget was supposed to be free";
+    const NO_PERMIT: &str = "the walk budget never handed out a slot";
+    const NO_WALK: &str = "the walk never started, so the stale cancel was never cleared";
     const NEVER_SETTLED: &str = "the walk never reached the state the test waits for";
     const MAIN_PATH: &str = "src/main.rs";
     const MAIN_QUERY: &str = "main";
@@ -1338,6 +1339,12 @@ mod tests {
 
     /// The walk runs on its own thread, so every test that reads results has
     /// to wait for it before asserting.
+    ///
+    /// The budget for walks is spent across the process, so a root that asks
+    /// while it is spent is not walked yet: nothing is published and no ending
+    /// is left behind, so the reader that wanted it asks again and gets the
+    /// walk once a slot frees. A test reads the way a reader does, so it asks
+    /// again too and waits for the walk rather than for a slot.
     fn wait_for(index: &FileIndex, ready: impl Fn(&Corpus) -> bool) -> Arc<Corpus> {
         let deadline = Instant::now() + Duration::from_secs(WAIT_SECS);
         loop {
@@ -1345,6 +1352,7 @@ mod tests {
             if ready(&corpus) {
                 return corpus;
             }
+            index.refresh();
             assert!(Instant::now() < deadline, "{NEVER_SETTLED}");
             thread::yield_now();
         }
@@ -1433,9 +1441,16 @@ mod tests {
     /// thread returns. A test that waited for a corpus has waited for this
     /// much already, since `finish` clears `running` under the lock it
     /// publishes the list with.
+    ///
+    /// The walk is asked for again, because the slot it needs may have been
+    /// spent when the reader asked the first time.
     fn settled(index: &FileIndex) {
         let deadline = Instant::now() + Duration::from_secs(WAIT_SECS);
-        while lock(&index.shared.walk).running {
+        loop {
+            index.refresh();
+            if !lock(&index.shared.walk).running {
+                return;
+            }
             assert!(Instant::now() < deadline, "{NEVER_SETTLED}");
             thread::yield_now();
         }
@@ -1733,7 +1748,16 @@ mod tests {
         index.cancel();
         lock(&index.shared.walk).ended = None;
 
-        index.refresh();
+        // A walk clears the flag as it starts, and the budget for walks is
+        // spent across the process, so the root is asked again until the walk
+        // it wants starts.
+        let before = lock(&index.shared.walk).generation;
+        let deadline = Instant::now() + Duration::from_secs(WAIT_SECS);
+        while lock(&index.shared.walk).generation == before {
+            index.refresh();
+            assert!(Instant::now() < deadline, "{NO_WALK}");
+            thread::yield_now();
+        }
         assert!(!index.cancelled(), "starting a walk clears the flag");
         assert_eq!(walked(&index).len(), 1);
     }
@@ -1935,14 +1959,24 @@ mod tests {
     /// A plugin looping over the subdirectories of a repo asks for one root
     /// per iteration, and each root used to be a thread plus a pool of walker
     /// threads however many were already going.
+    ///
+    /// The whole budget is taken first, so the root that asks below finds it
+    /// spent. A walk another test is running holds a slot of it, so the slots
+    /// are taken as they free rather than all at once.
     #[test]
     fn a_root_that_asks_while_the_walk_budget_is_spent_waits_for_a_later_ask() {
         let dir = tree(&["a.rs"]);
         let mut spent = Vec::new();
-        while let Some(permit) = WalkPermit::take() {
-            spent.push(permit);
+        let deadline = Instant::now() + Duration::from_secs(WAIT_SECS);
+        while spent.len() < MAX_WALKS {
+            match WalkPermit::take() {
+                Some(permit) => spent.push(permit),
+                None => {
+                    assert!(Instant::now() < deadline, "{NO_PERMIT}");
+                    thread::yield_now();
+                }
+            }
         }
-        assert_eq!(spent.len(), MAX_WALKS, "{NO_PERMIT}");
 
         let index = file_index(dir.path());
         assert!(!lock(&index.shared.walk).running, "no walker started");

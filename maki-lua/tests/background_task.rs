@@ -161,8 +161,8 @@ impl Host {
     }
 
     /// The final reply of the moved call, as its task tab gets it.
-    fn task_done(&mut self) -> ToolDoneEvent {
-        self.task_dones(&[CALL_ID]).remove(0)
+    fn task_done(&mut self, call_id: &str) -> ToolDoneEvent {
+        self.task_dones(&[call_id]).remove(0)
     }
 
     /// The final replies of {ids}, in that order, whichever ends first.
@@ -180,12 +180,12 @@ impl Host {
     }
 
     /// Waits for the moved subagent to ask the user, failing if it ends first.
-    fn wait_permission_request(&mut self) {
+    fn wait_permission_request(&mut self, call_id: &str) {
         loop {
             let envelope = next_task_event(&mut self.ui);
             match (envelope.event, envelope.subagent) {
                 (AgentEvent::PermissionRequest { .. }, _) => return,
-                (AgentEvent::ToolDone(done), None) if done.id == CALL_ID => {
+                (AgentEvent::ToolDone(done), None) if done.id == call_id => {
                     panic!("the task ended without asking: {}", done.output.as_text())
                 }
                 _ => {}
@@ -243,9 +243,13 @@ fn assert_refused(host: &Host, chat: MakiId, id: &str) {
 fn a_background_task_returns_a_receipt_and_its_reply_arrives_as_the_notice() {
     let mut host = Host::task(Arc::new(ToolRegistry::new()));
     let chat = Chat::live();
+    // The call id names the session the events are routed to, and the
+    // registry behind it is process-wide, so it carries the chat's own id.
+    let call_id = format!("{CALL_ID}-{}", chat.id);
+    let second_call_id = format!("{SECOND_CALL_ID}-{}", chat.id);
     let parked = Parked::new(RESULT);
     let (_run, run_token) = CancelToken::new();
-    let (mut ctx, _events) = call_ctx(&host.reg, chat.id, &run_token, CALL_ID);
+    let (mut ctx, _events) = call_ctx(&host.reg, chat.id, &run_token, &call_id);
     ctx.provider = Arc::clone(&parked.provider);
 
     let result = exec(&host.reg, TASK_TOOL, task_input(), &ctx);
@@ -258,7 +262,10 @@ fn a_background_task_returns_a_receipt_and_its_reply_arrives_as_the_notice() {
 
     parked.wait_started();
     parked.release.send(()).unwrap();
-    assert_eq!(done_text(&host.task_done()), (RESULT.to_owned(), false));
+    assert_eq!(
+        done_text(&host.task_done(&call_id)),
+        (RESULT.to_owned(), false)
+    );
     let notices = chat.mailbox.drain();
     assert_eq!(notices.len(), 1);
     let notice = notices[0].first_text_content().unwrap();
@@ -271,11 +278,15 @@ fn a_background_task_returns_a_receipt_and_its_reply_arrives_as_the_notice() {
 fn a_background_task_waiting_for_a_slot_returns_its_receipt_at_once() {
     let mut host = Host::task_with_slots(Arc::new(ToolRegistry::new()), 1);
     let chat = Chat::live();
+    // The call id names the session the events are routed to, and the
+    // registry behind it is process-wide, so it carries the chat's own id.
+    let call_id = format!("{CALL_ID}-{}", chat.id);
+    let second_call_id = format!("{SECOND_CALL_ID}-{}", chat.id);
     let parked = Parked::new(RESULT);
     let (_run, run_token) = CancelToken::new();
-    let (mut first, _first_events) = call_ctx(&host.reg, chat.id, &run_token, CALL_ID);
+    let (mut first, _first_events) = call_ctx(&host.reg, chat.id, &run_token, &call_id);
     first.provider = Arc::clone(&parked.provider);
-    let (mut second, _second_events) = call_ctx(&host.reg, chat.id, &run_token, SECOND_CALL_ID);
+    let (mut second, _second_events) = call_ctx(&host.reg, chat.id, &run_token, &second_call_id);
     second.provider = Arc::clone(&parked.provider);
 
     assert!(exec(&host.reg, TASK_TOOL, task_input(), &first).backgrounded);
@@ -301,7 +312,7 @@ fn a_background_task_waiting_for_a_slot_returns_its_receipt_at_once() {
 
     parked.release.send(()).unwrap();
     parked.release.send(()).unwrap();
-    for done in host.task_dones(&[CALL_ID, SECOND_CALL_ID]) {
+    for done in host.task_dones(&[&call_id, &second_call_id]) {
         assert_eq!(done_text(&done), (RESULT.to_owned(), false));
     }
 }
@@ -319,7 +330,15 @@ fn a_subagent_asks_for_permission_only_where_the_answer_comes_back(nested: bool)
     let chat = Chat::live();
     let project = TempDir::new().unwrap();
     let (_run, run_token) = CancelToken::new();
-    let (mut ctx, mut events) = call_ctx(&reg, chat.id, &run_token, CALL_ID);
+    // The call id names the session the events are routed to, and the
+    // registry behind it is process-wide, so this case's id is its own: the
+    // session of the other case would be the one the request reaches.
+    let call_id = format!(
+        "{CALL_ID}-{}-{}",
+        chat.id,
+        if nested { "nested" } else { "top" }
+    );
+    let (mut ctx, mut events) = call_ctx(&reg, chat.id, &run_token, &call_id);
     // The rest of `Parked` drops here, and without a release sender no turn
     // waits.
     ctx.provider = Parked::with_first_turn(
@@ -340,7 +359,11 @@ fn a_subagent_asks_for_permission_only_where_the_answer_comes_back(nested: bool)
     let (_answer_tx, answer_rx) = unbounded_channel::<String>();
     ctx.user_response_rx = Some(Arc::new(tokio::sync::Mutex::new(answer_rx)));
     if nested {
-        ctx.task_id = Some(Arc::from(SUBAGENT_TASK_ID));
+        // The task tabs are routed by the task id and the registry behind them
+        // is process-wide, so this test's task id is its own: the tab of
+        // another test that carries the same name would be the one the
+        // permission request reaches.
+        ctx.task_id = Some(Arc::from(format!("{SUBAGENT_TASK_ID}-{}", chat.id)));
     }
 
     let result = exec(&reg, TASK_TOOL, task_input(), &ctx);
@@ -354,9 +377,9 @@ fn a_subagent_asks_for_permission_only_where_the_answer_comes_back(nested: bool)
         assert!(failed && reply.contains(UNATTENDED), "{reply}");
     } else {
         assert!(result.backgrounded);
-        host.wait_permission_request();
-        host.host.event_handle().cancel_plugin_session(CALL_ID);
-        host.task_done();
+        host.wait_permission_request(&call_id);
+        host.host.event_handle().cancel_plugin_session(&call_id);
+        host.task_done(&call_id);
     }
 }
 
@@ -367,8 +390,12 @@ fn a_subagent_asks_for_permission_only_where_the_answer_comes_back(nested: bool)
 fn ctx_background_needs_the_agent_permission(agent: bool) {
     let mut host = Host::mover(agent);
     let chat = Chat::live();
+    // The call id names the session the events are routed to, and the
+    // registry behind it is process-wide, so it carries the chat's own id.
+    let call_id = format!("{CALL_ID}-{}", chat.id);
+    let second_call_id = format!("{SECOND_CALL_ID}-{}", chat.id);
     let (_run, run_token) = CancelToken::new();
-    let (ctx, _events) = call_ctx(&host.reg, chat.id, &run_token, CALL_ID);
+    let (ctx, _events) = call_ctx(&host.reg, chat.id, &run_token, &call_id);
 
     let result = exec(&host.reg, MOVER_TOOL, json!({}), &ctx);
 
@@ -378,7 +405,7 @@ fn ctx_background_needs_the_agent_permission(agent: bool) {
     if agent {
         assert!(reply.starts_with(MOVER_RECEIPT), "{reply}");
         assert_eq!(
-            done_text(&host.task_done()),
+            done_text(&host.task_done(&call_id)),
             (MOVER_FINAL.to_owned(), false)
         );
     } else {
@@ -393,8 +420,12 @@ fn ctx_background_needs_the_agent_permission(agent: bool) {
 fn a_background_deadline_needs_the_agent_permission(agent: bool) {
     let host = Host::mover(agent);
     let chat = Chat::live();
+    // The call id names the session the events are routed to, and the
+    // registry behind it is process-wide, so it carries the chat's own id.
+    let call_id = format!("{CALL_ID}-{}", chat.id);
+    let second_call_id = format!("{SECOND_CALL_ID}-{}", chat.id);
     let (_run, run_token) = CancelToken::new();
-    let (ctx, _events) = call_ctx(&host.reg, chat.id, &run_token, CALL_ID);
+    let (ctx, _events) = call_ctx(&host.reg, chat.id, &run_token, &call_id);
 
     let result = exec(&host.reg, DEADLINE_MOVER_TOOL, json!({}), &ctx);
 
@@ -413,10 +444,16 @@ fn a_background_deadline_needs_the_agent_permission(agent: bool) {
 fn ctx_background_refuses_a_subagents_call() {
     let host = Host::mover(true);
     let chat = Chat::live();
+    // The call id names the session the events are routed to, and the
+    // registry behind it is process-wide, so it carries the chat's own id.
+    let call_id = format!("{CALL_ID}-{}", chat.id);
+    let second_call_id = format!("{SECOND_CALL_ID}-{}", chat.id);
     let subagent = SessionMailbox::register(MakiId::generate());
     let (_run, run_token) = CancelToken::new();
-    let (mut ctx, _events) = call_ctx(&host.reg, chat.id, &run_token, CALL_ID);
-    ctx.task_id = Some(Arc::from(SUBAGENT_TASK_ID));
+    let (mut ctx, _events) = call_ctx(&host.reg, chat.id, &run_token, &call_id);
+    // The task tabs are routed by the task id and the registry behind them is
+    // process-wide, so this test's task id is its own.
+    ctx.task_id = Some(Arc::from(format!("{SUBAGENT_TASK_ID}-{}", chat.id)));
     ctx.mailbox = Some(subagent.clone());
 
     let result = exec(&host.reg, MOVER_TOOL, json!({}), &ctx);
@@ -435,8 +472,12 @@ fn ctx_background_refuses_a_subagents_call() {
 fn ctx_background_refuses_a_call_nested_in_another_tool() {
     let host = Host::mover(true);
     let chat = Chat::live();
+    // The call id names the session the events are routed to, and the
+    // registry behind it is process-wide, so it carries the chat's own id.
+    let call_id = format!("{CALL_ID}-{}", chat.id);
+    let second_call_id = format!("{SECOND_CALL_ID}-{}", chat.id);
     let (_run, run_token) = CancelToken::new();
-    let (mut ctx, _events) = call_ctx(&host.reg, chat.id, &run_token, CALL_ID);
+    let (mut ctx, _events) = call_ctx(&host.reg, chat.id, &run_token, &call_id);
     ctx.tool_use_id = None;
 
     let result = exec(&host.reg, MOVER_TOOL, json!({}), &ctx);
@@ -468,18 +509,22 @@ fn ctx_background_without_a_seed_names_the_cause(session_up: bool, reason: &str)
 fn a_message_reaches_a_running_background_task_at_its_next_turn() {
     let mut host = Host::task(Arc::new(ToolRegistry::new()));
     let chat = Chat::live();
+    // The call id names the session the events are routed to, and the
+    // registry behind it is process-wide, so it carries the chat's own id.
+    let call_id = format!("{CALL_ID}-{}", chat.id);
+    let second_call_id = format!("{SECOND_CALL_ID}-{}", chat.id);
     let parked = Parked::new(RESULT);
     let (_run, run_token) = CancelToken::new();
-    let (mut ctx, _events) = call_ctx(&host.reg, chat.id, &run_token, CALL_ID);
+    let (mut ctx, _events) = call_ctx(&host.reg, chat.id, &run_token, &call_id);
     ctx.provider = Arc::clone(&parked.provider);
 
     let (receipt, _) = done_text(&exec(&host.reg, TASK_TOOL, task_input(), &ctx));
-    assert!(receipt.contains(CALL_ID), "{receipt}");
+    assert!(receipt.contains(&call_id), "{receipt}");
     parked.wait_started();
     assert_eq!(parked.user_turns.recv().unwrap(), [PROMPT]);
 
     assert_eq!(
-        message(&host, chat.id, CALL_ID, false),
+        message(&host, chat.id, &call_id, false),
         (QUEUED.to_owned(), false)
     );
     parked.release.send(()).unwrap();
@@ -492,8 +537,11 @@ fn a_message_reaches_a_running_background_task_at_its_next_turn() {
         "{interrupt}"
     );
     parked.release.send(()).unwrap();
-    assert_eq!(done_text(&host.task_done()), (RESULT.to_owned(), false));
-    assert_refused(&host, chat.id, CALL_ID);
+    assert_eq!(
+        done_text(&host.task_done(&call_id)),
+        (RESULT.to_owned(), false)
+    );
+    assert_refused(&host, chat.id, &call_id);
 }
 
 /// A task still waiting for a slot has opened its session but not prompted
@@ -503,11 +551,15 @@ fn a_message_reaches_a_running_background_task_at_its_next_turn() {
 fn a_message_to_a_task_waiting_for_a_slot_rides_with_its_first_prompt() {
     let mut host = Host::task_with_slots(Arc::new(ToolRegistry::new()), 1);
     let chat = Chat::live();
+    // The call id names the session the events are routed to, and the
+    // registry behind it is process-wide, so it carries the chat's own id.
+    let call_id = format!("{CALL_ID}-{}", chat.id);
+    let second_call_id = format!("{SECOND_CALL_ID}-{}", chat.id);
     let parked = Parked::new(RESULT);
     let (_run, run_token) = CancelToken::new();
-    let (mut first, _first_events) = call_ctx(&host.reg, chat.id, &run_token, CALL_ID);
+    let (mut first, _first_events) = call_ctx(&host.reg, chat.id, &run_token, &call_id);
     first.provider = Arc::clone(&parked.provider);
-    let (mut second, _second_events) = call_ctx(&host.reg, chat.id, &run_token, SECOND_CALL_ID);
+    let (mut second, _second_events) = call_ctx(&host.reg, chat.id, &run_token, &second_call_id);
     second.provider = Arc::clone(&parked.provider);
 
     assert!(exec(&host.reg, TASK_TOOL, task_input(), &first).backgrounded);
@@ -515,7 +567,7 @@ fn a_message_to_a_task_waiting_for_a_slot_rides_with_its_first_prompt() {
     assert!(exec(&host.reg, TASK_TOOL, task_input(), &second).backgrounded);
 
     assert_eq!(
-        message(&host, chat.id, SECOND_CALL_ID, false),
+        message(&host, chat.id, &second_call_id, false),
         (QUEUED.to_owned(), false)
     );
     parked.release.send(()).unwrap();
@@ -523,7 +575,7 @@ fn a_message_to_a_task_waiting_for_a_slot_rides_with_its_first_prompt() {
     parked.release.send(()).unwrap();
     let turns: Vec<_> = parked.user_turns.try_iter().collect();
     assert_eq!(turns, [vec![PROMPT], vec![MESSAGE, PROMPT]]);
-    host.task_dones(&[CALL_ID, SECOND_CALL_ID]);
+    host.task_dones(&[&call_id, &second_call_id]);
 }
 
 /// An interrupt does not wait for the turn to end: the parked reply is cut,
@@ -532,9 +584,13 @@ fn a_message_to_a_task_waiting_for_a_slot_rides_with_its_first_prompt() {
 fn an_interrupt_cuts_a_background_tasks_turn_and_it_goes_on() {
     let mut host = Host::task(Arc::new(ToolRegistry::new()));
     let chat = Chat::live();
+    // The call id names the session the events are routed to, and the
+    // registry behind it is process-wide, so it carries the chat's own id.
+    let call_id = format!("{CALL_ID}-{}", chat.id);
+    let second_call_id = format!("{SECOND_CALL_ID}-{}", chat.id);
     let parked = Parked::new(RESULT);
     let (_run, run_token) = CancelToken::new();
-    let (mut ctx, _events) = call_ctx(&host.reg, chat.id, &run_token, CALL_ID);
+    let (mut ctx, _events) = call_ctx(&host.reg, chat.id, &run_token, &call_id);
     ctx.provider = Arc::clone(&parked.provider);
 
     assert!(exec(&host.reg, TASK_TOOL, task_input(), &ctx).backgrounded);
@@ -542,7 +598,7 @@ fn an_interrupt_cuts_a_background_tasks_turn_and_it_goes_on() {
     assert_eq!(parked.user_turns.recv().unwrap(), [PROMPT]);
 
     assert_eq!(
-        message(&host, chat.id, CALL_ID, true),
+        message(&host, chat.id, &call_id, true),
         (INTERRUPTED.to_owned(), false)
     );
     parked.wait_started();
@@ -553,7 +609,10 @@ fn an_interrupt_cuts_a_background_tasks_turn_and_it_goes_on() {
         "{interrupt}"
     );
     parked.release.send(()).unwrap();
-    assert_eq!(done_text(&host.task_done()), (RESULT.to_owned(), false));
+    assert_eq!(
+        done_text(&host.task_done(&call_id)),
+        (RESULT.to_owned(), false)
+    );
 }
 
 /// A user stop does not wait for the task to end, and the message must not
@@ -562,17 +621,21 @@ fn an_interrupt_cuts_a_background_tasks_turn_and_it_goes_on() {
 fn a_message_is_refused_by_a_task_the_user_just_stopped() {
     let mut host = Host::task(Arc::new(ToolRegistry::new()));
     let chat = Chat::live();
+    // The call id names the session the events are routed to, and the
+    // registry behind it is process-wide, so it carries the chat's own id.
+    let call_id = format!("{CALL_ID}-{}", chat.id);
+    let second_call_id = format!("{SECOND_CALL_ID}-{}", chat.id);
     let parked = Parked::new(RESULT);
     let (_run, run_token) = CancelToken::new();
-    let (mut ctx, _events) = call_ctx(&host.reg, chat.id, &run_token, CALL_ID);
+    let (mut ctx, _events) = call_ctx(&host.reg, chat.id, &run_token, &call_id);
     ctx.provider = Arc::clone(&parked.provider);
 
     assert!(exec(&host.reg, TASK_TOOL, task_input(), &ctx).backgrounded);
     parked.wait_started();
 
-    host.host.event_handle().cancel_plugin_session(CALL_ID);
-    assert_refused(&host, chat.id, CALL_ID);
-    host.task_done();
+    host.host.event_handle().cancel_plugin_session(&call_id);
+    assert_refused(&host, chat.id, &call_id);
+    host.task_done(&call_id);
 }
 
 /// Only the chat that started a task reaches it.
@@ -580,21 +643,25 @@ fn a_message_is_refused_by_a_task_the_user_just_stopped() {
 fn a_message_is_refused_by_tasks_the_caller_cannot_reach() {
     let host = Host::task(Arc::new(ToolRegistry::new()));
     let chat = Chat::live();
+    // The call id names the session the events are routed to, and the
+    // registry behind it is process-wide, so it carries the chat's own id.
+    let call_id = format!("{CALL_ID}-{}", chat.id);
+    let second_call_id = format!("{SECOND_CALL_ID}-{}", chat.id);
     let other = Chat::live();
     let parked = Parked::new(RESULT);
     let (_run, run_token) = CancelToken::new();
-    let (mut ctx, _events) = call_ctx(&host.reg, chat.id, &run_token, CALL_ID);
+    let (mut ctx, _events) = call_ctx(&host.reg, chat.id, &run_token, &call_id);
     ctx.provider = Arc::clone(&parked.provider);
 
     assert!(exec(&host.reg, TASK_TOOL, task_input(), &ctx).backgrounded);
     parked.wait_started();
 
-    assert_refused(&host, other.id, CALL_ID);
-    assert_refused(&host, chat.id, SECOND_CALL_ID);
+    assert_refused(&host, other.id, &call_id);
+    assert_refused(&host, chat.id, &second_call_id);
     let mut agent = chat.seed.tool_context(CancelToken::none());
     agent.mailbox = Some(chat.mailbox.clone());
-    exec(&host.reg, STOP_TOOL, json!({ "id": CALL_ID }), &agent);
-    assert_refused(&host, chat.id, CALL_ID);
+    exec(&host.reg, STOP_TOOL, json!({ "id": call_id }), &agent);
+    assert_refused(&host, chat.id, &call_id);
 }
 
 /// Ctrl+B still moves a blocking task with `allow_background` off, where
@@ -604,9 +671,13 @@ fn a_task_moved_without_allow_background_has_no_message_tool_and_still_reports()
     let mut host = Host::task_with_opts(Arc::new(ToolRegistry::new()), false, DEFAULT_SLOTS);
     assert!(host.reg.get(MESSAGE_TOOL).is_none());
     let chat = Chat::live();
+    // The call id names the session the events are routed to, and the
+    // registry behind it is process-wide, so it carries the chat's own id.
+    let call_id = format!("{CALL_ID}-{}", chat.id);
+    let second_call_id = format!("{SECOND_CALL_ID}-{}", chat.id);
     let parked = Parked::new(RESULT);
     let (_run, run_token) = CancelToken::new();
-    let (mut ctx, _events) = call_ctx(&host.reg, chat.id, &run_token, CALL_ID);
+    let (mut ctx, _events) = call_ctx(&host.reg, chat.id, &run_token, &call_id);
     ctx.provider = Arc::clone(&parked.provider);
 
     let reg = Arc::clone(&host.reg);
@@ -620,7 +691,7 @@ fn a_task_moved_without_allow_background_has_no_message_tool_and_still_reports()
     });
     parked.wait_started();
     assert_eq!(
-        request_move(&host.host.event_handle(), CALL_ID),
+        request_move(&host.host.event_handle(), &call_id),
         MoveOutcome::Moved
     );
     let result = call.join().expect("task call");
@@ -628,7 +699,10 @@ fn a_task_moved_without_allow_background_has_no_message_tool_and_still_reports()
     assert!(done_text(&result).0.starts_with(MOVED_RECEIPT));
 
     parked.release.send(()).unwrap();
-    assert_eq!(done_text(&host.task_done()), (RESULT.to_owned(), false));
+    assert_eq!(
+        done_text(&host.task_done(&call_id)),
+        (RESULT.to_owned(), false)
+    );
 }
 
 /// The model sent its background tasks out in one batch, and the batch moved
@@ -642,9 +716,13 @@ fn the_tasks_of_a_moved_batch_are_reached_by_the_batchs_id_or_their_own() {
         .load_source_with_permissions(BATCH_PLUGIN, BATCH, PluginPermissions::trusted())
         .unwrap();
     let chat = Chat::live();
+    // The call id names the session the events are routed to, and the
+    // registry behind it is process-wide, so it carries the chat's own id.
+    let call_id = format!("{CALL_ID}-{}", chat.id);
+    let second_call_id = format!("{SECOND_CALL_ID}-{}", chat.id);
     let parked = Parked::new(RESULT);
     let (_run, run_token) = CancelToken::new();
-    let (mut ctx, _events) = call_ctx(&host.reg, chat.id, &run_token, CALL_ID);
+    let (mut ctx, _events) = call_ctx(&host.reg, chat.id, &run_token, &call_id);
     ctx.provider = Arc::clone(&parked.provider);
     let tasks = [NAME, SECOND_NAME].map(|name| {
         json!({
@@ -669,7 +747,7 @@ fn the_tasks_of_a_moved_batch_are_reached_by_the_batchs_id_or_their_own() {
         parked.wait_started();
     }
 
-    let (sent, failed) = message(&host, chat.id, CALL_ID, false);
+    let (sent, failed) = message(&host, chat.id, &call_id, false);
     assert!(
         !failed && sent.contains(NAME) && sent.contains(SECOND_NAME),
         "{sent}"
@@ -678,7 +756,7 @@ fn the_tasks_of_a_moved_batch_are_reached_by_the_batchs_id_or_their_own() {
     agent.mailbox = Some(chat.mailbox.clone());
     assert_eq!(
         done_text(&exec(&host.reg, STOP_TOOL, json!({ "id": second }), &agent)),
-        (format!("{NESTED_STOPPED}{CALL_ID}."), false)
+        (format!("{NESTED_STOPPED}{call_id}."), false)
     );
     assert_refused(&host, chat.id, second);
     assert_eq!(
@@ -689,5 +767,5 @@ fn the_tasks_of_a_moved_batch_are_reached_by_the_batchs_id_or_their_own() {
     // Dropping the release sender lets every turn finish, however many the
     // queued messages add.
     drop(parked);
-    host.task_done();
+    host.task_done(&call_id);
 }

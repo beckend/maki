@@ -604,6 +604,7 @@ mod tests {
     #[test_case(HTTP_PROTOBUF, "http://collector:4318/v1/metrics"; "http_appends_the_signal_path")]
     #[test_case(GRPC, ENDPOINT; "grpc_uses_it_as_given")]
     fn generic_lua_endpoint(protocol: &str, expected: &str) {
+        let _env = crate::EnvGuard::take();
         isolate_env();
         let otlp = Otlp::new(&lua(protocol), Signal::Metrics).unwrap();
         assert_eq!(otlp.endpoint.as_deref(), Some(expected));
@@ -611,6 +612,7 @@ mod tests {
 
     #[test]
     fn per_signal_lua_keys_win_and_headers_merge() {
+        let _env = crate::EnvGuard::take();
         isolate_env();
         let config = TelemetryConfig {
             logs_protocol: Some(GRPC.to_string()),
@@ -636,6 +638,7 @@ mod tests {
 
     #[test]
     fn generic_lua_keys_yield_to_a_signal_variable() {
+        let _env = crate::EnvGuard::take();
         isolate_env();
         for env in [
             OTEL_EXPORTER_OTLP_METRICS_PROTOCOL,
@@ -667,6 +670,7 @@ mod tests {
     #[test_case(Signal::Metrics, Transport::Http(None); "own_endpoint_variable_drops_it")]
     #[test_case(Signal::Logs, Transport::Grpc; "other_signal_keeps_it")]
     fn generic_lua_protocol_with_a_signal_endpoint_variable(signal: Signal, expected: Transport) {
+        let _env = crate::EnvGuard::take();
         isolate_env();
         unsafe { env::set_var(OTEL_EXPORTER_OTLP_METRICS_ENDPOINT, ENDPOINT) };
         assert_eq!(Otlp::new(&lua(GRPC), signal).unwrap().transport, expected);
@@ -676,6 +680,7 @@ mod tests {
     #[test_case(Signal::Metrics, &[("authorization", "Bearer%20x")]; "merged_under_the_signal_variable")]
     #[test_case(Signal::Logs, &[]; "left_to_the_sdk")]
     fn generic_header_variable(signal: Signal, expected: &[(&str, &str)]) {
+        let _env = crate::EnvGuard::take();
         isolate_env();
         unsafe {
             env::set_var(OTEL_EXPORTER_OTLP_HEADERS, "authorization=Bearer%20x");
@@ -692,6 +697,7 @@ mod tests {
     #[test_case("a=1, b = 2 ,=3,c=,d", &[("a", "1"), ("b", "2")]; "skips_what_the_sdk_skips")]
     #[test_case("", &[]; "empty")]
     fn parses_headers_like_the_sdk(raw: &str, expected: &[(&str, &str)]) {
+        let _env = crate::EnvGuard::take();
         let expected: Vec<_> = expected
             .iter()
             .map(|&(key, value)| (key.to_string(), value.to_string()))
@@ -703,17 +709,20 @@ mod tests {
     #[test_case("100%", "100%"; "invalid_escape_stays")]
     #[test_case("plain", "plain"; "plain")]
     fn percent_decodes_metadata(raw: &str, expected: &str) {
+        let _env = crate::EnvGuard::take();
         assert_eq!(percent_decoded(raw), expected);
     }
 
     #[test_case("GRPC", Transport::Grpc; "grpc")]
     #[test_case("HTTP/JSON", Transport::Http(Some(Protocol::HttpJson)); "http_json")]
     fn lua_protocol_in_any_case(raw: &str, expected: Transport) {
+        let _env = crate::EnvGuard::take();
         assert_eq!(parse_transport(LUA_PROTOCOL, Some(raw)), Ok(Some(expected)));
     }
 
     #[test]
     fn lua_compression_in_any_case() {
+        let _env = crate::EnvGuard::take();
         assert_eq!(parse_compression("GZIP"), Ok(Some(Compression::Gzip)));
     }
 
@@ -722,6 +731,7 @@ mod tests {
     #[test_case(None, Some("sometimes"), Temporality::Delta; "invalid_variable_falls_back")]
     #[test_case(Some("lowmemory"), None, Temporality::LowMemory; "lua")]
     fn temporality_is(lua: Option<&str>, env: Option<&str>, expected: Temporality) {
+        let _env = crate::EnvGuard::take();
         isolate_env();
         if let Some(env) = env {
             unsafe { env::set_var(OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE, env) };
@@ -737,6 +747,7 @@ mod tests {
     #[test_case(&[(ENV_LOGS_EXPORT_INTERVAL, "250"), (OTEL_BLRP_SCHEDULE_DELAY, "500")], Ok(Some(250)); "claude_code_variable_first")]
     #[test_case(&[(ENV_LOGS_EXPORT_INTERVAL, "0")], Err(ENV_LOGS_EXPORT_INTERVAL); "zero_is_rejected")]
     fn logs_interval(env: &[(&str, &str)], expected: Result<Option<u64>, &str>) {
+        let _env = crate::EnvGuard::take();
         isolate_env();
         for (key, value) in env {
             unsafe { env::set_var(key, value) };
@@ -761,11 +772,13 @@ mod tests {
     #[test_case("collector:4317", true, false; "schemeless_insecure")]
     #[test_case("collector:4317/a://b", true, false; "separator_after_a_path")]
     fn grpc_roots_only_where_the_sdk_uses_tls(endpoint: &str, insecure: bool, expected: bool) {
+        let _env = crate::EnvGuard::take();
         assert_eq!(reached_over_tls(endpoint, insecure), expected);
     }
 
     #[test]
     fn rejects_an_invalid_http_header() {
+        let _env = crate::EnvGuard::take();
         let config = TelemetryConfig {
             headers: Some(BTreeMap::from([(
                 "authorization".to_string(),
@@ -782,6 +795,7 @@ mod tests {
 
     #[test]
     fn lua_compression_none_leaves_it_unset() {
+        let _env = crate::EnvGuard::take();
         let config = TelemetryConfig {
             compression: Some(COMPRESSION_NONE.to_string()),
             ..lua(GRPC)
@@ -791,6 +805,7 @@ mod tests {
 
     #[test]
     fn rejects_compression_that_is_not_compiled_in() {
+        let _env = crate::EnvGuard::take();
         let config = TelemetryConfig {
             compression: Some("zstd".to_string()),
             ..lua(GRPC)
@@ -804,6 +819,7 @@ mod tests {
 
     #[test]
     fn rejects_an_unknown_lua_protocol() {
+        let _env = crate::EnvGuard::take();
         let err = Otlp::new(&lua("udp"), Signal::Metrics).err().unwrap();
         assert_eq!(
             err,
@@ -813,6 +829,7 @@ mod tests {
 
     #[test]
     fn rejects_a_queue_the_sdk_cannot_allocate() {
+        let _env = crate::EnvGuard::take();
         let size = MAX_LOGS_QUEUE_SIZE + 1;
         let config = TelemetryConfig {
             logs_max_queue_size: Some(size),
@@ -830,6 +847,7 @@ mod tests {
 
     #[test]
     fn rejects_a_zero_logs_interval() {
+        let _env = crate::EnvGuard::take();
         isolate_env();
         let config = TelemetryConfig {
             logs_interval_ms: Some(0),
@@ -843,6 +861,7 @@ mod tests {
 
     #[test]
     fn rejects_a_zero_metrics_interval() {
+        let _env = crate::EnvGuard::take();
         let config = TelemetryConfig {
             metrics_interval_ms: Some(0),
             ..TelemetryConfig::default()
@@ -878,6 +897,7 @@ mod tests {
     #[test_case(CONSOLE, GRPC, ""; "console")]
     #[tokio::test]
     async fn providers_build_for_every_exporter(exporter: &str, protocol: &str, endpoint: &str) {
+        let _env = crate::EnvGuard::take();
         isolate_env();
         let config = TelemetryConfig {
             enabled: Some(true),

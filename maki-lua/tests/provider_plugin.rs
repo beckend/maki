@@ -15,8 +15,8 @@ use std::fs;
 use std::iter;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::mpsc::sync_channel;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use maki_agent::tools::ToolRegistry;
@@ -26,7 +26,7 @@ use maki_providers::model::{Model, ModelTier};
 use maki_providers::provider::Provider;
 use maki_providers::retry::RetryKind;
 use maki_providers::test_support::{
-    Canned, JSON_HEADERS, Recorded, Requests, isolated_home, serve,
+    Canned, IsolatedHome, JSON_HEADERS, Recorded, Requests, isolated_home, serve,
 };
 use maki_providers::{
     AgentError, Effort, Message, ProviderEvent, RequestOptions, StopReason, StreamResponse,
@@ -34,17 +34,28 @@ use maki_providers::{
 };
 use maki_storage::StateDir;
 use maki_storage::auth::{load_plugin_auth, lock_plugin_store};
+use maki_storage::id::MakiId;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use test_case::test_case;
 use tokio::sync::mpsc::unbounded_channel;
+
+/// The provider registry is one process-wide map, and the credentials a
+/// plugin mints are kept per slug, so the tests that load one run one at a
+/// time: two at once share the registry, the credentials and the recorded
+/// server's address, and each sees the other's.
+static PLUGIN_LOAD: Mutex<()> = Mutex::new(());
+
+/// Holds the provider registry still while a test works with it.
+fn plugin_load() -> MutexGuard<'static, ()> {
+    PLUGIN_LOAD.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 const SLUG: &str = "acmelua";
 const DISPLAY_NAME: &str = "Acme (Lua)";
 const MODEL: &str = "acme-1";
 /// The origin a user points the slug at, which is the one a hook's side
 /// requests reach unguarded, loopback included.
-const BASE_URL_ENV: &str = "ACMELUA_BASE_URL";
 const MODELS_PATH: &str = "/models";
 const LISTED_WINDOW: u32 = 128000;
 const LOOPBACK_HOST: &str = "127.0.0.1";
@@ -197,8 +208,26 @@ const OVERLOADED_SCRIPT: &[Canned] = &[Canned {
     path: None,
 }];
 
-fn fixture_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/provider_plugin/init.lua")
+/// The fixture plugin's own copy, in a directory named for this test.
+///
+/// The plugin's name is the owner of the credentials it mints, and a name
+/// another test shares would share those credentials too: the cell is kept
+/// per slug and only a new owner takes it over. So every test loads the
+/// fixture under a name of its own.
+fn fixture_dir(home: &IsolatedHome) -> (PathBuf, String) {
+    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/provider_plugin");
+    let id = MakiId::generate();
+    let dir = home.path().join(format!("provider_plugin_{id}"));
+    fs::create_dir_all(&dir).expect(TEMPDIR_FAILED);
+    // The slug is a process-global key: the credentials a plugin mints are
+    // kept per slug, so a slug another test shares would share those
+    // credentials too.
+    let slug = format!("acmelua-{id}");
+    for file in ["init.lua", "plugin.toml"] {
+        let source = fs::read_to_string(source.join(file)).expect(IO_FAILED);
+        fs::write(dir.join(file), source.replace(SLUG, &slug)).expect(WRITE_FAILED);
+    }
+    (dir, slug)
 }
 
 /// A grant to reach exactly one host, the way a `plugin.toml` with a
@@ -211,6 +240,11 @@ fn permissions_for(host: &str) -> PluginPermissions {
 
 fn bearer(token: &str) -> String {
     format!("Bearer {token}")
+}
+
+/// The environment variable a slug's origin is read from.
+fn base_url_env(slug: &str) -> String {
+    maki_config::providers::base_url_env_var(slug)
 }
 
 fn plugin_host() -> PluginHost {
@@ -233,8 +267,10 @@ fn load_inline(host: &PluginHost, source: &str, net_host: &str, slugs: &[&str]) 
 struct Fixture {
     provider: Box<dyn Provider>,
     server: Requests,
+    /// The slug this fixture's plugin registered under.
+    slug: String,
     _host: PluginHost,
-    _home: TempDir,
+    _home: IsolatedHome,
 }
 
 impl Fixture {
@@ -244,16 +280,20 @@ impl Fixture {
         Self::at(home, &base_url, server)
     }
 
-    fn at(home: TempDir, base_url: &str, server: Requests) -> Self {
-        unsafe { std::env::set_var(BASE_URL_ENV, base_url) };
-
+    fn at(home: IsolatedHome, base_url: &str, server: Requests) -> Self {
         let host = plugin_host();
-        host.load_plugin_file(&fixture_path()).expect(LOAD_FAILED);
+        let (dir, slug) = fixture_dir(&home);
+        // The origin is read from the variable the slug names, so it is the
+        // fixture's own slug that is set.
+        unsafe { std::env::set_var(base_url_env(&slug), base_url) };
+        host.load_plugin_file(&dir.join("init.lua"))
+            .expect(LOAD_FAILED);
         plugin::commit_load();
 
         Self {
-            provider: plugin::create(SLUG, Timeouts::default()).expect(CREATE_FAILED),
+            provider: plugin::create(&slug, Timeouts::default()).expect(CREATE_FAILED),
             server,
+            slug,
             _host: host,
             _home: home,
         }
@@ -263,7 +303,7 @@ impl Fixture {
         &self,
         thinking: ThinkingConfig,
     ) -> (Vec<ProviderEvent>, Result<StreamResponse, AgentError>) {
-        let model = Model::from_spec(&format!("{SLUG}/{MODEL}")).expect(UNKNOWN_MODEL);
+        let model = Model::from_spec(&format!("{}/{MODEL}", self.slug)).expect(UNKNOWN_MODEL);
         stream(self.provider.as_ref(), &model, thinking)
     }
 
@@ -320,6 +360,7 @@ fn stream(
 /// the key the hook deleted never reaches the wire.
 #[test]
 fn a_recorded_turn_streams_its_events_and_posts_the_body_the_hook_built() {
+    let _load = plugin_load();
     let fixture = Fixture::start(CHAT_SCRIPT);
 
     let (events, result) = fixture.stream(ThinkingConfig::Effort(ASKED_EFFORT));
@@ -368,6 +409,7 @@ fn a_recorded_turn_streams_its_events_and_posts_the_body_the_hook_built() {
 /// holds the token the refresh minted and wrote.
 #[test]
 fn the_auth_hooks_drive_the_credential_lifecycle() {
+    let _load = plugin_load();
     let fixture = Fixture::start(REFRESH_SCRIPT);
 
     fixture.stream(ThinkingConfig::Off).1.expect(STREAM_FAILED);
@@ -392,6 +434,7 @@ fn the_auth_hooks_drive_the_credential_lifecycle() {
 /// the call below comes back as a hook timeout rather than as a token.
 #[test]
 fn a_refresh_hook_persists_the_token_it_minted() {
+    let _load = plugin_load();
     let fixture = Fixture::start(NO_REQUESTS);
 
     runtime()
@@ -399,7 +442,7 @@ fn a_refresh_hook_persists_the_token_it_minted() {
         .expect(HOOK_FAILED);
 
     let dir = StateDir::resolve().expect(NO_STATE_DIR);
-    let stored = load_plugin_auth(&dir, SLUG).expect(NO_CREDENTIALS);
+    let stored = load_plugin_auth(&dir, &fixture.slug).expect(NO_CREDENTIALS);
     assert_eq!(stored[TOKEN_KEY], json!(RENEWED_TOKEN));
 }
 
@@ -409,6 +452,7 @@ fn a_refresh_hook_persists_the_token_it_minted() {
 /// absent from it.
 #[test]
 fn list_models_and_fetch_usage_answer_from_their_hooks() {
+    let _load = plugin_load();
     let fixture = Fixture::start(MODELS_SCRIPT);
 
     let models = runtime()
@@ -466,6 +510,7 @@ fn map_error_restates_the_status_and_keeps_retry_after(
 /// raise for it, `Retry-After` included.
 #[test]
 fn a_refused_side_request_is_the_native_error() {
+    let _load = plugin_load();
     let fixture = Fixture::start(OVERLOADED_SCRIPT);
 
     let error = runtime()
@@ -484,6 +529,7 @@ fn a_refused_side_request_is_the_native_error() {
 /// it is, not as a broken hook.
 #[test]
 fn a_side_request_that_cannot_connect_is_a_transport_error() {
+    let _load = plugin_load();
     let closed = TcpListener::bind((LOOPBACK_HOST, 0)).expect(IO_FAILED);
     let base_url = format!("http://{}", closed.local_addr().expect(IO_FAILED));
     drop(closed);
@@ -500,16 +546,21 @@ fn a_side_request_that_cannot_connect_is_a_transport_error() {
 /// plugin provider an auth target, and both halves run against a real host.
 #[test]
 fn a_login_hook_is_what_makes_the_slug_an_auth_target() {
-    let _fixture = Fixture::start(NO_REQUESTS);
+    let _load = plugin_load();
+    let fixture = Fixture::start(NO_REQUESTS);
 
     assert!(
-        plugin::auth_providers().contains(&(SLUG.to_owned(), DISPLAY_NAME.to_owned())),
+        plugin::auth_providers().contains(&(fixture.slug.clone(), DISPLAY_NAME.to_owned())),
         "{:?}",
         plugin::auth_providers()
     );
-    runtime().block_on(plugin::login(SLUG)).expect(HOOK_FAILED);
+    runtime()
+        .block_on(plugin::login(&fixture.slug))
+        .expect(HOOK_FAILED);
     assert!(
-        runtime().block_on(plugin::logout(SLUG)).expect(HOOK_FAILED),
+        runtime()
+            .block_on(plugin::logout(&fixture.slug))
+            .expect(HOOK_FAILED),
         "{HOOK_FAILED}"
     );
 }
@@ -536,6 +587,7 @@ maki.provider.register({{
 /// branch builds its body somewhere else entirely, so it gets its own case.
 #[test]
 fn the_responses_codec_applies_the_body_hook_too() {
+    let _load = plugin_load();
     let _state = isolated_home();
     let (base_url, server) = serve(RESPONSES_SCRIPT);
     let host = plugin_host();
@@ -596,6 +648,7 @@ maki.provider.register({{
 #[test_case("anthropic" ; "anthropic")]
 #[test_case("google" ; "google")]
 fn a_header_the_auth_hook_sets_replaces_makis_own(codec: &str) {
+    let _load = plugin_load();
     let _home = isolated_home();
     let (base_url, server) = serve(REJECTED_SCRIPT);
     let host = plugin_host();
@@ -690,6 +743,7 @@ fn wait_for(path: &Path) {
 /// A parked host would otherwise hang the test for good instead of failing it.
 #[test]
 fn a_credential_write_does_not_park_the_plugin_host() {
+    let _load = plugin_load();
     let state = isolated_home();
     let entered = state.path().join("entered");
     let done = state.path().join("done");
@@ -725,6 +779,7 @@ fn a_credential_write_does_not_park_the_plugin_host() {
 /// on belong to the handle and go only once nobody holds it.
 #[test]
 fn an_in_flight_hook_call_survives_a_plugin_reload() {
+    let _load = plugin_load();
     let state = isolated_home();
     let started = state.path().join("started");
     let release = state.path().join("release");
@@ -748,6 +803,7 @@ fn an_in_flight_hook_call_survives_a_plugin_reload() {
 /// maki ships stays reserved, even when its bundled plugin is turned off.
 #[test]
 fn a_third_party_plugin_cannot_take_a_builtin_slug() {
+    let _load = plugin_load();
     let _state = isolated_home();
     let host = plugin_host();
     plugin::begin_load();
@@ -790,6 +846,7 @@ fn takeover_catalog_cached() {
 /// holds no grant at all.
 #[test]
 fn every_registered_slug_needs_the_grant_a_package_load_carries() {
+    let _load = plugin_load();
     let _state = isolated_home();
     takeover_catalog_cached();
 
@@ -852,6 +909,7 @@ fn every_registered_slug_needs_the_grant_a_package_load_carries() {
 /// does.
 #[test]
 fn a_failed_package_load_keeps_its_granted_slug_owned() {
+    let _load = plugin_load();
     let _state = isolated_home();
     takeover_catalog_cached();
 

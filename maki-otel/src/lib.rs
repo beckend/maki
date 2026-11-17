@@ -291,6 +291,34 @@ fn handle() -> Option<&'static Handle> {
     enabled().then(|| HANDLE.get()).flatten()
 }
 
+/// The telemetry configuration is read from the environment, and the
+/// environment is process-wide, so the tests that read it and the tests that
+/// set it take turns at it: two at once read each other's variables.
+#[cfg(test)]
+pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The turn at the environment a test holds.
+///
+/// It starts from a clean one: a variable another test set would otherwise be
+/// read as this test's own, and the tests here leave what they set behind.
+#[cfg(test)]
+pub(crate) struct EnvGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl EnvGuard {
+    pub(crate) fn take() -> Self {
+        let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("OTEL_") {
+                unsafe { std::env::remove_var(&key) };
+            }
+        }
+        Self { _lock: lock }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
