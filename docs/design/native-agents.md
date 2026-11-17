@@ -1,0 +1,1771 @@
+# Native background agents and shell jobs (design)
+
+Status: proposal, branch `native-agents`. Part A covers goals, data model, tool surface,
+delivery and the native-tool mechanism. Part B covers limits, persistence and phases.
+Line references are to maki 0.6.4 on this branch. Revised after two independent reviews (code
+facts re-verified, open questions decided, phases re-split).
+
+## 1. Goals and non-goals
+
+Goals:
+1. Subagents and background shell jobs are core Rust in `maki-agent`, so TUI, `maki -p`,
+   ACP and SDK all get them (headless has no wake consumer today, see
+   `maki-agent/src/live_session.rs:111` `claim_wake`, used only by
+   `maki-ui/src/event_loop.rs:1189` `start_mailbox_runs`).
+2. Free two-way messaging: parent to child, child to parent, sibling to sibling, under a
+   known topology the model can see and the runtime enforces.
+3. One concept (a run, `Unit` in Rust), one id scheme, one state machine, one notice path, one small tool
+   family, for agents and shell jobs alike.
+4. Bounded everything: notices, inboxes, outputs, wake storms. Full bodies are pulled by id.
+5. Cache-safe: topology reaches the model through `tell_changes`/`LiveFacts`, never by
+   editing the system prompt.
+6. Offer a native replacement for the external Lua
+   `maki-monitor` plugin (phase 2b ships the shell replacement; the Lua `task` tool, the
+   Lua APIs and `maki-monitor` are left untouched in v1, see appendix B).
+
+Non-goals: remote or cross-process agents, external-harness children (ACP/Codex as
+children), a workflow DSL, re-adoption of live agent runs or shell jobs after a crash,
+changing the UI tab model beyond consuming new events.
+
+### 1.1 Comparison
+
+| Aspect | dsh | maki today | This design |
+|---|---|---|---|
+| Subsystems | Two (subagent manager, jobs registry) with different ids, states, notices | Three: Lua `task`, Lua `maki.fn.job*` (`maki-lua/src/api/fn.rs:820`), user `maki-monitor` plugin | One `UnitHub`, one `Unit` |
+| Ids | session uuid vs `bash-<16hex>` | task_id (tool_use_id), session_id, mailbox MakiId all differ | One `MakiId` per run, short handle `ag-k3x9ab`/`sh-4m2q7z` plus unique name |
+| States | agents `running\|inactive`, jobs 5 states | ad hoc per UI tab | `Queued Running Idle Stopping Done(reason)`, reason one of completed failed killed timed_out lost max_turns max_tokens refused |
+| Tools | 7+ (`subagent`, `send_message`, `interrupt_agent`, `list_agents`, `job_output/list/kill`) | `task`, bash, plugin tools | 5: `spawn send runs wait stop` |
+| Wait on a child | none in core | none (blocking `task` call) | `wait(ids, any/all, timeout)` |
+| Notice size | unbounded closing message | whole answer is tool result | 4 KiB cap, spill to disk, pull full body |
+| Notice dedupe | wait/kill only | none | any consuming read (wait, runs peek, stop) |
+| Wake budget | opt-in, jobs only | none | default 3 consecutive notice wakes on main, agents and shells |
+| Delivery acks | accepted only | none | accepted, delivered |
+| Inbox bounds | unbounded | mailbox 100 (`live_session.rs:18`) | 32 pending, 16 KiB/message, per-pair rate limit |
+| Siblings | not in core | no | parent/child and `main` by default; siblings via config only |
+| Crash | notice lost, ids dangle | stranded tabs dropped | journal, `lost` state, notice on next wake |
+| Stop | request, no escalation, no cascade | `cancel_all` per run | cascade by default, TERM, grace 5 s, KILL, returns after settle |
+| Cost | none per child | `RunLedger::child` chain (`types.rs:1084`) | same chain, usage in every notice |
+| Headless | `waitForChildren` for agents, jobs not joined | children die with run | hub `join()` joins both, `-p` waits |
+| Topology to model | depth hint at limit | none | per-turn tree fact via `LiveFacts` |
+
+## 2. Data model
+
+### 2.1 Crate placement
+
+New module tree `maki-agent/src/runs/` (no dependency on lua or ui, honoring the dependency
+direction storage, config, providers, agent, lua, ui):
+
+```
+runs/mod.rs        UnitHub, UnitId, UnitHandle, UnitName, Unit, UnitKind, UnitState, DoneReason
+runs/agent.rs      AgentRunner: driver loop owning History for a native agent
+runs/shell.rs      ShellRunner: process spawn, log file, pump, TERM/KILL
+runs/inbox.rs      Inbox, InboxItem, DeliveryKind, rate limiter, ping-pong guard
+runs/notice.rs     Notice, NoticeKind, rendering, spill, consume claims
+runs/topology.rs   Topology snapshot, router, facts rendering
+runs/clock.rs      Clock trait, SystemClock, ManualClock (tests)
+runs/limits.rs     UnitLimits and its config conversion
+runs/journal.rs    adapter over the storage RunJournal (Part B)
+tools/runs.rs      the five native tools (impl Tool, see section 5)
+```
+
+Also `maki-agent/src/test_support.rs` (shared `MockProvider`, `StubStreamProvider`, phase 1),
+`maki-storage/src/runs.rs` (journal) and mirror config types in `maki-config`. UI-facing
+information goes out as new `AgentEvent` variants (`types.rs:642`) over the existing
+`EventSender`, never `UiAction` (which lives in `maki-lua`). `MakiId` stays in
+`maki-storage/src/id.rs:37`.
+
+Naming: this doc says "run" (the model-facing word, tool and config name); the Rust types are
+prefixed `Unit` because `Run*` collides with the per-turn `run_id` (`Envelope.run_id`,
+`types.rs:1195`), `RunContext` (`agent/frame.rs`) and `RunLedger` (`types.rs:1084`).
+
+### 2.2 Ids and names
+
+One id per run: the existing `MakiId` (16 byte uuid). It replaces three ids that mean the same
+thing in different maps today: subagent `task_id: Option<Arc<str>>` (the spawning `tool_use_id`,
+`AgentParams` at `run.rs:102`), the Lua session `MakiId` mailbox key
+(`maki-lua/src/api/agent.rs` ~885) and the UI chat key. For native runs the UI chat key is the
+handle (phase 3); `tool_use_id` is kept as `origin_tool_use_id` for rendering the spawn call.
+
+```rust
+pub struct UnitId(MakiId);                 // internal, persisted, mailbox key
+pub struct UnitHandle(Arc<str>);           // "ag-k3x9ab" | "sh-4m2q7z": kind prefix + 6 base32 chars
+pub struct UnitName(Arc<str>);             // lower-kebab, 1..=32 chars, unique per session tree
+```
+
+The model-facing id is the handle; the name works anywhere an id is accepted. `main` (root
+agent) and `parent` (the caller's parent) are reserved and cannot be used as `name`. A handle
+is derived from the last 4 bytes (a v7 uuid starts with a timestamp) of the `MakiId`; collisions inside one session tree are
+retried at spawn. Names default to a slug of `description`, suffixed `-2`, `-3` on clash.
+Display: name first, handle in parentheses.
+
+`session_id` (`ToolContext.session_id`, provider affinity and otel) stays the root session's id
+for every descendant; it is not an identity and nothing may key run maps by it (comment at
+`maki-lua/src/api/agent.rs` ~879 warns of the collision).
+
+### 2.3 The `Unit` (a "run")
+
+```rust
+pub enum UnitKind {
+    Agent(AgentSpec),   // model, audience, tool filter, output_schema, thinking, one_shot, timeout
+    Shell(ShellSpec),   // command, cwd, timeout, watch regex
+}
+
+pub struct Unit {
+    pub id: UnitId,
+    pub handle: UnitHandle,
+    pub name: UnitName,
+    pub owner: UnitId,           // who gets notices; main agent id for top level
+    pub parent: UnitId,          // who spawned it; equals owner unless re-parented (stop detach only)
+    pub depth: u8,               // main = 0
+    pub kind: UnitKind,
+    pub description: String,     // 3-8 words, display
+    pub origin_tool_use_id: Option<Arc<str>>,
+    pub state: UnitState,
+    pub created_at: SystemTime,
+    pub started_at: Option<SystemTime>,
+    pub finished_at: Option<SystemTime>,
+    pub last_activity: Instant,
+    pub progress: Option<String>,// agent: current tool header; shell: last output line
+    pub usage: TokenUsage,       // own, cumulative; subtree rolled via RunLedger
+    pub cost: f64,
+    pub notice_policy: NoticePolicy, // on_exit | on_match | never, wake or quiet
+}
+
+/// One field, no separate reason: the reason is part of Done.
+pub enum UnitState { Queued, Running, Idle, Stopping, Done(Box<Terminal>) }
+
+pub enum DoneReason {
+    Completed,          // agent EndTurn of a one_shot agent, or idle expiry; shell exit 0
+    Failed,             // agent error; shell nonzero exit
+    Killed,             // stop requested (model, user, cascade, shutdown)
+    TimedOut,           // wall clock hit
+    MaxTurns, MaxTokens,
+    Refused,
+    Lost,               // process or session died, outcome unknown
+}
+
+pub struct Terminal {
+    pub reason: DoneReason,
+    pub exit_code: Option<i32>,
+    pub detail: Option<String>,      // short error or signal text
+    pub result: UnitResult,
+}
+
+pub struct UnitResult {
+    pub summary: String,             // <= 4096 bytes, model-facing
+    pub truncated: bool,
+    pub body_ref: Option<BodyRef>,   // full text on disk when truncated
+    pub structured: Option<serde_json::Value>,
+    pub usage: TokenUsage, pub cost: f64, pub turns: u32, pub elapsed_ms: u64,
+}
+```
+
+`Idle` exists only for agents: the run finished a turn, has no pending wakeable inbox and may be
+woken by `send`; its last turn result is held in the record. A dsh agent's `inactive`
+conflates idle, finished, crashed and unloaded; here each is distinct. An agent is spawned
+continuable by default; `one_shot: true` makes it `Done(Completed)` instead of `Idle`.
+
+### 2.4 Hub
+
+```rust
+pub struct UnitHub {                       // one per root session, Arc
+    units: Mutex<UnitTable>,               // id -> entry, name index, children index
+    cancel: CancelToken,                   // session-lifetime root; runs hold child tokens
+    ledger: Arc<RunLedger>,                // root ledger; each run holds RunLedger::child
+    events: EventSender,                   // run_id 0, stamped with SubagentInfo for agents
+    limits: UnitLimits,
+    notices: NoticeRouter,
+    waiters: WaiterSet,                    // wait() registrations and consume claims
+}
+```
+
+Creation (5.3): in the TUI next to `publish_seed` (`maki-ui/src/agent/agent_loop.rs:85`) and
+stored in `AgentSeed` (`live_session.rs:53`, registered in `LIVE_SESSIONS` at `:22`); in
+headless beside `SessionMailbox::register` (`headless.rs:190`, `:339`) with no seed, passed
+straight to `AgentParams`. Lock discipline is in section 4.
+
+### 2.5 State machines
+
+Agent run:
+
+```
+spawn ──> Queued ──slot free──> Running <──────────────┐
+            │                     │   │ turn ends,     │ send(wake) / notice
+            │ stop                │   │ inbox settled, │ addressed to it
+            v                     │   │ continuable    │
+        Done(Killed)              │   v                │
+                                  │  Idle ─────────────┘
+                                  │   │ one_shot, or stop, or idle expiry (silent)
+   stop ─> Stopping ──────┐       │   v
+     (children first)     │       └─> Done(Completed | Failed | TimedOut | MaxTurns ...)
+                          v
+                    Done(Killed)
+   any non-Done ──(process exit/crash; journal replay finds it running)──> Done(Lost)
+```
+
+Shell run:
+
+```
+spawn ──> Queued ──> Running ──exit 0──> Done(Completed)
+                       │  └──exit != 0──> Done(Failed)
+                       │  └──deadline───> Stopping ──> Done(TimedOut)
+   stop ──> Stopping ──TERM, 5 s grace, KILL──> Done(Killed)
+   any non-Done ──(hub died; pid dead or unknown on replay)──> Done(Lost)
+```
+
+Rules: the first transition into `Done` wins (settle is idempotent); `Stopping` is entered once
+and left only into `Done`; `Idle` is not terminal. A turn-done (`Idle`) produces a result
+notice (kind `Settled`, state idle) so a continuable agent's result reaches its owner; `Idle`
+expiry and `max_idle` eviction are silent (7.4). `Done(Lost)` is produced only by
+reconciliation. `Queued` exists because capacity is a queue, not an error (6.1). Dead runs
+past `max_retained` leave a tombstone (7.4).
+
+### 2.6 Notices
+
+All run-originated text for the model goes through one type and one path.
+
+```rust
+pub struct Notice {
+    pub seq: u64,               // per-owner monotonic, for ordering and idempotency
+    pub run: UnitId,
+    pub kind: NoticeKind,
+    pub wake: bool,
+    pub text: String,           // rendered, <= 4096 bytes
+    pub created: SystemTime,
+}
+
+pub enum NoticeKind {
+    Settled,       // run reached Done, or an agent finished a turn and went Idle
+    Lost,          // reconciliation found it dead; delivered at next owner wake
+    Message,       // run-to-run message body (see inbox)
+    Match,         // shell watch rule fired (replaces maki-monitor lines)
+    Overflow,      // "N notices dropped" coalesced marker
+}
+```
+
+Notices are rendered as `Message::observation` (the existing mailbox message type,
+`live_session.rs`), user role, wrapped in `<run-notice run="ag-k3x9ab" name="auditor"
+seq="12" kind="settled">...</run-notice>`, so the model and the UI can recognise them and
+the UI collapses them into one row.
+
+Structured results: the settlement notice carries `UnitResult` fields; the full record is
+fetchable with `runs(id)` (section 3.4). An agent with `output_schema` registers the
+existing `structured_output` local tool (`LocalTool`, `tools/mod.rs:304`) and its JSON
+lands in `UnitResult.structured`, shown in the notice as `structured: {...}` if it fits in
+the 4 KiB budget, else only as a `body_ref`.
+
+Bounding and spill: `summary` is the final assistant text. If longer than 4096 bytes the
+notice keeps the first 3072 and last 768 bytes joined by
+`\n[... N bytes omitted; full text: runs(id="ag-k3x9ab", full=true) ...]\n` and the whole
+text is written to `<state>/runs/<session>/<handle>.result.txt` (`BodyRef`). Shell output
+is never inlined in a notice; it lives in `<handle>.log` (append-only, offset cursor)
+and the notice carries the last 5 lines (max 1 KiB) plus byte counts.
+
+## 3. Native tool surface
+
+Five tools, all native. Rationale for consolidation instead of `agent_*` plus `job_*`:
+the model needs one mental model (a run has an id, a state, a result, can be waited on,
+messaged, stopped); the only kind-specific moment is `spawn`. dsh needs 7+ tools
+because its two systems diverged; maki had `task`, a monitor plugin and `fn.job*`.
+
+Old surface (all unchanged in v1; see 8.3 and appendix B):
+* `task` (bundled Lua, `plugins/task`) stays and coexists with native `spawn`; its fields
+  (`subagent_type`, `model_tier`, `output_schema`, `thinking`) map one to one onto `spawn`.
+  Users can hide either with `disabled_tools`. Replacing it is a separate decision.
+* `monitor_*` (external Lua plugin, not in this repo) is not touched; `spawn(kind="shell",
+  watch=...)` (phase 2b) covers it and the docs carry a migration table.
+* `maki.fn.jobstart` family stays for plugin-private processes, not the model's path. bash
+  stays the synchronous tool; its description gains one sentence: "For anything that runs
+  longer than a minute or must keep running, use `spawn` with kind shell." On timeout bash
+  promotes the command to a background run (phase 2c).
+
+### 3.1 `spawn`
+
+Description (model-facing):
+
+```
+Start background work and return immediately with its id. kind "agent" starts a
+subagent: a separate agent with its own context that works on a self-contained task and
+reports back. kind "shell" starts a command that keeps running while you continue. You
+are notified when a run finishes; do not poll or sleep. Start independent runs together
+in one message. Use `wait` only when you are blocked on a result, `send` to talk to a
+run, `stop` to end it, `runs` to look. Not available to agents at the maximum depth.
+
+Agent runs do not see this conversation, so the prompt must contain everything they
+need. They share your workspace. An agent run stays available after it reports and can
+receive follow-up messages unless one_shot is true.
+```
+
+Schema:
+
+```json
+{
+  "type": "object",
+  "required": ["kind", "description"],
+  "properties": {
+    "kind": {"enum": ["agent", "shell"]},
+    "description": {"type": "string", "description": "3-8 word label for display and for default naming."},
+    "name": {"type": "string", "pattern": "^[a-z][a-z0-9-]{0,31}$", "description": "Optional unique name others can address this run by. `main` and `parent` are reserved."},
+    "prompt": {"type": "string", "description": "agent only. The complete, self-contained task."},
+    "subagent_type": {"enum": ["research", "general"], "description": "agent only. research is read-only; general can edit. Default general."},
+    "model_tier": {"enum": ["weak", "medium", "strong"], "description": "agent only. Clamped to your tier."},
+    "thinking": {"type": "string"},
+    "output_schema": {"type": "object", "description": "agent only. JSON Schema the final result must satisfy."},
+    "context": {"enum": ["fresh", "fork"], "description": "agent only. fork seeds the run with your completed turns, excluding the turn in flight (default fresh)."},
+    "one_shot": {"type": "boolean", "description": "agent only. Complete after the first result instead of staying available. Default false."},
+    "command": {"type": "string", "description": "shell only. Command line run with the user's shell."},
+    "cwd": {"type": "string"},
+    "timeout_secs": {"type": "integer", "minimum": 1, "description": "Wall clock limit. Default: 1800 for agents, 3600 for shell. Expiry ends the run as timed_out."},
+    "watch": {"type": "string", "description": "shell only. Regex (Rust syntax) matched against each stdout/stderr line; matches become notices, at most 1 per second (lines in between are batched) and 20 per minute, then one overflow notice. Wakes you only with notify=wake. A bad regex is rejected."},
+    "notify": {"enum": ["wake", "quiet", "never"], "description": "On finish: wake starts a turn if you are idle (default), quiet waits for your next turn, never sends nothing (read with runs)."}
+  }
+}
+```
+
+Cross-kind fields are rejected with explicit text, never ignored: `kind=shell` given `prompt`,
+`subagent_type`, `model_tier`, `thinking`, `output_schema`, `context` or `one_shot` returns
+`BAD_FIELD: "prompt" is for kind "agent"; a shell takes "command"`; `kind=agent` given
+`command`, `cwd` or `watch` returns `BAD_FIELD: "command" is for kind "shell"; an agent takes
+"prompt"`. `name` equal to `main` or `parent` returns `BAD_FIELD: reserved name`.
+
+`context=fork` semantics: the child starts from a copy of the caller's committed history
+snapshot taken at spawn, which excludes the in-flight assistant turn (the pending `spawn`
+`tool_use` and its siblings), so the copy ends on a complete user/tool_result boundary; the
+copy is then followed by `prompt` as a user message. If a snapshot ending on a clean boundary
+cannot be produced, `fork` is rejected with `BAD_FIELD`. Phase 3 may cut `fork` entirely if
+that proves fragile.
+
+Result: `started ag-k3x9ab "auditor" (agent, running)`; queued runs show `(queued, position 2
+of 2)`. The child is registered in the parent's children before `spawn` returns (4.4).
+
+Permission: `spawn` is `tool_kind` execute; prompting follows the bash rule for `kind=shell`
+(scope = the command, so bash allow rules and `permission_scopes` apply) and no prompt for
+`kind=agent` (the child's tools are gated individually). Plan mode blocks `kind=shell` and
+agent `general` (`background_write_block`).
+
+### 3.2 `send`
+
+```
+Send a message to another run in this session: your child, your parent (name "parent"),
+or "main". (Siblings only if the session enables it.) The message is queued and returns a
+message id at once. A running recipient reads it at its next step; an idle one starts a turn
+with it. Sending does not end your turn and is not an answer: the recipient's reply, if any,
+comes as a message to you. Use mode "quiet" for FYI notes that must not start a turn. Your
+final result reaches your parent on its own: use send to a parent only for a question or
+mid-run progress.
+```
+
+```json
+{"type":"object","required":["to","message"],"properties":{
+  "to": {"type":"string","description":"Run id or name, or \"parent\" / \"main\"."},
+  "message": {"type":"string","description":"Up to 16 KiB. Be self-contained."},
+  "mode": {"enum":["steer","followup","quiet"],"description":"steer (default): next step of a running recipient, wakes an idle one. followup: after the recipient's current turn ends, as its own turn. quiet: delivered at the recipient's next model request, never wakes."}
+}}
+```
+
+Result: `message m-17 queued for ag-k3x9ab (running); use runs(id) to see delivery`. Stable error
+codes: `UNKNOWN_RUN`, `NOT_REACHABLE` (outside tree or policy, including siblings when off),
+`RECIPIENT_TERMINAL` (shells, one_shot completed, unrepairable), `NOT_AGENT` (shells take no
+messages in v1), `INBOX_FULL retry_after=Ns`, `TOO_LARGE max=16384`, `RATE_LIMITED
+retry_after=Ns`, `HELD` (ping-pong guard, 4.7), `SELF`. A `send` to a terminal revivable agent
+revives it (7.4).
+
+### 3.3 `wait`
+
+```
+Block until runs have finished their work or a timeout expires. Use only when you cannot
+proceed without the result; otherwise keep working, you will be notified. mode "all" (default)
+returns when every listed run is done or idle (finished its turn), "any" when the first is.
+A timeout is not an error: you get the current states and the runs keep going. Results you
+receive here are not repeated as notices.
+```
+
+```json
+{"type":"object","required":["ids"],"properties":{
+  "ids":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":16},
+  "mode":{"enum":["all","any"]},
+  "timeout_secs":{"type":"integer","minimum":1,"maximum":600,"description":"Default 60."}
+}}
+```
+
+Precise return rule: a run is "settled for this wait" when its state is `Done(_)` or `Idle`
+(an agent that finished its turn is `Idle`, which is non-terminal, so waiting on terminal
+states alone would never return for a default continuable agent). The turn-done result of an
+`Idle` agent is the same result record a notice carries, and consuming it follows 4.8. Returns,
+per run, the `runs(id)` record. On timeout the reply ends with guidance for the model: `Still
+running: <ids>. Do not wait again immediately; do other work, you will be notified when they
+finish.` It is cancellable by the caller's own cancel token; a cancel returns without stopping
+the runs. `wait` on a `Queued` or `Running` run blocks; the caller releases its capacity slot
+while blocked (6.1).
+
+### 3.4 `runs`
+
+```
+List your runs and everything below you, or inspect one. Without id: a tree of runs with id,
+name, kind, state, age, last activity, cost and a one-line progress, plus unread quiet
+notices. With id: the full record, the result (full=true for untruncated), and for shell runs
+output since your last read (tail=N lines, from_offset=B to page; output is read from the log
+file). Reading a finished run's result marks it received, so its notice is dropped.
+```
+
+```json
+{"type":"object","properties":{
+  "id":{"type":"string"},
+  "scope":{"enum":["children","descendants","all"],"description":"No id only. Default children. all includes siblings and ancestors."},
+  "full":{"type":"boolean"},
+  "tail":{"type":"integer","minimum":1,"maximum":200,"description":"shell: last N lines. Default 40."},
+  "from_offset":{"type":"integer","minimum":0,"description":"shell: byte offset in the log; the reply gives next_offset."},
+  "include_finished":{"type":"boolean","description":"List only. Default true, finished runs retained for the session."}
+}}
+```
+
+Output cursors are per reader: the log cursor is keyed by the reading run's id, so two agents
+tailing one shell each get their own "since your last read". Observers such as the UI log
+viewer use non-consuming reads (explicit `from_offset`, no cursor advance, no notice
+consumption). Every `runs` call lists unread quiet notices at the top, and committing the call
+consumes them (4.8).
+
+List output example:
+
+```
+main (you)
+├─ ag-k3x9ab auditor      agent  running  2m10s  $0.12  Grep for token handling in src/auth
+│  └─ ag-p8d2ne scanner   agent  idle     1m02s  $0.03  replied 40s ago
+├─ sh-4m2q7z build        shell  running  5m01s  cargo build --release (last: Compiling maki-ui)
+└─ ag-9wq0lc docs-check   agent  done     3m     $0.08  result received
+```
+
+### 3.5 `stop`
+
+```
+Stop runs. Agents are cancelled at their next safe point and their children are stopped
+too (detach=true leaves children running). With soft=true an agent only abandons its current
+turn: it stays idle, keeps its transcript and inbox, and can be messaged again. Shells get
+SIGTERM, then SIGKILL after 5 seconds. Returns once the runs have settled or after wait_secs.
+A stopped agent keeps its transcript and is read with runs; you will not get a notice for
+runs you stopped.
+```
+
+```json
+{"type":"object","required":["ids"],"properties":{
+  "ids":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":16},
+  "reason":{"type":"string","description":"Forwarded to the run as its last message."},
+  "detach":{"type":"boolean"},
+  "soft":{"type":"boolean","description":"Agents only. Cancel the current turn, stay idle, keep the inbox."},
+  "wait_secs":{"type":"integer","minimum":0,"maximum":30,"description":"Default 10."}
+}}
+```
+
+Outcome per id: `stopped` / `interrupted` (soft) / `already_finished(state)` /
+`still_stopping`. Unlike dsh `interrupt_agent` (always `accepted:true`, no cascade) the answer
+is truthful.
+
+Reason about not adding more tools: peek is `runs(id)`, message status is `runs(id)` (shows
+`inbox: 2 pending, last delivered m-17 at step 4`), progress reporting by an agent is
+`send(to="parent", mode="quiet")`.
+
+### 3.6 Per-turn identity and topology snippet
+
+Delivered as a context update through `tell_changes` (`run.rs:460`), diffed against what the
+history `told()` (`agent/history.rs:85`), so it is emitted only when it changes and persists
+across resume. The fact lives in `LiveFacts` (`maki-storage/src/frame.rs:29`, today `plan` and
+`prompt`). Layering: `maki-storage` cannot name maki-agent types, so the fact uses plain
+`String`/`u8` (or the id newtypes move to storage next to `MakiId`):
+
+```rust
+pub struct LiveFacts {
+    pub plan: Option<PathBuf>,
+    pub prompt: Option<PromptFacts>,
+    pub topology: Option<TopologyFacts>,   // None when the hub has no runs and caller is main
+}
+pub struct TopologyFacts {                 // sorted, small, no timestamps, costs or states
+    pub me: (String /*handle*/, String /*name*/, u8 /*depth*/),
+    pub parent: Option<(String, String)>,
+    pub children: Vec<(String, String, u8 /*kind tag*/)>,
+    pub limits: (u8 /*max depth*/, bool /*siblings enabled*/),
+}
+```
+
+Parent and children only: siblings are not in the fact (they would make every spawn re-tell
+all n siblings, O(n^2) tokens); a model finds siblings on demand with `runs scope=all`, and
+they are addressable only when `siblings = true`. Free slots are not in the fact either (they
+change constantly); `runs` shows them. States are not in the fact: they come from notices and
+`runs`. A child being created or ending changes the child list, a legitimate re-tell, and
+re-tells are coalesced: at most one topology update per drain (4.2), however many runs changed
+since the last one.
+
+Touch points for a new fact (all must change together): `LiveFacts`, `FactsUpdate` (`frame.rs:48`),
+`LiveFacts::apply` (`:71`) and `changes_to` (`:100`), `facts_at_start` (`:149`, which hard-codes
+`plan: None`), `Message::context_update` / `FactsUpdate` in
+`maki-providers/src/types.rs:407` and the storage-format test `context_update_keeps_its_stored_format`
+(`:1383`), and `context_update` in `maki-agent/src/agent/frame.rs:253` (the renderer; it is in
+maki-agent, not maki-storage). `maki-providers` is therefore in the file list of phase 4d.
+
+The real work for subagents: they are built with `RunContext::fixed(system, tools)`
+(`agent/frame.rs:83`, used at `maki-lua/src/api/agent.rs:969-970`), which has `facts: None`.
+`tell_changes` already runs for them (`run.rs:400`, `:533`), but `History::told()` returns `None`
+without a frame, so no update is ever pushed. Native agents must get a facts-bearing frame
+instead of `fixed()`: a frame constructor taking the topology as initial facts, so `told()`
+returns `Some` and `changes_to` yields topology updates. Cache note: the tool descriptions
+are static frame text, so adding the five tools busts the cache once per upgrade, never per
+spawn.
+
+Rendered text for a subagent:
+
+```
+Run topology changed. You are agent "auditor" (ag-k3x9ab), depth 1 of 2. Your parent is
+"main". You have no children. Use send(to="parent") for a question or progress while you
+work; your result is delivered to your parent automatically when you finish, so do not send
+it. Sending does not end your turn. Messages to siblings are not enabled.
+```
+
+For the main agent:
+
+```
+Run topology changed. You are "main". Runs you started: "auditor" (ag-k3x9ab, agent),
+"build" (sh-4m2q7z, shell). Runs finish with a notice; do not poll. Maximum depth 2.
+```
+
+At the depth cap the text adds: `You are at the maximum depth: spawn(kind="agent") will fail
+with DEPTH_LIMIT; do the work directly.` The tool stays in the list with a static note
+(5.2). A child's first prompt also carries the identity paragraph, so the contract exists even
+if the first `tell_changes` is skipped.
+
+### 3.7 Settlement notice wording
+
+Rendered in the owner's `<run-notice>` wrapper. Variable part by state and reason:
+
+```
+Run ag-k3x9ab "auditor" (agent) finished its turn and is idle; send it a message to
+continue. 2m10s, 14 turns, $0.12.                                  (Idle, turn done)
+Run ag-k3x9ab "auditor" (agent) finished and will do no further work.   (Done Completed, one_shot)
+Run ag-k3x9ab "auditor" was stopped before it finished.           (Killed)
+Run ag-k3x9ab "auditor" ran out of room before it finished.       (MaxTokens / MaxTurns)
+Run ag-k3x9ab "auditor" timed out after 600s.                     (TimedOut)
+Run ag-k3x9ab "auditor" failed: <detail, 200 bytes>.              (Failed)
+Run ag-k3x9ab "auditor" declined the task.                        (Refused)
+Run ag-k3x9ab "auditor" was lost: the session ended while it was running; its
+transcript up to the last saved turn is available with runs(id).  (Lost)
+Run sh-4m2q7z "build" exited 0 after 5m01s.  /  exited 2 ...  /  was killed by SIGTERM.
+```
+
+followed by `Result:` and the bounded summary (agents) or `Last output:` (shells, 5 lines),
+then optional `Structured: {...}` and `Full result: runs(id="ag-k3x9ab", full=true)` when
+truncated or when a log exists. Match notice: `sh-4m2q7z "build" output matched /error/:
+<line, 300 bytes> (+3 more since, see runs).` Overflow: `12 more notices from your runs were
+dropped to protect your context; call runs() to see state.`
+
+## 4. Delivery semantics
+
+Lock discipline (all of section 4 and 6): the hub lock and each inbox lock are short
+`std`-style critical sections. Nothing inside them awaits, performs I/O, calls a provider, or
+sends on a bounded channel that can block; journal records, events and wakes are queued to
+unbounded channels or a writer task and emitted after the lock is dropped.
+
+### 4.1 Inbox
+
+One `Inbox` per agent run and for `main` (shells have no inbox in v1: stdin `send` is cut,
+`NOT_AGENT`, appendix B). Items:
+
+```rust
+pub struct InboxItem {
+    pub id: MessageId,         // "m-17", per-hub counter
+    pub from: UnitId,
+    pub kind: DeliveryKind,
+    pub text: String,          // <= 16384 bytes
+    pub enqueued: Instant,
+}
+pub enum DeliveryKind {
+    Steer,     // next step boundary of a running recipient, wakes an idle one
+    Followup,  // after current turn completes; one per turn; wakes an idle one
+    Quiet,     // next model request of the recipient (the mid-run drain), never wakes
+    Notice,    // a Notice (section 2.6); wake flag decides
+}
+```
+
+`send` modes map 1:1 onto `Steer|Followup|Quiet`; `Notice` is produced only by the hub. It
+replaces the three channels a subagent has today: `SubagentInbox` as an `InterruptSource`
+(`inbox.rs`), `maki.session.notify` (`live_session.rs:87`) and the per-prompt interrupt in
+`prompt()`. Text typed into a subagent tab becomes `Steer` from the reserved sender `user`.
+The existing `SessionMailbox` stays the physical store for `main` (TUI wake path unchanged).
+
+### 4.2 Drain points
+
+An agent drains at exactly these points, in `Agent::turn()` (`run.rs:538`):
+
+1. `land_input` (`run.rs:388`) at run start: `Quiet` + `Steer` + at most one `Followup`.
+2. `prepare_request` (`run.rs:514`), before each model call, after the previous tool results
+   were pushed: all `Steer`, `Quiet`, `Notice`. This is the mid-run drain: a `quiet` message
+   to a running agent lands here, i.e. at the recipient's next model request, not earlier.
+   Nothing is inserted between an assistant `tool_use` and its `tool_result` blocks
+   (Anthropic and OpenAI reject it); parallel calls (`tool_dispatch.rs:1031`) are joined first.
+3. `handle_queued_command` (`run.rs:1087`) after tool results: pending `Steer` continues the
+   loop instead of ending the turn.
+4. Turn end (`keep_going`, `run.rs:742`): pending `Steer` or `Followup` continues the run; one
+   `Followup` starts the next turn. A turn never ends with pending Steer.
+
+Drained items become ONE user-role message ordered by `(kind rank Steer < Notice < Quiet, then
+seq)`, each framed `<run-message from="auditor" id="m-17" delivered_step="4">text</run-message>`;
+notices keep their `<run-notice>` frame. FIFO per (sender, recipient) pair; arrival order
+across senders. A message always lands after a tool result issued in the same step.
+
+Drain cutoff: an item is "queued" until a drain removes it from the inbox under the inbox
+lock; from then on it is "drained" (in the outgoing request). The distinction matters for
+notice consumption (4.8).
+
+### 4.3 Wake rules
+
+| Recipient state | Steer | Followup | Quiet | Notice(wake) | Notice(quiet) |
+|---|---|---|---|---|---|
+| running | next step | next turn | next model request | next step | next model request |
+| Idle (agent) | start turn | start turn | wait | start turn | wait |
+| main, idle, TUI | mailbox wake (`start_mailbox_runs`) | same | wait | same | wait |
+| main, idle, headless | `drive_main` starts a run (4.4) | same | wait | same | wait |
+| Stopping | dropped, sender told `RECIPIENT_TERMINAL` | dropped | dropped | kept | kept |
+| Done | rejected at `send` (revivable runs excepted, 7.4) | rejected | rejected | n/a | n/a |
+
+A waking item to a recipient whose current run is already cancelled is demoted to `Followup`.
+
+Wake budget (default on, `main` only): at most 3 consecutive notice-initiated turns; the 4th
+and later notices are delivered quiet and one `Overflow` marker says so. The counter resets
+when a user message lands and when the model itself reads state (`wait` or `runs` called by
+the main agent), because that proves it is engaged. Quiet notices are never stranded: every
+`runs` call lists unread quiet notices; the next turn's drain (4.2 point 1) carries them; in
+headless `join()` drains all remaining quiet notices as a closing turn (4.4). There is no
+peer-wake budget: agent-to-agent loops are bounded by the per-pair rate limit and the
+ping-pong guard (4.7).
+
+### 4.4 Driver loops (subagents and headless main)
+
+Subagent mailboxes never wake today (`land_notes`, `run.rs:409`, drains only inside a turn). A
+native agent owns a driver:
+
+```rust
+// runs/agent.rs
+async fn drive(self) {
+    loop {
+        self.inbox.wait_wakeable().await;           // Steer|Followup|wake-Notice, or stop
+        if stop { break }
+        let (input, seq) = self.inbox.take_start(); // 4.2 point 1; seq = inbox counter now
+        let outcome = Agent::new(self.params()).run(input, &mut *self.history.lock().await, ..).await;
+        let mut g = self.inbox.lock();              // settle under the inbox lock
+        if g.seq != seq || g.has_wakeable() { continue }   // arrived while run returned: not lost
+        self.settle_or_idle(&mut g, outcome);       // state set in the same critical section
+    }
+}
+```
+
+Race closed: `send` enqueues, bumps `seq` and decides "wake or not" under the same inbox lock
+that `settle_or_idle` holds while it moves the state to `Idle`/`Done`. A message arriving
+between `agent.run` returning and the settle either bumps `seq` first (the driver loops) or
+sees `Idle` and wakes it; no interleaving drops it. The `History` async mutex serialises a
+prompt against an inbound message.
+
+`drive_main` is the headless wake consumer (phase 4c): started where the headless frontend
+registers its mailbox (`headless.rs:190`, `:339`), it starts a main run when a waking notice
+arrives while `main` is idle. `hub.join(timeout)` runs after the final turn: it waits for
+non-terminal runs, ignores `Idle` agents with empty inboxes, drains all remaining quiet
+notices as one closing turn, and at the timeout stops what is left (`Done(Killed)`, not
+silently dropped). Parent registration: `spawn` inserts the child into the parent's children
+index in the same critical section that allocates it, before returning, so an idle parent
+cannot settle between "child created" and "child visible".
+
+### 4.5 Cancel domains
+
+`AgentLoop::process_run` ends every run with `subagent_cancels.cancel_all()`
+(`maki-ui/src/agent/agent_loop.rs:141`) because a `tool_use_id` is only meaningful within its
+run. Native runs are not in that `CancelMap`; they hold a child of `UnitHub.cancel`, whose
+lifetime is the session. A parent's `stop` and the cascade call the child's trigger. Esc on the
+main run cancels the main turn only. Esc in a run's tab, `/stop <name>` and quit call
+`hub.stop`. Legacy Lua `task` runs keep the old per-run map.
+
+The double Esc is scoped to the view it is used in. In the main chat it ends the main turn, and
+the runs of the session keep working: a rewind (the picker's Esc opens it) rewrites the parent's
+transcript, so the respawn behind it keeps the hub and the runs on it, and only the runs whose
+receipts the rewind drops are stopped (`maki-ui/src/app/session.rs:rewind_to`). In a run's tab it
+stops that run alone: the hub is stopped with `detach`, so the work it started moves up to its
+own parent and goes on. Quit (Ctrl-C) is the one that ends everything: it shuts the hub down.
+
+### 4.6 Acks
+
+Two stages, visible through `runs(id)`:
+1. `accepted`: in the recipient's inbox (the `send` result; body journaled, 7.3).
+2. `delivered`: drained into the recipient's history at step N (`AgentEvent::RunMessageDelivered`).
+
+There is no `acted` stage: it proved nothing a runtime can attest. The sender gets a `Quiet`
+notice only when delivery takes longer than 60 s or the message is dropped (`message m-17 to
+ag-k3x9ab was dropped: recipient stopped`); otherwise the stages are queryable and cost no
+context.
+
+### 4.7 Caps and rate limits (defaults)
+
+| Limit | Default |
+|---|---|
+| Message size | 16384 bytes, hard reject `TOO_LARGE` |
+| Pending items per inbox | 32, `INBOX_FULL retry_after` |
+| Pending Followups per inbox | 8 |
+| Notice text | 4096 bytes (3072 head, 768 tail) |
+| Match notices per shell | 1 per second, then batched; 20 per minute, then `Overflow` |
+| Messages per sender to one recipient | 6 per 10 s, token bucket, burst 6 |
+| Drained bytes per step into one request | 32 KiB, rest stays queued (oldest first) |
+| Main notice wake budget | 3 consecutive (4.3) |
+| Ping-pong guard | 6 consecutive agent-to-agent messages per pair without other tool work |
+| `wait` ids | 16; default timeout 60 s; max 600 s |
+| `stop` grace | TERM, 5 s, KILL |
+| Notice duplicate collapse | identical `(kind, run, text)` within 30 s become `(xN)`; notices only, never messages |
+
+The only rate limits are the per-pair bucket, the inbox cap and the main wake budget; there is
+no per-sender total limit and no peer-wake budget. `session_max_runs` is the only spawn
+backstop.
+
+Ping-pong guard: per pair `{a,b}` the hub counts consecutive agent-to-agent messages with no
+intervening user message, no `main` message to either, and no tool call by either side other
+than `send`, `runs`, `wait`. After 6, further sends between them are held (up to 4 per pair,
+else `RATE_LIMITED`), the parent of the sender (or `main`) gets one `Quiet` notice `a and b
+exchanged 6 messages without doing other work; further messages are held`, and the held
+messages release when the counter resets (any other tool call by either, or a message from the
+parent). The guard is mandatory when `siblings = true`; it also covers parent/child pairs.
+
+### 4.8 Notice consumption and suppression
+
+A settlement or match notice is suppressed when: the owner called `stop` on the run (truthful
+reply already delivered); a read consumed it (below); `notify=never`; the owner is gone or the
+hub is shutting down. Idle expiry and `max_idle` eviction are silent and never create one.
+
+Consumption is by commit, not by call: a `wait`, `runs` or `stop` read takes a `ConsumeClaim`
+on the notice when it returns the result; the claim becomes consumption only when the tool
+result carrying it is committed to the reader's history. If the call is cancelled or errors
+before commit, the claim is released and the notice stays. A timed-out `wait` claims nothing.
+Cutoff against drains, all under the owner's inbox lock: a claim finalised while the notice is
+still queued removes it from the inbox; a notice already drained cannot be cancelled, and the
+read still returns the result (the model may see it twice, which is harmless and never loses
+it). The check-and-enqueue of a new notice and of a claim is one critical section, closing the
+race where a `wait` timing out in the same tick as settlement loses the notice (dsh weakness
+12).
+
+## 5. Native-tool mechanism and wiring
+
+### 5.1 New `ToolSource::Native`
+
+`ToolSource` is `{Mcp, Lua}` (`maki-agent/src/tools/registry.rs:81`); every built-in today is
+a bundled Lua plugin, and the only `Tool` impls are `LuaTool` (`maki-lua/src/api/tool.rs:217`)
+and test mocks. Decision: add
+
+```rust
+pub enum ToolSource { Mcp { server: Arc<str> }, Lua { plugin: Arc<str> }, Native }
+```
+
+and implement `Tool` (`registry.rs:235`) and `ToolInvocation` (`registry.rs:212`) directly, no
+new trait. The dispatcher needs no new route: `Route::Native(entry)` (`tool_dispatch.rs:393`
+and `:603`) already routes any registered tool, so the only compile-forced touch point in the
+dispatcher path is `ToolSource::as_log_field` (`registry.rs:87`, arm `native`). Other
+touch points: docgen `gen_tools.rs`, `is_builtin_tool` (`tools/mod.rs` ~519) and
+`ToolFilter::from_config`, `DEFAULT_BUILTINS` in `maki-config`, UI rendering by name/`tool_kind`
+in `maki-ui/src/components/tool_display.rs`. Permissions: `ToolKey::Native` already exists
+(`permissions.rs`), so `spawn = "allow"` rules work with no new key kind.
+
+Authority: `Tool::reach()` (`registry.rs:249`) defaults to `None`, which every consumer prices
+as unbounded authority. Native tools must declare it: `spawn` `ToolReach{permission: Run,
+prompted: true}`; `send`, `runs`, `wait`, `stop` `ToolReach{permission: Agent, prompted:
+false}`. A test asserts no native tool leaves `reach()` undeclared.
+
+Rejected alternative: expose the hub as a Lua API and keep the tools in Lua. That re-adds the
+single Lua thread (5 s hold limit), cannot work headless without the Lua host, and keeps the
+plugin `run` permission bypass for shell spawning.
+
+### 5.2 Registration
+
+```rust
+pub fn native_run_tools(audience: ToolAudience) -> Vec<Arc<dyn Tool>>;  // spawn, send, runs, wait, stop
+```
+
+Tools are stateless `Tool` objects; state comes through `ToolContext`, so one instance serves
+all sessions. They are added where the frame's tool list is built, before Lua tools, so a
+plugin cannot shadow them. Audiences: `MAIN` and `GENERAL_SUB` get all five; `RESEARCH_SUB`
+gets `runs`, `wait`, `send` (no `spawn`, `stop`). Tool defs are part of the frame fingerprint
+(`frame.rs:131`), so the set per audience is fixed for a frame's life.
+
+Depth cap (DECIDED): `spawn` stays in the tool list of an agent at `max_depth`; its static
+description says "Not available to agents at the maximum depth: you get DEPTH_LIMIT and must
+do the work yourself", the call fails in `start` with `DEPTH_LIMIT`, and the topology fact
+states the cap (3.6). Why: removing the tool at the cap would give depth-2 agents a different
+tool list than depth-1 agents of the same audience, i.e. a second frame fingerprint and a
+second prompt-cache prefix per audience, for a rare event; static text keeps one frame per
+audience and the cost is a few tokens.
+
+`Tool::parse` returns the invocation; `start_header` renders `spawn auditor`;
+`permission_scopes` for `spawn(kind=shell)` returns the command scope computed by a Rust port
+of the scope logic in `plugins/bash/init.lua:296` (bash itself is unchanged); everything else
+returns no scopes. `execute` receives `&ToolContext` and calls the hub.
+
+### 5.3 ToolContext and AgentParams changes
+
+`ToolContext` (`tools/mod.rs:322`) has no hub or identity. Add one field, `runs:
+Option<RunsCtx>`, with `RunsCtx { hub: Arc<UnitHub>, self_run: UnitId }` (`None` for `maki index`
+and tests; `MAIN_RUN` for the root agent). About 30 struct literals construct a
+`ToolContext` (`run.rs` 2, `tool_dispatch.rs` 15, `live_session.rs` 2, `tools/mod.rs` 7,
+`maki-lua/src/api/util/ctx.rs` 3, `maki-lua/tests/code_execution_policy.rs` 1), each gets
+`runs: None`; one mechanical step in phase 1.
+
+`AgentParams` (`run.rs:102`) gains `runs: Option<RunsCtx>`; `task_id` stays for legacy Lua
+sessions. `Agent::tool_context()` (`run.rs:935`) copies it, and so do nested `batch` and
+`code_execution` children (they clone the context). Child agents get `self_run = child id`
+and the same hub; router authority checks use `self_run`.
+
+Where the hub is created. TUI: next to `publish_seed` (`maki-ui/src/agent/agent_loop.rs:85`),
+stored in `AgentSeed` (`live_session.rs:53`) so `do_agent_run` (`agent_loop.rs:270`) and
+`AgentSeed::tool_context` pass it on. Headless builds no `AgentSeed`: `headless.rs:190` and
+`:339` only call `SessionMailbox::register`. There the hub is created beside those calls and
+handed straight to `AgentParams.runs`, with `drive_main` spawned from the same site. A hub
+per root session in both frontends; `AgentSeed` merely carries it for Lua nested calls.
+
+### 5.4 Hooks into AgentLoop and frontends
+
+* Cancel: `process_run`'s `cancel_all` (`agent_loop.rs:141`) is untouched; hub runs are
+  outside that map (4.5). Session close and process exit call `hub.shutdown()`: cascade stop
+  with a 5 s hard deadline, then force-settle; shutdown never waits for a runner whose cancel
+  did not settle.
+* Ledger: each agent run gets `RunLedger::child(&parent_ledger)` (`types.rs:1084`), parent =
+  the spawning run's ledger; the notice's cost is the child's own total. Relays do not re-add.
+* Events: new `AgentEvent` variants `RunStarted`, `RunStateChanged`, `RunNotice`,
+  `RunMessageDelivered`, `RunFinished`, carried in `Envelope` (`types.rs:1190`) with
+  `SubagentInfo` (`:1121`) stamped for agent runs, `parent_tool_use_id` = the run handle (phase
+  3), so tab routing (`maki-ui/src/app/mod.rs:1636`) works unchanged. `SubagentInfo.inbox`
+  becomes a handle that `send`s `Steer` from sender `user`. Background envelopes use run_id 0
+  and rely on the stamp.
+* Permissions: see 6.2; a background agent's `PermissionRequest` carries the stamp and an
+  answer channel registered with the hub; headless without a client auto-denies
+  (`permissions.rs:755`).
+* Routing: `topology.rs` answers `can_send(from, to)`. Default: parent, child and `main`;
+  siblings only with `siblings = true`; `stop` and `runs scope=descendants` are limited to the
+  caller's subtree; only an ancestor may `stop`. Rejections return the stable codes of 3.2.
+* Tests: `MockProvider` and `StubStreamProvider` from the shared `test_support` module
+  (phase 1; they are private to `run.rs` today); shell runs with `sh -c`; an injected clock
+  for rate limits and wake budgets, so no sleeps.
+
+## 6. Concurrency, limits and permissions
+
+### 6.1 Capacity pool and queue
+
+One `UnitLimits` per hub, loaded from `[agent.runs]` in `maki-config` (mirror types there,
+e.g. `UnattendedMode`, because maki-config cannot name maki-agent types; maki-agent converts),
+so docgen emits it. Defaults:
+
+| Limit | Default | Notes |
+|---|---|---|
+| `max_agents` | 4 | agents in state `Running` per session tree (idle agents hold no slot) |
+| `max_shells` | 8 | running shells per session tree |
+| `max_shells_per_owner` | 4 | one agent cannot take all shell slots |
+| `max_depth` | 2 | main = 0, so main spawns depth 1, which may spawn depth 2, which cannot spawn agents |
+| `max_children_per_run` | 8 | direct, non-terminal |
+| `max_queue` | 16 | queued runs across the tree; the 17th `spawn` returns `QUEUE_FULL` |
+| `max_retained` | 64 | terminal runs kept in full in the table; older ones become tombstones, which are bounded by `session_max_runs`, not by this (7.4) |
+| `max_idle` | 16 | idle agents in memory; the least recently active leaves memory silently |
+| `idle_timeout` | 30 min | idle agent leaves memory silently (no notice, 7.4) |
+| `default_timeout` | 30 min | wall clock for every agent unless `spawn.timeout_secs` says otherwise |
+| `session_max_runs` | 64 | the only spawn backstop (6.3) |
+| `siblings` | false | sibling `send` (4.7) |
+
+Only `Running` agents consume an agent slot. Capacity gates execution, not existence
+(dsh's `ACTIVATION_LIMIT_REACHED` is an error; here excess spawns queue). Admission is FIFO.
+Deadlock avoidance has no special rule: a run blocked in `wait`, or awaiting a permission
+prompt, releases its slot and re-acquires it on resume with queue priority (ahead of
+never-started queued runs). So eight parents each waiting on a queued child cannot starve
+each other. Slot release, promotion and re-acquire are one critical section under the hub
+lock; nothing in it awaits or does I/O (journal and events are sent over channels after the
+lock is dropped). Queue position is shown in the `spawn` result and `runs`. A queued run
+that is stopped settles `Done(Killed)` without starting.
+
+Provider concurrency is separate: the existing per-provider retry handling stays, and a user
+who hits provider 429s lowers `max_agents`.
+
+### 6.2 Permissions for background agents
+
+Problem: `PermissionManager::enforce` (`permissions.rs:755`) emits
+`AgentEvent::PermissionRequest` and waits on `user_response_rx`; with `None` it
+auto-denies with `UNATTENDED_REASON` (`permissions.rs:830-841`). A background agent that
+silently auto-denies every edit or bash call is useless, and one that blocks forever
+on an unseen prompt is worse. Decision: route, with a policy fallback.
+
+Routing (attended frontends: TUI, ACP with a client):
+1. A native agent always has a response channel: the hub gives each agent run a
+   `PermissionBroker` handle in place of `user_response_rx`. `enforce` is unchanged; the
+   broker is the receiver end.
+2. The `PermissionRequest` event is stamped with `SubagentInfo` and the run name. The TUI
+   queues it in the existing permission prompt queue (one prompt visible at a time,
+   FIFO across runs) with a header `auditor (ag-k3x9ab) wants to run: <scope>`.
+   Answering is by request id (already the key). Allow-always writes the same rule
+   files as today; it applies to every run in the session.
+3. ACP: the same request goes to the client through `maki-acp/src/permissions.rs`
+   (`permission_options`), with the run name in the title.
+4. The tool call of that run (only that run) waits; siblings and main continue, and the run
+   releases its capacity slot while it waits and re-acquires it on resume (6.1). Wait is
+   bounded by `permission_timeout` (default 120 s). On timeout the call is denied with
+   `permission prompt for <scope> timed out after 120s; ask your parent via send if
+   you need it`, and the run continues, so it can report instead of stalling.
+5. Notice side effect: when a prompt has been pending 60 s while the user's main
+   run is idle, the owner gets one `Quiet` notice `ag-k3x9ab is waiting for permission:
+   <scope>` (never wake). So a main agent can `send` guidance, and the status line shows
+   a badge (7.2).
+
+Policy fallback (unattended: `maki -p`, SDK without a handler, or a prompt timing out):
+`[agent.runs] unattended_permissions = "deny" | "allow_under_yolo"`. Default `deny` with
+the existing text, but the deny text for agents is extended with "report this to your
+parent with send". `maki -p --yolo` already means allow; it is inherited by runs
+because they share `PermissionManager` (the seed carries it). Rules in `permissions.toml`
+apply identically to every run; no separate per-agent policy in v1.
+
+Why not auto-deny only: it makes `general` subagents unable to do the job they exist
+for the moment a rule is missing, and the main agent cannot see why. Why not inherit
+silently-allow: a subagent has no human context and the `spawn` call (which the user
+approved) cannot know its future commands. Why not block with no timeout: a forgotten
+prompt would pin a slot forever.
+
+Special cases:
+* Plan mode: `background_write_block` stays; spawns of `general` agents and shells are
+  refused in plan mode (already in 3.1).
+* Shell runs: prompt happens at `spawn` time in the spawning turn (3.1, 5.4). Because a
+  prompt there blocks the spawning tool call only, nothing new is needed. A shell
+  started by a subagent prompts through the broker above.
+* `send` to `main` and `runs` never prompt.
+* An agent cannot widen permissions: child `PermissionManager` is the parent's, plus
+  an optional `tools` filter intersect (never union).
+
+### 6.3 Budgets
+
+The model may set only `timeout_secs` in `spawn`; `max_cost_usd`, `max_turns`, `max_tokens`
+are not in the schema (the model cannot raise its own limits). Everything else comes from
+config:
+
+| Budget | Default | Effect |
+|---|---|---|
+| `agent_max_turns` | 100 (existing `MaxTurns`) | `Done(MaxTurns)` |
+| agent timeout | 1800 s for every agent (`default_timeout`, or `spawn.timeout_secs`) | `Done(TimedOut)` |
+| `session_max_runs` | 64 spawns per session | `SPAWN_LIMIT`; the only backstop (no per-sender total send limit), resets on a new session |
+| shell `timeout_secs` | 3600 default, max 86400 | TERM then KILL, `Done(TimedOut)` |
+| shell log size | 64 MiB per run | beyond it output is discarded, one marker line; process keeps running |
+
+Subtree cost budgets are post-v1 (appendix B); local models report cost 0 anyway. Each
+usage event still rolls up through `RunLedger::child` for display.
+
+### 6.4 Rate limits
+
+`spawn`: at most 10 per rolling 60 s per owner (`spawn_per_minute`), then `RATE_LIMITED retry_after`
+(prevents a loop from filling the queue). `send` and wake limits are in 4.7. Rate
+limiters take an injected `Clock` trait (`runs/clock.rs`: `fn now(&self) -> Instant`;
+tests use a manual clock), so no test sleeps.
+
+## 7. Lifecycle, persistence and reconciliation
+
+### 7.1 Cancellation tree
+
+The tree is the ownership tree: `main -> children -> grandchildren`. Each run holds a
+`CancelToken` that is a `child()` of its parent's token (`cancel.rs`), the root being
+`UnitHub.cancel`. Cancelling a node cancels all descendants automatically, but the hub
+does not rely on token propagation alone: `stop` walks the tree explicitly so state
+transitions (`Stopping` then terminal) and notices are produced per run.
+
+Cascade order is child-first (leaves, then up):
+1. Mark every run in the subtree `Stopping` (one lock, so no new spawn can attach to a
+   stopping parent: `spawn` under a `Stopping` run returns `RECIPIENT_TERMINAL`).
+2. Queued runs settle `killed` immediately.
+3. Agents: fire the cancel token. The run settles at its next safe point (cancel
+   check at `turn()` start, between tool calls, inside streaming); tools in flight
+   receive the same token. `finish()` (`run.rs:368`) sanitizes history
+   (`sanitize_cancelled_history`), so the transcript is valid for cold resume.
+4. Shells: `killpg(SIGTERM)` to the process group (spawn with `setsid`), 5 s grace,
+   then `killpg(SIGKILL)`. The pump task drains remaining output to the log, then the
+   exit is recorded. Non-unix: `TerminateProcess` with no grace (job objects are post-v1).
+5. Hard deadline: `stop` returns after `wait_secs` (default 10, max 30) with
+   `still_stopping` per unsettled run. The hub's per-run settle watchdog runs
+   independently: 5 s after the cancel token fires (15 s for an agent mid-tool), a
+   run that has not settled is force-settled `killed` with detail `forced`, its runner
+   task is dropped (smol task drop cancels it), and its shell tree is KILLed. This
+   fixes the dsh stall where a runner ignoring cancel blocked shutdown.
+6. Parent settles after its children (child-first). A parent's settlement notice
+   (suppressed if it was stopped by its owner) is produced only when all descendants
+   are terminal, so a notice never reports a finished parent with live children.
+
+`stop(detach=true)` removes the child link only for agents: the children get their
+`parent` set to the stopper's `owner` ("re-parent to grandparent"), which is the one
+exception to "never re-parented in v1" in 2.3, documented there as a stop-only rule.
+
+Soft interrupt: `stop(soft=true)` on an agent cancels only its current turn (the cancel
+token of that turn, not the run's), the agent settles to `Idle` with its transcript
+sanitized and its inbox kept, and it is not a terminal state. Use it to redirect a runaway
+turn without losing the agent; a following `send` starts the next turn. Soft stop on a
+shell is rejected (`NOT_AGENT`). Hard `stop` keeps the cascade semantics above.
+
+### 7.2 What user and process events do
+
+| Event | Effect on runs |
+|---|---|
+| Esc on the main run | cancels the main turn only. Background runs continue. They notify when done and the main agent wakes per the wake budget. A rewind keeps the hub, so the runs it keeps go on working. |
+| Esc in a run's tab | `hub.stop(run, detach)`: that run alone, and the work it started moves up to its own parent. Esc again = hard `forced` settle immediately |
+| `/stop <name\|all>` (new command, 8.1) | `hub.stop`; `all` stops every run owned by the session root |
+| `/new` | the old session's hub does `shutdown()` (cascade stop, 5 s deadline), then a fresh hub with a fresh root token. Runs do not migrate sessions. |
+| session switch (`/resume`, session picker) | same as `/new` for the session being left; its runs settle `Done(Killed)` (detail `session_closed`) so the journal is clean and a resume shows them stopped, not lost |
+| `/reload` (Lua plugins reload) | no effect on native runs; they are not owned by the Lua host. This is a main reason shells are native (today `JobStore` Drop kills them on reload). Lua-owned `maki.fn.job*` still die as before. |
+| `/compact` | no effect on runs; the main agent compacts its own history |
+| config reload | new limits apply to future admissions only |
+| quit (`Ctrl-C` twice, `/quit`) | `shutdown()` with 5 s deadline. Agents `killed`, shells TERM/KILL. |
+| `maki -p` finish | `hub.join()` waits for non-terminal runs, ignoring Idle agents without a waking item in their inbox, up to the join timeout (600 s, `--join-timeout` in 7b); then `shutdown()`. `-p` exit code is unchanged by child failure. |
+| crash / SIGKILL / power loss | nothing runs; journal replay at next start (7.3) |
+| SIGTERM / SIGHUP to maki | handled as quit; SIGKILL cannot be handled |
+
+Shell orphans: `spawn(kind="shell")` has no `detach` field (runs do not survive the process).
+Shells run in their own process group; the `<handle>.pid` file records pgid and process start
+time so that after a crash the next start kills the orphan only if the start time still
+matches (7.3). There is no re-adoption (decided); output logs are kept.
+
+### 7.3 Journal and `lost` reconciliation
+
+Location: `<state_dir>/runs/<session_id>/` (`maki-storage/src/paths.rs:284` `state_dir()`),
+created `0700`:
+
+```
+journal.ndjson          append-only event log (durable source for the run table)
+messages.ndjson         message bodies (<= 16 KiB each), so messages to a crashed child survive
+<handle>.log            shell merged output, append-only
+<handle>.pid            pgid and process start time of a live shell (orphan cleanup)
+<handle>.result.txt     spill of a truncated agent result (2.6)
+```
+
+The `RunJournal` lives in `maki-storage/src/runs.rs` (leaf crate; `SessionRef` is a storage
+type, `maki-storage/src/id.rs:109`, so `RunJournal::open(&SessionRef)` is layering-safe) so the
+session delete path can remove it. Records are one JSON object per line, forward compatible
+(`#[serde(default)]`, unknown `t` ignored). Because it lives in storage, records use plain
+`String`/`u8` ids, never maki-agent types:
+
+```json
+{"v":1,"t":"spawn","ts":1760000000123,"id":"<MakiId>","handle":"ag-k3x9ab","name":"auditor","kind":"agent","owner":"<id>","parent":"<id>","depth":1,"desc":"...","origin_tool_use_id":"toolu_01","notify":"wake","spec":{"model":"...","tools":["..."],"audience":"general_sub","thinking":"...","output_schema":null,"one_shot":false,"timeout_secs":1800}}
+{"v":1,"t":"state","ts":...,"id":"...","state":"running"}
+{"v":1,"t":"msg","ts":...,"id":"m-17","from":"...","to":"...","kind":"steer","bytes":420,"stage":"accepted"}
+{"v":1,"t":"ack","ts":...,"id":"m-17","stage":"delivered","step":4}
+{"v":1,"t":"notice","ts":...,"seq":12,"run":"...","kind":"settled","delivered":false,"consumed":false}
+{"v":1,"t":"term","ts":...,"id":"...","reason":"completed","exit_code":0,"cost":0.12,"turns":14,"elapsed_ms":130000,"result_len":812,"body_ref":null}
+{"v":1,"t":"mark","ts":...,"reason":"clean_shutdown"}
+```
+
+Rules:
+* Versioning: first line `{"v":1,"t":"hdr","maki":"0.6.4"}`. Readers accept `v <= 1`; a higher
+  `v` makes the file read-only for this binary (runs listed `lost`, nothing rewritten).
+* Lock discipline: journal writes happen off the hub lock, through a channel to a writer task;
+  `fsync` on `spawn`, `term` and `mark`, other records flushed every 250 ms and at shutdown.
+  A torn last line is ignored on replay. Journal write failure degrades to memory-only with
+  one warning notice and never fails a spawn.
+* Message bodies go to `messages.ndjson` (separate file, same torn-line rules), up to 16 KiB
+  each, written before `send` returns `accepted`; bodies of delivered messages are dead weight
+  and dropped at compaction. Pending bodies are redelivered after a crash (cold revive,
+  7.4).
+* Spec: `spawn` persists the full `AgentSpec` (model, tool filter, schema, audience,
+  thinking, timeout) so cold revive rebuilds the same agent.
+* Growth cap while live: when `journal.ndjson` exceeds 4 MiB the writer task compacts it
+  (write temp, rename, drop terminal runs older than 24 h and delivered message bodies),
+  and also at session start. Compaction runs in the writer task, not under the hub lock.
+* Shell log retention: each log is capped at 64 MiB (2.6, 6.3); at session start, logs of
+  terminal runs older than 7 days, and the oldest logs beyond 512 MiB total per session, are
+  deleted; session delete removes the directory.
+* Transcripts are written incrementally per turn (7.4).
+
+Reconciliation (`UnitHub::reconcile`, constructor of a resumed session, before any spawn):
+1. Replay the journal. Runs whose last state is non-terminal and not followed by a clean mark
+   are suspect; a non-terminal run despite a clean mark is a bug and treated the same.
+2. Suspect agent: `Done(Lost)`, transcript untouched.
+3. Suspect shell with a `.pid` file: if the process exists and its start time matches
+   (`/proc/<pid>/stat` field 22; elsewhere pid only and treated as gone), it is an orphan:
+   `killpg(SIGTERM)`, 5 s, `SIGKILL`, then `Done(Lost)` (detail `orphan killed`); else
+   `Done(Lost)` (`process gone`). No re-adoption.
+4. Append `term` records so replay is idempotent.
+5. Undelivered, unconsumed `notice` records plus one `Lost` notice per newly lost run queue
+   for `main`, wake flag per original policy, subject to the wake budget, delivered on the
+   first `claim_wake` after load (TUI) or at hub start (headless). The lost wording (3.7)
+   says what to do: `runs(id)`, `send` to cold-revive, or spawn a new one.
+6. Pending messages (`accepted`, never `delivered`) keep their bodies in `messages.ndjson`;
+   they are redelivered on revive and the lost notice says "N unread messages".
+
+A session without a journal (written before this feature) reconciles as a no-op and
+`StoredSubagent` keeps restoring read-only tabs.
+
+### 7.4 Persistence of agents, cold revive
+
+Transcripts reuse `Session.subagent_messages` (`maki-storage/src/sessions.rs:423`) and
+`subagents: Vec<StoredSubagent>` (`:640`). The key becomes the run handle for native agents;
+`StoredSubagent` gains `run: Option<StoredRun>` (handle, name, parent handle, kind tag, last
+state, depth, one_shot), `#[serde(default, skip_serializing_if)]`; old binaries ignore it and
+old sessions load with `None`. Writes use the incremental path (`saved_sub_msg_counts`,
+`sessions.rs:1088`): the hub emits `AgentEvent::SubagentHistory` at each turn end, appending
+only the new messages, so a crash loses at most the current turn. Not persisted in the
+session: inboxes, buckets, wake counters, waiters, live processes (the journal covers
+notices and delivery).
+
+Revivability. `send` to a `Done` agent (`Completed`, `Lost`, `Killed`, `Failed`, `TimedOut`
+from an earlier process) or one evicted from memory is accepted when its transcript exists.
+`UnitHub::revive(id)` loads `subagent_messages[handle]`, rebuilds the runner from the persisted
+`AgentSpec` (same `UnitId`, handle, name, owner), sets `Running` (`Queued` if no slot), and
+delivers the message as its first `Steer` together with any pending journaled messages. Not
+revivable (`RECIPIENT_TERMINAL`): shells, an agent with no transcript file, a `Failed` agent
+whose transcript cannot be repaired by sanitize. A `one_shot` agent that completed is
+revivable like any other: it only ends after its turn instead of staying available.
+
+Eviction. Idle agents beyond `max_idle` and `Idle` expiry (`idle_timeout`) leave memory
+silently: no settlement notice, because Idle never produced one; the agent becomes
+`Done(Completed)` with its transcript kept. Terminal runs beyond `max_retained` are evicted
+from the table but keep a tombstone (handle, name, owner, kind, last reason, transcript
+pointer, spec) in the journal and a one-line entry in `runs include_finished`, so revive by
+handle or name still works; tombstones are dropped at session delete or compaction after 24 h
+only when the transcript no longer exists. Topology facts are re-told on revive; the system
+prompt and tool frame are rebuilt for the audience (one possible cache miss, accepted).
+
+## 8. UI and observability
+
+### 8.1 TUI
+
+* Tabs: unchanged model. `RunStarted` with `SubagentInfo` creates a chat tab through
+  `deliver`/`resolve_or_create_chat` (`maki-ui/src/app/mod.rs:1636`), keyed by the run
+  handle carried in `SubagentInfo.parent_tool_use_id` (5.4, phase 3). The tab title is the run name. Shell runs get no
+  chat tab; they appear in `/runs` and the status line only, with a log viewer
+  (below).
+* `/runs` (picker, named `/runs` so it does not clash with the Lua `/tasks`): implemented in Rust in `maki-ui` over a `RunsView` kept in
+  `App`, updated from `RunStateChanged`. Rows: tree indent, name, handle, kind, state
+  glyph, age, cost, progress. Keys: Enter focus the tab (agents) or open the shell log
+  viewer, `s` stop, `x` stop and forget, `r` resume prompt for finished agents. Sits beside
+  the legacy Lua `task` picker (unchanged in v1); the outcome-transition logic of `diff_task_states`
+  (`maki-ui/src/app/tasks.rs:184`) is ported onto `UnitState`.
+* Status line: a segment `runs 3 running 1 queued` hidden at zero, plus a `!` badge
+  when a run waits for permission, and `lost` count after a resume.
+* Notices render as one collapsed row in the main transcript: `<run-notice>` frames are
+  detected (the UI recognises the wrapper, 2.6) and shown as `auditor finished (2m10s,
+  $0.12)`, expandable to the bounded text. `RunMessageDelivered` shows a dim
+  `delivered` mark on the send tool row. A `send` from `user` (typing in a tab) is
+  `Steer`.
+* Shell log viewer: a read-only transient panel tailing `<handle>.log` by offset; no
+  model tokens involved.
+* Mailbox wake (`start_mailbox_runs`, `event_loop.rs:1189`): unchanged for `main`;
+  `RunNotice(wake)` calls `SessionMailbox::notify(main, text, wake)`, honouring the wake
+  budget in the hub before the call.
+* Stale-run drop (`event_loop.rs:246`): hub events use run_id 0 plus the stamp, as today.
+
+### 8.2 Headless, ACP, SDK
+
+* `maki -p`: `headless.rs:163 spawn` and `:307 spawn_interactive` start `drive_main`
+  (4.4, phase 4c). Run transitions print on stderr as one line each
+  (`[run ag-k3x9ab auditor completed 2m10s]`) unless `--quiet-runs`; JSON output (`print.rs`)
+  adds `run_*` objects; `join` per 4.4; unattended permissions follow 6.2 (phase 7b).
+* ACP (`maki-acp`): permission requests carry the run name (phase 5b). Mapping run state to
+  `tool_call_update` is post-v1 (appendix B); ACP exposes no run tree in v1.
+* SDK (`sdk_mode.rs`): events serialised with the existing envelope plus the new variants;
+  additive to the wire format.
+* Logging: every transition is a `tracing` event with `run`, `handle`, `owner`, `state`;
+  otel spans per agent run are children of the spawning tool span.
+
+### 8.3 Lua API relation
+
+Lua is left as is in v1; the native tools coexist with the Lua `task` tool until a separate
+decision (appendix B).
+
+| API | v1 decision |
+|---|---|
+| `maki.agent.session`, `maki.task.*`, `maki.session.notify`, `maki.fn.job*`, bundled `plugins/task` | Unchanged. The legacy `task` tool and native `spawn` coexist; users may hide one with `disabled_tools`. `plugins.task.*` config keeps working. |
+| `maki.run.*` | Built after v1 (appendix B): `enabled`, `spawn`, `send`, `runs`, `wait`, `stop` over the native hub. |
+| `maki-monitor` | External, not in this repo; not touched. Docs carry a migration table `monitor_start -> spawn(kind=shell, watch=...)` once phase 2b lands. |
+
+### 8.4 Docs and docgen
+
+`maki-docgen/src/main.rs` PAGES (8 pages, content root `site/docs/content`, `:17`; `docs/`
+holds only `docs/design`). Each phase regenerates with `cargo run -p maki-docgen` and commits
+the output in the same commit, because `--check` is a CI gate: phase 1 (tools via
+`gen_tools.rs` showing `ToolSource::Native`, `[agent.runs]` on the configuration page),
+5a (full `[agent.runs]`), 7a (commands `/stop`, keybindings). The hand-written agents page
+under `site/docs/content/` lands in 7b.
+
+## 9. Phased implementation plan
+
+Common rules for every phase: strict sequence (a phase assumes only the earlier ones
+are merged); no sleeps in tests (injected `Clock`, flume channels, `smol::block_on`);
+AGENTS.md style (no trivial comments, constants at top, `test_case`, deps only through
+the workspace `Cargo.toml`); one commit per phase, conventional prefix (`feat:`, 2-5
+sentences, plain prose, no em-dashes), no push. Regression gates after each phase (see
+Appendix A for the toolchain):
+
+```
+cargo fmt --all -- --check
+cargo clippy --all --tests -- -D warnings
+cargo nextest run --workspace
+cargo run -p maki-docgen -- --check
+```
+
+Live e2e: isolated XDG dirs under `/tmp/e2e` (`XDG_CONFIG_HOME/maki/providers.toml`
+with `[linken] protocol="openai" base_url="http://ai-models-1.linken.lan/v1"
+api_key="none"`), model `linken/ornith-1.5-35b-a3b-cybertiel-mtpv2-ice-21g`, driven
+through the PTY runner `/tmp/e2e/run.py`. Never kill processes by name; kill by the PID
+the runner prints.
+
+### Kill switches and naming
+
+Each phase is sized for one agent context, ends in a green gate, a commit and a live e2e, and
+is guarded by its own key under `[agent.runs]` (all default true once `enabled = true`;
+setting one false removes that capability without touching the others):
+
+| Phase | Switch | Effect when false |
+|---|---|---|
+| 1 | `enabled` | tools not registered (default false until phase 8) |
+| 2, 2b, 2c | `shell` | `spawn(kind=shell)` rejected `DISABLED`; no watch; no promotion |
+| 3 | `agents` | `spawn(kind=agent)` rejected `DISABLED` |
+| 4a | `messaging` | `send` rejected `DISABLED`; no inbox drains |
+| 4b | `notices` | settlement visible only through `wait`/`runs`; no wake |
+| 4c | `headless_drive` | `-p` exits at the final turn as today |
+| 4d | `topology` | no topology fact; `siblings` irrelevant |
+| 4e | `acks` | no delivery tracking |
+| 5a | `queue` | over-cap spawn rejected `QUEUE_FULL` instead of queued |
+| 5b | `route_permissions` | background prompts auto-deny |
+| 6a | `journal` | memory-only table, no `lost` reconciliation |
+| 6b | `revive` | terminal runs never revive |
+| 7a, 7b | `ui` | no `/runs`, status segment, log viewer, run stderr lines |
+| 12 | `background_only` | the `task` tool is offered again, a delegated child stays idle after its turn and is not told to report |
+
+Naming: the new concept is `Unit` in Rust (`UnitHub`, `UnitId`, `UnitHandle`, `UnitName`,
+`UnitState`, `UnitLimits`...), because `Run*` names collide with the per-turn `run_id`
+(`Envelope.run_id`, `types.rs:1195`), `RunContext` and `RunLedger`. Model-facing text, the
+tool names, `[agent.runs]` and the `runs/` module keep the word "run"; this doc says run.
+
+### Phase 1: native tool path, UnitHub skeleton, ids
+
+Goal: `ToolSource::Native` exists, the five tools are registered and callable, the hub
+creates, names and lists runs with no execution (`spawn` records state `Queued` for agent
+and shell, `runs` lists it). Behind `enabled` (default false).
+
+Files: `maki-agent/src/runs/{mod,topology,clock,limits}.rs` (new, `limits.rs` holds a
+minimal `UnitLimits` with only `max_depth`, `max_children_per_run`, `session_max_runs`
+so spawn validation exists; the rest lands in 5a); `maki-agent/src/tools/runs.rs` (new);
+`tools/registry.rs:81` (variant) and `:87` `as_log_field` only (`Route::Native` at
+`tool_dispatch.rs:393` already routes any registered tool, no `Route` change);
+`tools/mod.rs` (`ToolContext` `:322`, `is_builtin_tool`); `agent/run.rs` (`AgentParams`
+`:102`, `tool_context` `:935`); `live_session.rs` (`AgentSeed` `:53` field); `maki-config`
+(`[agent.runs]` mirror types, `DEFAULT_BUILTINS`); `maki-docgen/src/gen_tools.rs`;
+`maki-ui/src/components/tool_display.rs`; headless wiring (5.3).
+
+ToolContext churn: about 30 struct literals (`run.rs` 2, `tool_dispatch.rs` 15,
+`live_session.rs` 2, `tools/mod.rs` 7, `maki-lua/src/api/util/ctx.rs` 3,
+`maki-lua/tests/code_execution_policy.rs` 1; `plugin_host.rs` only implements `Tool`). The
+two new fields go in one `runs: Option<RunsCtx>` so each literal gets one `runs: None`
+line; do it as the first mechanical step, compile, then continue.
+
+Test support: `MockProvider` (`run.rs:1239`) and `StubStreamProvider` (`:1293`) are private
+under `#[cfg(test)]` in `run.rs`. Step 0: extract them into `maki-agent/src/test_support.rs`
+(`#[cfg(any(test, feature = "test-support"))]`, `pub`), used by `runs/` tests and
+`maki-agent/tests/runs_soak.rs` (a new dir; integration tests need the feature, enabled
+in dev-dependencies). `maki-providers` already has a `test-support` feature for its
+recorded server; reuse that flag name.
+
+Interfaces:
+```rust
+pub struct UnitHub; impl UnitHub {
+  pub fn new(limits: UnitLimits, events: EventSender, clock: Arc<dyn Clock>) -> Arc<Self>;
+  pub fn spawn(&self, caller: UnitId, req: SpawnRequest) -> Result<SpawnAck, UnitError>;
+  pub fn list(&self, caller: UnitId, scope: Scope) -> Vec<UnitView>;
+  pub fn resolve(&self, caller: UnitId, key: &str) -> Result<UnitId, UnitError>; // id|handle|name|"main"|"parent"
+}
+pub fn native_run_tools(audience: ToolAudience) -> Vec<Arc<dyn Tool>>;
+pub trait Clock: Send + Sync { fn now(&self) -> Instant; }
+pub enum UnitError { UnknownRun, NotReachable, RecipientTerminal, InboxFull{retry_after:u64}, TooLarge{max:usize}, RateLimited{retry_after:u64}, SelfSend, QueueFull, SpawnLimit, DepthLimit, Disabled, BadField{field:&'static str, kind:&'static str} }
+```
+Steps: (1) the churn and test-support steps above; (2) enum variant, fix compile errors,
+`as_log_field` arm `native`; (3) ids, handle collision retry, name slug, reserved
+names `main` and `parent`; (4) `UnitTable` with name and children indexes; (5) tool structs
+(`parse`, `start_header`, schema and descriptions from section 3, cross-kind field
+rejection 3.1) each declaring `reach()` (`registry.rs:249`; `None` means unbounded
+authority, so declare explicitly: `spawn` `Permission::Run` prompted, the rest
+`Permission::Agent` not prompted); `wait/send/stop` return `NOT_IMPLEMENTED`; (6) config
+flag and registration before Lua tools; (7) hub creation and `tool_context` plumbing
+(5.3, including headless, which builds no `AgentSeed`); (8) docgen: `gen_tools` shows the
+native tools and `[agent.runs]` appears on the configuration page, regenerated in this
+commit so `--check` stays green.
+
+Tests: `runs::handle_is_prefixed_and_six_chars`, `runs::name_slug_suffixes_on_clash`,
+`runs::reserved_names_rejected`, `runs::resolve_main_parent_name_handle`,
+`runs::depth_limit_rejects_agent_spawn`, `tools::runs::schema_matches_snapshot`,
+`tools::runs::cross_kind_fields_rejected`, `tools::runs::spawn_returns_queued_record`,
+`registry::native_tool_logs_source`, `registry::native_tools_declare_reach`.
+E2E: start, ask "call runs with no arguments", expect `no runs`.
+Notes from the build: the root id is `hub.main()` (not in the table, depth 0); native tools are registered by `runs::sync_registration` from `load_plugins` (`src/cmd/mod.rs`) before the Lua builtins; the run names count as built-in (MCP server name clash) only while `enabled` is true.
+Commit: `feat: add native run tool surface and hub skeleton`.
+
+### Phase 2: native shell jobs (core)
+
+Goal: `spawn(kind=shell)` runs, logs to disk, settles with exit codes, TERM/KILL stop,
+`runs(id)` reads output by cursor, `wait` and `stop` truthful. No stdin send in v1, no
+`watch` (2b). Settlement notices exist in a hub-local queue; delivery is phase 4b (until
+then `wait` and `runs` return them).
+
+Files: `runs/shell.rs`, `runs/notice.rs` (new), `runs/mod.rs`, `tools/runs.rs`,
+`maki-storage/src/paths.rs` (runs dir helper, `0700`), `maki-agent/Cargo.toml` (`smol::process`
+is in tree; process groups via `std::os::unix::process::CommandExt::process_group`; add no
+new dependency without checking the workspace `Cargo.toml`).
+
+Interfaces:
+```rust
+impl UnitHub {
+  pub fn stop(&self, caller: UnitId, ids: &[UnitId], opts: StopOpts) -> Vec<StopOutcome>;
+  pub async fn wait(&self, caller: UnitId, ids: &[UnitId], mode: WaitMode, timeout: Duration, cancel: &CancelToken) -> Vec<UnitView>;
+  pub fn read_output(&self, reader: UnitId, id: UnitId, from: Option<u64>, tail: usize, consume: bool) -> OutputSlice;
+}
+pub struct ShellSpec { pub command: String, pub cwd: PathBuf, pub timeout: Duration }
+```
+Steps: (1) spawn `sh -c` with `process_group(0)`, stdout and stderr into one pipe, pump to
+`<handle>.log` capped at 64 MiB; (2) settle on exit with code or signal text; (3) timeout
+task on the injected clock; (4) `stop` = TERM, 5 s grace, KILL, `Stopping` then `Done(Killed)`;
+(5) `wait` per 3.3 (terminal or Idle) with `WaiterSet` and the consumption rules of 4.8;
+(6) per-reader output cursors keyed by reader id (3.4); (7) last 5 lines in the result;
+(8) permission scope: `permission_scopes` for bash lives in `plugins/bash/init.lua:296`
+(`generalize_bash_segment`, `permissions.rs:1047`, only generalises an allow-always rule
+and is not the scope logic); port the minimal scope computation to Rust, do not change
+bash; (9) log retention (7.3): size cap per log, age cleanup at session start.
+
+Tests: `shell::exit_zero_completes`, `shell::nonzero_is_failed`, `shell::output_ordered_in_log`,
+`shell::stop_sends_term_then_kill_after_grace` (traps TERM, manual clock),
+`shell::timeout_marks_timed_out`, `shell::orphan_group_killed`, `shell::log_cap_discards_and_marks`,
+`shell::cursors_are_per_reader`, `hub::wait_any_returns_first`,
+`hub::wait_timeout_does_not_consume_result`, `hub::wait_cancel_does_not_stop_runs`,
+`hub::stop_is_idempotent_and_truthful`.
+E2E: "spawn a shell `for i in 1 2 3; do echo $i; sleep 1; done`, wait for it, tell me the
+last line" (calls spawn, wait; answer has 3). "spawn `sleep 600`, then stop it": `stopped`,
+no `sleep 600` left by the PID the runner prints.
+Notes from the build: shells start `Running` at once (capacity is the phase 1 spawn limits; `max_shells` and the queue arrive in 5a), agents stay `Queued` until phase 3. The log dir is `<state>/runs/<session>/` (`maki_storage::paths::runs_dir`, which also prunes: stale logs everywhere, 512 MiB budget for the own session). `Clock` gained `sleep_until` so timeouts and the TERM grace run on the injected clock. `stop` only starts the stop; the tool waits up to `wait_secs` and then reports `stopped` or `still_stopping`. Reads consume notices immediately (the commit-claim of 4.8 comes with delivery in 4b). Anything still in the process group after the shell exits is killed, and dropping the hub kills running shells without grace (a launch in flight is covered by a lock shared with the teardown). A graceful quit (Ctrl-C/Ctrl-D) leaves no shell behind, and so do SIGTERM, SIGHUP and SIGINT outside raw mode and a panic on the main thread: `runs::install_signal_teardown()` (called first in `main`) turns them into a pipe write handled by a `maki-signals` thread that calls `runs::shutdown_all()` (SIGTERM to every live shell group, at most 500 ms, then SIGKILL) and re-raises the signal with the default action; normal and error exit call `shutdown_all()` too. `UnitHub::shutdown()` does the same for one hub and both are synchronous, idempotent and need no runtime; a process-wide set of live groups lets the signal thread work without a hub, and new launches are refused once shutdown began. SIGKILL and abort cannot run code, so shells still outlive maki there until the pid-file reconciliation of phase 6a. `PR_SET_PDEATHSIG` was tested and rejected: it fires when the thread that forked the child exits (verified: a child spawned from a thread that then ended was killed at once), and shells are spawned from smol executor and blocking-pool threads that come and go; it would also reach only the leader, not the rest of the group. Shell logs are `0600` in a `0700` dir. The `spawn` prompt is keyed `spawn`, so `spawn` allow rules apply, not bash rules; scopes come from `runs::shell::command_scopes`, a quote-aware splitter that is stricter than the bash plugin (anything it is unsure about is one forced-prompt scope).
+Commit: `feat: native background shell runs`.
+
+### Phase 2b: shell watch and Match notices (maki-monitor replacement)
+
+Goal: `spawn(kind=shell, watch=regex)` turns matching lines into `Match` notices, shipped
+right after core shells so `maki-monitor` users can migrate.
+Files: `runs/shell.rs`, `runs/notice.rs`, `tools/runs.rs` (`watch` field), docs migration
+table. Steps: regex compile errors returned at `spawn`; 1 match notice per second then
+batched, 20 per minute then `Overflow`; matches coalesce per drain; notices are quiet
+unless `notify=wake`. Tests: `shell::match_notices_rate_limited`, `shell::bad_regex_rejected`,
+`shell::match_batches_after_first_per_second`. E2E: spawn a loop echoing `error` lines with
+`watch=error`; `runs` shows the batched matches.
+Commit: `feat: shell watch notices`.
+
+Notes from the build: the code is `runs/watch.rs`. The shell's stdout and stderr already share one pipe, so the pump feeds the raw chunks to a `Watch` (line splitter, `regex::Regex`, pure `Limiter`) before the log-cap check, which means matching continues after the log limit is hit; a trailing line without a newline is matched at EOF and an 8 KiB line is matched in pieces. The regex is compiled in `SpawnRequest::into_kind`, so a bad one fails `spawn` with `BAD_FIELD: "watch" is not a valid regex` and no run is created (Rust `regex` syntax; the pump compiles it again). The limiter sends the first match at once, holds later ones for at least 1 s (a pump timer on the hub clock flushes them when the output goes quiet; at most 50 lines per notice, the rest counted as `(+N more matching lines)`), and after 20 match notices in a 60 s window sends one `Overflow` notice and drops matches until the window rolls over; held lines are flushed at EOF. Notices are `Match` kind with generation 0, so the inbox's existing collapse folds identical texts into `(xN)` and a read of a finished run does not consume them (only `Settled` ones are claimed). They wake only under `notify=wake` (the default) and so spend the wake budget like any waking notice (a noisy watch can use up the three wakes; the claim then demotes them and queues the usual overflow marker); `notify=quiet` makes them quiet and `never` suppresses them (read with `runs`). Match lines are cut at 300 characters in the notice. The limits are constants (`MIN_GAP`, `WINDOW`, `MAX_PER_WINDOW`). Tests: `watch::tests::match_notices_rate_limited` (limiter cap and roll-over), `shell::tests::match_batches_after_first_per_second`, `shell::tests::bad_regex_rejected` and a real-process test (`sh -c 'echo a; echo ERROR b; sleep 1'` with `watch=ERROR` yields one waking notice naming only `ERROR b`). Not built: a live TUI run of the loop e2e, and a migration table in the user docs beyond the schema text.
+
+### Phase 2c: bash foreground-to-background promotion
+
+Goal: a long `cargo build` that hits the bash timeout keeps running as a shell run instead
+of being killed. First read how `plugins/bash/init.lua` spawns and times out (bash is a Lua
+plugin); if the child can be handed to the hub through a core hook
+(`ToolContext.runs.adopt(child, log)`, called from a native `bash_promote` seam in the
+tool runner), adopt it: the timeout result says `still running as sh-xxxxxx, use wait or
+runs`. If the plugin cannot hand over the process, fall back to a result text hint
+("rerun with spawn kind shell") and record promotion as post-v1 (appendix B). Tests:
+`shell::adopted_process_gets_handle_and_log`, `bash::timeout_result_names_handle`.
+E2E: `bash` with a 3 s timeout and `sleep 20`; the result names the handle and `wait`
+finishes it.
+
+Notes from the build: bash is a Lua plugin whose child lives in the Lua job store (reader threads own the pipes, a wait thread owns the `Child`), so a process cannot move into the hub as a handle. Instead the plugin calls `ctx:promote(job, {command, output})` from its `on_cancel` hook when the reason is `timeout`, and the hub adopts the job by its event stream: `ctx:promote` takes the job's pid and `flume` receiver (`JobStore::take_for_adoption`, task-owned and still alive only), asks `UnitHub::adopt_shell` (a normal `spawn_with` with an `Adopted { pid, initial, events }` argument, so every limit, the rate window, naming and the journal `spawn` record apply), and only on success drops the job entry without a kill and starts a `job-adopt` thread that turns the remaining lines and the exit into `AdoptEvent`s. A refusal (`SHELL_LIMIT`, `SPAWN_LIMIT`, `RATE_LIMITED`, runs disabled, the job already exited) returns `(nil, why)` with the job and its receiver untouched, and the plugin falls through to today's `partial.cut` kill path, so nothing changes with `[agent.runs]` off. Ownership: the wait thread keeps reaping the child and sends the exit; the hub never waits on the pid, it signals the group only (TERM, the grace, KILL) and sweeps the group after the exit, and the task scope's `kill_owner` finds nothing because the entry is gone, so there is no double kill. `supervise_adopted` (`runs/shell.rs`) writes the output captured so far (`initial`, the plugin's merged lines) to the head of `<handle>.log` and the ring, appends later output through the same cap logic, publishes the pgid under the same `killed` gate as a launch (teardown, `shutdown_all` and the signal thread cover it) and journals the `proc` record, so a crash reconciles it like any shell. The run gets a fresh default shell timeout counted from adoption (the elapsed foreground time is not charged), no `watch`, the label `bash: <first line>` and `notify` default. The result is not an error: `[timed out after Ns; still running as sh-xxxxxx, use wait or runs to follow it; output above is partial]` (`partial.promoted`). Deviations: the stdout/stderr interleaving is the plugin's arrival order, the `proc` record is written after the command started (no gate), and the doc's `ToolContext.runs.adopt` seam is `ctx:promote` on the Lua ctx. Tests: `shell::tests::adopted_process_gets_handle_and_log`, `adopted_failure_keeps_exit_code`, `adopted_process_is_stopped_once_with_term_then_kill`, `adopted_process_times_out_on_its_own_deadline`, `refused_adoption_leaves_the_process_with_its_owner` (real `sh` processes) and, with a real Lua job, `plugin_host::ctx_promote_hands_a_timed_out_job_to_the_run_hub` and `ctx_promote_refuses_when_runs_are_off`. Not verified live against a real model or the TUI.
+Commit: `feat: promote timed-out bash commands to background runs`.
+
+### Phase 3: background agent driver loop
+
+Goal: `spawn(kind=agent)` runs a real subagent that survives the parent turn, reports,
+becomes `Idle`; events stream to today's subagent tabs.
+
+Files: `runs/agent.rs` (new), `runs/mod.rs`, `tools/runs.rs`, `agent/run.rs`
+(`AgentParams` `self_run`, `runs`; `task_id` untouched), `agent/frame.rs:83` and
+`maki-lua/src/api/agent.rs:969-970` (the existing `RunContext::fixed` sites to learn from),
+`types.rs` (`AgentEvent::{RunStarted, RunStateChanged, RunFinished}`),
+`maki-ui/src/app/mod.rs:1636` and `maki-ui/src/agent/mod.rs` (hub creation), `headless.rs`.
+
+UI spec: `SubagentInfo.parent_tool_use_id` (`types.rs:1122`) keys the tab today. For native
+runs the stamp's `parent_tool_use_id` carries the run handle (`ag-k3x9ab`), `name` the run
+name; `resolve_or_create_chat` is keyed by that string, so tabs, `/runs` and persistence need
+no new key type. The origin `tool_use_id` is rendering metadata (`origin_tool_use_id`).
+Legacy Lua `task` keeps real tool_use_ids; the two key spaces cannot collide (`ag-`/`sh-`
+prefix vs `toolu_`/`call_`).
+
+Audience tool sets: native agents use `ToolAudience::GENERAL_SUB` or `RESEARCH_SUB`
+(`registry.rs:26`); phase 3 registers the five tools for `MAIN` and `GENERAL_SUB` only
+(`RESEARCH_SUB` gets `runs`, `wait`, `send`; no `spawn`, `stop`). `send` is a no-op error
+until 4a. Tool sets are fixed per frame (5.2).
+
+Interfaces:
+```rust
+pub(crate) struct AgentRunner { /* history, gauge, inbox, cancel, ledger */ }
+impl UnitHub { pub(crate) fn spawn_agent(&self, caller: UnitId, spec: AgentSpec) -> Result<SpawnAck, UnitError>; }
+pub struct AgentSpec { pub prompt: String, pub audience: ToolAudience, pub model: ModelChoice, pub tools: Option<ToolFilter>, pub thinking: Option<Thinking>, pub output_schema: Option<Value>, pub one_shot: bool, pub context: ContextMode, pub timeout: Duration }
+```
+Steps: (1) port the `AgentParams` construction from `maki-lua/src/api/agent.rs:731`
+into `AgentRunner::params` (move `resolve_model` into maki-agent, Lua calls it); (2)
+child cancel token from `hub.cancel`, `RunLedger::child`; (3) drive loop 4.4 with only the
+initial prompt; (4) `structured_output` local tool; (5) result capture with 4 KiB bound and
+spill; (6) `Idle` after the first result unless `one_shot`; (7) port
+`relay_session_events` (`maki-lua/src/api/agent.rs:270`) stamping `SubagentInfo`; (8) UI tab
+creation on `RunStarted`; (9) permission broker with auto-deny only (5b adds routing);
+(10) `wait` Idle semantics (3.3), default `timeout_secs` 1800 applied; (11) stop cascade child-first with
+notice suppression (7.1, 4.8; test `agent_run::stop_cascades_children_first`); (12) `context=fork`
+per 3.1 or cut it if the history snapshot cannot exclude the in-flight turn.
+
+Tests: `agent_run::completes_with_result_and_goes_idle`, `agent_run::one_shot_completes`,
+`agent_run::survives_parent_turn_end` (`cancel_all` called, child continues),
+`agent_run::cost_rolls_up_once`, `agent_run::structured_output_lands_in_result`,
+`agent_run::long_result_spills_to_disk`, `agent_run::stop_settles_killed_and_history_sanitized`,
+`agent_run::wait_returns_on_idle`, `agent_run::fork_excludes_inflight_turn`,
+`app::native_run_creates_tab_keyed_by_handle`, and the matrix `native_and_legacy_task_enabled`
+(both the Lua `task` tool and native `spawn` registered; both complete; tabs do not clash).
+E2E: "spawn an agent named reader to list the top-level files and report in one sentence,
+then wait for it". Expect a tab; `wait` returns when the agent is Idle; the child tab keeps
+progressing after the parent's final text when not waited.
+Commit: `feat: native background agent runs`.
+
+Notes from the build: `AgentSpec` is the request as parsed (prompt, subagent type, tier, thinking, schema, `fork`, `one_shot`, timeout) and everything the driver needs from the caller's `ToolContext` is resolved by `AgentLaunch::prepare` in the `spawn` tool before the hub is touched, so a bad schema or tier fails with no run created; the hub's `spawn_agent` takes the prepared launch. The driver (`runs/agent.rs`) owns its `History`, its cancel token is a child of a session-lifetime root on the hub (not in the per-run `CancelMap`, so `cancel_all` after a turn leaves it alone), and its `RunLedger` is a child of the caller's, so cost is added once up the chain. Events of background runs carry `BACKGROUND_RUN_ID` (`types.rs`); without it the UI's stale-turn gate dropped every event once the next turn began. The tab is keyed by the handle through `SubagentInfo.parent_tool_use_id`, opened by the stamped `RunStarted`, and double Esc on it stops the run through the hub (cascade included); `RunFinished` closes it. Run events are not stamped for shells, so they stay on the main chat. `context=fork` is kept: `tool_dispatch` publishes the history as it stood before the in-flight assistant message for every `spawn` call that asks for it, and `spawn_agent` consumes that snapshot by `tool_use_id` (`BAD_FIELD` when none exists). Results are bounded at 4 KiB (3072 head, 768 tail) with the whole text in `<handle>.result.txt` in the run dir, and `runs(id, full=true)` reads it back; `wait` and `runs` print an agent's `result:` and `structured:` lines. A soft stop is an interrupt of the turn that lands in `Idle`; a hard stop cancels the run token, and `finish` stops children first and settles the parent only once they have settled (a 5 s watcher force-settles a run that does not react). An idle agent has no wake source before 4a, so it waits for its stop. Plan mode lets only research agents be spawned and blocks shell runs. `wait`, `runs(id)`, `runs(scope=all)` and `stop` are scoped to the caller's subtree (`can_reach`). `UnitView.result` carries the last result of an `Idle` agent. The hub is shut down with its agent loop (`cancel_all`), which stops every run. Permissions are auto-deny only, as planned: a background agent has no `user_response_rx`, so `PermissionManager::enforce` denies any call that would need a prompt while allow rules still apply; routing a prompt to the owner is 5b.
+
+Verified live (PTY, rendered screen): the status bar shows only the active chat as `[name]` once a second chat exists, so a native tab is seen by switching chats (`next_chat`), not in a strip. Esc in the parent ends only the parent turn; native tabs are exempt from the Esc sweep (`is_native_run` in `maki-ui/src/app/mod.rs`) so they stay open and are not marked cancelled. Quitting while an agent is mid-request exits at once and sends no further provider requests.
+
+### Phase 4a: inbox, drain points, send parent <-> child
+
+Goal: `send` between a parent and its child (and to `main`) with caps; no wake of main yet.
+Files: `runs/inbox.rs`, `runs/agent.rs`, `agent/run.rs` (`land_input` `:388`, `prepare_request`
+`:514`, `handle_queued_command` `:1087`, `keep_going` `:742`), `inbox.rs` (`SubagentInbox`
+adapter), `live_session.rs` (per-run mailbox).
+Interfaces: `UnitHub::send(from, to, text, kind) -> Result<MessageId, UnitError>`.
+Steps: (1) `Inbox` with caps (4.7), per-pair bucket and duplicate-free messages; (2) the four
+drain points (4.2), coalesced `<run-message>` frames, never between `tool_use` and
+`tool_result`; (3) the seq-recheck drive loop (4.4); (4) router `can_send` for parent,
+child, `main`, `user`; (5) anti-ping-pong guard (4.7); (6) steer/followup/quiet semantics.
+Tests: `inbox::caps_reject_toolarge_and_full`, `inbox::pair_rate_limit_manual_clock`,
+`inbox::steer_never_between_tool_use_and_result`, `inbox::steer_extends_open_turn`,
+`inbox::idle_agent_woken_by_steer`, `inbox::quiet_drains_at_next_model_request`,
+`inbox::message_arriving_during_settle_not_lost`, `inbox::messages_never_collapsed`,
+`hub::pingpong_guard_holds_and_notifies_parent`, `hub::send_to_sibling_rejected_by_default`.
+E2E: spawn `a`; `a` is told to ask its parent one question mid-run via `send`; the parent
+answers with `send`; `a` finishes with a result that uses the answer.
+Commit: `feat: run inbox and parent child messaging`.
+
+Notes from the build: every inbox lives in `runs/inbox.rs`; `main` has one on the hub and the root agent drains it through the same code, so `main` as a recipient is capped and rate limited like any run (waking an idle `main` is 4b). `Agent::new` takes its inbox from `params.runs` (`hub.inbox_of(self_run)`), so legacy Lua subagents, which carry no `RunsCtx`, are untouched. Lock order is inbox lock first, hub lock second; `send` checks reachability and state under the hub lock, drops it, then enqueues under the inbox lock, where a waking item flips the inbox phase and the unit state to `Running` in the same critical section. A run's inbox is closed when it is hard-stopped or finishes, so a `send` that raced the state change still gets `RECIPIENT_TERMINAL`. The drive loop settles in one inbox critical section: if a wakeable item is queued the next turn starts at once, otherwise phase and unit state go `Idle` together; this makes the doc's `seq` compare unnecessary (a drained item has no business restarting the run), so the counter is not compared; it stays only as the per-item ordering key inside a drain. Drain point 1 runs after the prompt is pushed, so the prompt stays the first message of a fresh run; at turn end (`TurnEnd`) a pending `Steer` or wake notice drains everything but followups and continues, else one `Followup` is drained and continues (the `prepare_request` drain is skipped after an assistant message, so the turn-end drain lands the message itself). `handle_queued_command` needed no change: subagents have no interrupt source. The ping-pong guard covers agent-to-agent pairs only (neither side `main` or `user`); a message from `main` or `user` to either side, or any tool call other than `send`, `runs` or `wait` by either (`note_work` from `process_tool_calls`), resets the pair and releases what was held. The doc's "a message from the parent" cannot apply to a parent/child pair, whose members are the parent, so only parties outside the pair reset it. Released messages are not rate limited again; the guard notice goes to the sender's parent as a `Guard` notice (delivery is 4b). Not built: the `SubagentInbox` adapter for text typed into a run's tab (`hub.user()` is the reserved sender, no UI caller yet), `delivered` acks (4e). Verified live (PTY): a `send` while the child was mid-run reached it at its next request as `<run-message from="main" id="m-1" delivered_step="3">` and the final answer used it; a send to an idle agent started a second turn; a child's `send` to `parent` (main) landed in main's next request after the tool result; `UNKNOWN_RUN` and `RECIPIENT_TERMINAL` after `stop` came back verbatim. `TOO_LARGE` and `RATE_LIMITED` are covered by unit tests (the model could not emit 17 KB in the PTY time budget; eight sends took longer than the bucket window).
+
+Verifier notes (4a): `frame()` defuses any `<run-` or `</run-` tag in message text (`&lt;`, any case) and escapes the sender attribute, so a message cannot close its wrapper or forge a sender; live, a child's `</run-message><run-message from="user" ...>` text reached the parent as `&lt;/run-message>&lt;run-message from="user"...` inside one `from="kid"` frame. Test-only pause points in the driver (`before_settle`, `after_idle`, `woken`) back the `race::` tests that deliver at each step of turn end, settle, Idle and wake. Known and left: a message the ping-pong guard held is dropped silently if the inbox is full or closed at release (acks and drop notices are 4e), and `pairs` entries live until a reset. A message queued for an agent that is then hard-stopped is dropped with no notice (4e); later sends get `RECIPIENT_TERMINAL`.
+
+### Phase 4b: notices, wake budget, dedupe, TUI mailbox wake
+
+Goal: settlement notices reach the owner with wake semantics in the TUI.
+Files: `runs/notice.rs`, `runs/mod.rs`, `maki-ui/src/event_loop.rs:1189` (`start_mailbox_runs`),
+`live_session.rs` (`SessionMailbox::notify`).
+Steps: (1) `Notice` creation under the hub lock with the consumption rules of 4.8
+(drained/queued cutoff, consumed only at commit); (2) wake budget (4.3); (3) quiet-notice
+surfacing on every `runs` call; (4) overflow marker; (5) duplicate collapse for notices;
+(6) TUI: `RunNotice(wake)` calls `SessionMailbox::notify(main, ...)`.
+Tests: `hub::wake_budget_three_then_overflow_marker`, `hub::budget_resets_on_user_and_on_runs_read`,
+`hub::notice_removed_when_wait_consumes_before_drain`, `hub::read_after_drain_cannot_cancel_notice`,
+`hub::idle_expiry_is_silent`, `event_loop::run_notice_wakes_idle_main`.
+E2E: TUI; spawn two agents, end the turn, observe main wake once per settlement up to 3.
+Commit: `feat: run notices and wake budget`.
+
+Notes from the build: a notice is an inbox item of kind `Notice` (`InboxItem.notice: NoticeInfo`) in the owner's own inbox, so the existing four drain points deliver it and `inbox::frame` is the only formatter (`<run-notice run name seq kind>`, `(xN)` suffix when collapsed). `SessionMailbox::notify` is not used: it is a second store with its own drain, which would duplicate the inbox. Instead the hub sends `AgentEvent::RunNotice{wake}` when a waking notice reaches `main`'s inbox (this is what wakes the event loop) and `start_mailbox_runs` asks `UnitHub::claim_main_wake()`, which starts a turn with an empty preamble and no user bubble; the turn drains the notice at `land_input`. The wake budget is spent at that claim, not at notice creation, so a notice that a running turn drains costs nothing and "consecutive notice-initiated turns" is exact. When the budget is gone the claim turns the queued waking notices quiet and queues one `Overflow` marker (worded for the budget; the "N dropped" wording is used when the inbox cap, not the budget, drops notices). A message to `main` (Steer/Followup) wakes without spending the budget. Notices are created under the hub lock into a pending list and moved into the inbox right after it is released (inbox lock first, hub second); the window between the two is closed by a per-run `settle_gen` and a `consumed` high-water mark checked under the inbox lock, so a read that saw settle N can only ever remove notices up to N, and a read that commits before the enqueue suppresses it. A read takes a `Claim` keyed by `tool_use_id`; `tool_dispatch` commits it right after the tool-result message is pushed to history (`commit_claims`) and releases it when the results are not submitted; a call with no `tool_use_id` commits at once. Only the owner's reads claim. `wait` on the hub no longer consumes; the `wait`, `runs` and `stop` tools claim what they returned. `runs` lists every queued notice (quiet ones included) and claims them, but in practice a quiet notice is drained by the next request first, so the listing matters only for a notice that arrives between a drain and the tool call. The budget resets in `Agent` when a non-blank user message lands (initial or queued steer) and in the `runs` and `wait` tools when called by `main`. Not built: Match and Lost kinds (2b, 6a), the UI collapse of notices into one row, and a configurable budget (a constant, `WAKE_BUDGET`). Verified live (PTY, real TUI): a shell that finished after the turn ended woke the idle parent once with a single extra request and no user bubble; a background agent finishing during the parent's closing request was delivered at turn end (same turn, no second wake); five staggered shells woke the parent three times, the fourth and fifth were quiet with one overflow marker and arrived with the user's next message, and after that message a sixth run woke it again; a `wait` that returned the result left no notice in any later request; `stop` produced none.
+Notes from the build: shells start `Running` at once (capacity is the phase 1 spawn limits; `max_shells` and the queue arrive in 5a), agents stay `Queued` until phase 3. The log dir is `<state>/runs/<session>/` (`maki_storage::paths::runs_dir`, which also prunes: stale logs everywhere, 512 MiB budget for the own session). `Clock` gained `sleep_until` so timeouts and the TERM grace run on the injected clock. `stop` only starts the stop; the tool waits up to `wait_secs` and then reports `stopped` or `still_stopping`. Reads consume notices immediately (the commit-claim of 4.8 comes with delivery in 4b). Anything still in the process group after the shell exits is killed, and dropping the hub kills running shells without grace. The `spawn` prompt is keyed `spawn`, so `spawn` allow rules apply, not bash rules; scopes come from `runs::shell::command_scopes`, a quote-aware splitter that is stricter than the bash plugin (anything it is unsure about is one forced-prompt scope).
+
+Verifier notes (4b): a claim registered under a reused `tool_use_id` now replaces the earlier one, so an abandoned call cannot consume a notice the model never saw. Known and accepted: a guard notice that collapses (`(xN)`) after a `runs` listing but before its commit is removed with it, losing one count. Verified live (PTY): an agent finishing while the chat was idle woke it once, the request ended in one user turn holding the notice with the result and no empty message; a plugin `maki.session.notify(wake=true)` and a native shell notice in the same session each started one turn in their own idle period and both texts arrived once; a draft typed while the wake turn streamed stayed in the input; `/new` with a shell running killed the shell and no notice or turn followed. Budget-exhausted quiet notices wait for the next user message or the next turn; the TUI accepts that (headless is 4c).
+
+### Phase 4c: headless drive_main and join
+
+Goal: `maki -p`, ACP and SDK start a run when a waking notice arrives and wait for work.
+Files: `headless.rs` (`:190` and `:339` already call `SessionMailbox::register`; there is no
+`AgentSeed`/`publish_seed` in headless, only `maki-ui/src/agent/agent_loop.rs:85`),
+`runs/mod.rs`.
+Interfaces:
+```rust
+impl UnitHub {
+  pub async fn drive_main(self: Arc<Self>, wake: impl WakeSink);
+  pub async fn join(&self, timeout: Duration);   // direct arg; the CLI flag is phase 7b
+}
+pub trait WakeSink { fn start_main_run(&self, preamble: Vec<Message>); }
+```
+Steps: (1) `drive_main` over the main mailbox; (2) `join` per 4.4 (ignores Idle agents with
+empty inboxes, drains quiet notices as a closing turn); (3) on timeout `stop` everything,
+runs become `Done(Killed)`.
+Tests: `headless::main_wakes_on_notice_and_join_waits`, `headless::join_timeout_stops_runs`
+(calls `join(timeout)` directly with a manual clock), `headless::join_ignores_idle_agents`,
+`headless::join_delivers_quiet_notices_as_closing_turn`.
+E2E: `maki -p` with a prompt that spawns a 5 s shell and an agent; process stays until both
+finish and prints their results.
+Commit: `feat: headless run driver and join`.
+
+Notes from the build: the code is `runs/drive.rs`. `join` and `join_until(deadline)` take `self: &Arc<Self>` (they call `stop`) and return `Joined::{Quiet, Pending, TimedOut{stopped}}` instead of `()`: `Pending` means no run is left but `main`'s inbox holds quiet items, so the caller runs one closing turn (at most 3 in a row) and joins again. `drive_main` hands a wake to the sink only while no turn of `main` is in flight; the frontend brackets every turn with `main_turn_begins`/`main_turn_ends`, and `join` treats an open turn, an unclaimed wake and notices between the pending list and the inbox (`notices_in_flight`) as work left, so it cannot return between a settle and its notice. An Idle agent counts as work only when its inbox holds a waking item (a quiet-only inbox would never be read, so waiting would just run into the timeout); this is a deliberate narrowing of "non-empty inbox". `-p` runs the extra turns on the same `Agent` (blank input, notice drained at `land_input`), prints only the last turn's text on stdout and keeps the final cumulative usage and cost; with runs off the loop still breaks at the first `Done`. The bound is `HeadlessParams.join_timeout` (default 600 s); until the `--join-timeout` flag of 7b, `maki -p` reads it from `MAKI_JOIN_TIMEOUT_SECS`. On timeout everything top-level is stopped (children go with it), the process waits up to 10 s for the stops, `shutdown()` kills what is left, a line `maki: join timeout of Ns reached, stopped N run(s): handles` goes to stderr and the exit code stays unchanged. Per-run transition lines on stderr and JSON `run_*` objects are 7b. SDK mode wakes `main` (`InteractiveParams.wake_main`); ACP leaves it off, because its pump answers the client's pending prompt on any `Done`, so a wake turn finishing while a prompt is open would end that prompt early; its notices are delivered with the next prompt. The Lua `SessionMailbox` wake (plugin `notify(wake=true)`) is still not consumed headless. Verified live (`maki -p`, real model): a 4 s shell outlived the turn and the follow-up text reached stdout; five shells finishing 4 s apart gave three wake turns plus a closing turn that delivered the last two; a 600 s shell with a 5 s bound was stopped, the process exited 0 with the message and the pid was gone; SIGTERM during the join exited 143 with the shell gone; runs off is unchanged. Verifier notes: a wake that a closing turn already read is dropped without a blank turn (the history would end on an assistant message); once the join bound has passed a wake no longer wins over the join, so a model that starts a run in every turn is stopped at the deadline (the wake budget resets whenever the model reads `runs`, so the budget alone does not bound it). `MAKI_JOIN_TIMEOUT_SECS` stays the stopgap (invalid values fall back to 600). A `-p` run whose model spawned a shell with `notify: never` prints only the first turn's text, because nothing wakes `main`; that is expected.
+
+### Phase 4d: topology facts and sibling routing
+
+Goal: the model sees parent and children; sibling `send` works only with `siblings = true`.
+Files: `maki-storage/src/frame.rs` (`LiveFacts` `:29`, `facts_at_start` `:149`, `FactsUpdate`
+`:48`, `apply` `:71`, `changes_to` `:100`), `maki-providers/src/types.rs` (`Message::context_update`
+`:407`, the storage-format test near `:1383`), `maki-agent/src/agent/frame.rs:253`
+`context_update`, `agent/history.rs:85` `told()`, `agent/run.rs:400,:533` (`tell_changes`),
+`runs/topology.rs`.
+Steps: (1) `TopologyFacts` with plain `String`/`u8` fields (3.6); (2) replace `RunContext::fixed`
+with a facts-bearing frame for native agents (3.6); (3) coalesced re-tell, one per drain;
+(4) depth-cap behaviour (3.6); (5) `can_send` gains the sibling rule; (6) `runs scope=all`.
+Tests: `topology::fact_changes_only_when_children_change`, `topology::retell_coalesced_per_drain`,
+`topology::rendering_snapshot_main_and_sub`, `topology::no_siblings_in_fact`,
+`providers::context_update_topology_keeps_stored_format`, `storage::facts_at_start_plan_none`,
+`hub::sibling_send_only_with_config`, `hub::pingpong_guard_mandatory_with_siblings`.
+E2E: with `siblings = true`, `a` messages `b` by name and `b` reports both.
+Commit: `feat: run topology facts and sibling routing`.
+
+Notes from the build: no new frame constructor was needed. `fit_frame` already stores a frame for `RunContext::fixed`, so `History::told()` is `Some` for native agents and the plan fact was always tracked; the topology is simply a third `LiveFacts` field that starts `None` at every frame (`facts_at_start`), so a child's first request carries the update before its prompt and a compaction re-tells it. The fact is read live from the hub in `tell_changes` (`UnitHub::topology_facts`), not from the context builder, because it changes mid-run. `FactsUpdate.topology` carries the whole new topology (absent when unchanged, so stored updates stay byte-identical); the main agent with no unfinished runs is `None`, and one that loses its last run hears "no unfinished runs". Children are the unfinished ones sorted by name, so a finished child leaves the list and re-tells once; the e2e shows the main agent hearing it after `wait`. The sibling rule is one extra clause in `UnitHub::send`; the error stays `NOT_REACHABLE`. The ping-pong guard keys on the pair, so it covers siblings unchanged. The scripted test provider routes on the first non-update message, since the update now precedes the prompt.
+
+### Phase 4e: acks
+
+Goal: delivery visible. Files: `runs/inbox.rs`, `types.rs` (`RunMessageDelivered`),
+`tools/runs.rs`. Steps: `accepted` in the send result, `delivered` at drain with step,
+`runs(id)` shows pending and last delivered; a quiet notice only when delivery exceeds 60 s
+or the message is dropped. Tests: `ack::accepted_then_delivered_order`,
+`ack::dropped_when_recipient_stopped_notifies_sender`. E2E: `runs(id)` after a send shows
+`delivered`.
+Commit: `feat: run message acks`.
+
+Notes from the build: acks live in `runs/ack.rs`, one bounded list per sender on the hub behind a leaf lock (`MAX_ACKS_PER_SENDER` = 64, finished records evicted before pending ones; nothing is kept for `user`). `send` records `accepted` (or `held` while the ping-pong guard keeps it) before the enqueue, so a drain right after it finds the record. `delivered` is set by the recipient `Agent` only after the request that carries the landed messages returned a response (`confirm_landed` in `turn`); a request that fails first leaves them `accepted`, and a retry after auth or overflow confirms them later. Messages the drive loop takes to start or restart a run become the next turn's user message; they wait in a staging list, move to the history's landed list when the turn starts and are marked `delivered` (no step) by that turn's first response, like any other. `dropped(reason)` is set when the inbox is closed with items in it (hard stop, finish, the settle that closes it: `recipient_stopped`) and when a guard release meets a full or closed inbox (`inbox_full`, `recipient_stopped`); a final state is never overwritten. The sender gets one quiet `Delivery` notice per drop (`message m-17 to ag-k3x9ab was dropped: recipient stopped`), and one per message still undelivered after 60 s (a detached timer on the hub clock). `runs(id)` appends `message m-N: <state>` lines for what the caller sent to that run: all pending and dropped ones and the last delivered. A run may read its own record with `runs(id=<own id>)` (it used to answer `NOT_REACHABLE`); its parent and siblings stay out of reach. `wait` output is unchanged: the notice and `runs` carry the acks.
+
+Verifier notes (4e): the landed list lives on `History`, not on the `Agent`, because a driver builds a new `Agent` every turn; with the list on the `Agent` a request cancelled or interrupted before it returned left its messages in the transcript but `accepted` forever (and a bogus 60 s notice). Now the next request that returns confirms them once, and whatever is still staged or landed when the run ends is dropped (`recipient_stopped`) with a notice. A history rewind of `main` can still leave a record `accepted` for a message the model no longer sees; the 60 s notice covers it. Drops are reported with one notice per sender and recipient per drop event (`6 messages (m-1, ...) to ag-x were dropped: recipient stopped`, at most 8 ids listed); the rate limit and inbox cap bound the count at 6 per window, 32 per inbox. The slow notice stays per message (one detached task per send sleeping on the hub clock, about 60 s, holding only a weak hub reference; it exits at once when the record is final). A released ping-pong message shows as `accepted` again. A run cannot read the record of its parent or siblings, but `runs(id)` on such a target answers with `message m-N: <state>` lines for what the caller sent there (no record), so a child can follow a message to `main`. Verified live (`maki -p`, real model, proxy answering 500 once to the request that carried the message): `runs` showed `accepted` before and `delivered (step 2)` after the retry, and the child saw the message exactly once; 12 quiet sends to an idle child that was then stopped gave 6 accepted (6 more `RATE_LIMITED`), 6 `dropped (recipient_stopped)` and one collapsed notice; a steer to a child that finished its turn showed `delivered` without a step.
+
+### Phase 5a: capacity pool, queue, limits, budgets
+
+Goal: section 6 caps, FIFO queue, slot release while blocked, budgets.
+Files: `runs/limits.rs` (full `UnitLimits`), `runs/mod.rs` (`admit`), `maki-config/src/lib.rs`
+(`[agent.runs]` full section with mirror `UnattendedMode` type, since maki-config cannot name
+maki-agent types; maki-agent converts), `maki-docgen` output.
+Interfaces: `UnitLimits { max_agents:u8, max_shells:u8, max_shells_per_owner:u8, max_depth:u8, max_children_per_run:u8, max_queue:u16, max_retained:u16, max_idle:u8, idle_timeout:Duration, default_timeout:Duration, spawn_per_minute:u8, session_max_runs:u16, siblings:bool }`.
+Steps: (1) defaults equal to 6.1, zero values rejected; (2) FIFO `admit`; a run in `wait` or a
+permission prompt releases its slot and re-acquires at queue priority; (3) queue positions;
+(4) per-owner shell cap, children cap, spawn rate; (5) timeouts and `session_max_runs`;
+(6) docgen regen in this commit.
+Tests: `limits::defaults_match_design`, `limits::zero_rejected`, `admit::fifo_and_queue_position`,
+`admit::wait_releases_slot_and_reacquires_first`, `admit::queue_full_error`,
+`admit::stop_queued_never_starts`, `rate::spawn_limit_manual_clock`, `budget::default_timeout_30m`.
+E2E: `max_agents = 1`; spawn three agents; see `queued position 1 of 2` and sequential
+execution; an agent that `wait`s on a queued child does not deadlock.
+Commit: `feat: run limits and queue`.
+
+Notes from the build: the pool is `runs/admit.rs` (`Pool`: held set, priority line, FIFO line, blocked waits) inside the hub table, so release, promotion and re-acquire are one critical section and waiters are woken after the lock (they listen on the existing `settled` event). A run holds a slot for a turn: the driver calls `hub.acquire` before each turn (a no-op while held, so a restart at turn end keeps the slot), `settle_idle` and `settle_locked` give it back, and every terminal path goes through `settle_locked`, so a spawn failure, stop while queued, timeout, forced settle or driver drop cannot leak one. An idle agent that is woken has no slot and goes back to `Queued` until it gets one (it is not counted against `max_queue`). `hub.wait` releases the caller's slot when it blocks and registers what it waits for, so the same lock that settles the awaited run moves the waiter ahead of never-started runs; this is stricter than re-queueing on wake-up, which would let the slot go to a fresh run first. `release_slot` and `acquire` are the extension point for 5b's permission wait. The agent timeout starts when the run first gets a slot, not while it queues. `timeout_secs` (default or asked) is clamped to `max_timeout_secs` (default 86400, applies to shells too). Shell caps return `SHELL_LIMIT` (not a queue); `max_shells` counts shells not yet `Done`. Spawn rate is a per-owner rolling 60 s window on the hub clock (`RATE_LIMITED retry_after`). `runs` shows `queued (position N of M)` and ends with `session: N of M runs started`; `spawn` keeps `queued, position N of M` in its reply. The depth note in the `spawn` description was already static. Not built: `max_retained`, `max_idle` and `idle_timeout` (they belong to the eviction of 6b, no config keys yet), the `UnattendedMode` mirror (5b). Config keys: `max_agents`, `max_shells`, `max_shells_per_owner`, `max_queue`, `spawn_per_minute`, `default_timeout_secs`, `max_timeout_secs`. Verified live (headless, real model, proxy log): `max_agents = 2` with five agents showed two running and three `queued (position 1..3 of 3)`, never more than two agent requests in flight; `stop` on a queued run left it `killed` and it never sent a request; with `max_agents = 1` an agent that spawned a child and `wait`ed for it did not deadlock; `timeout_secs = 10` ended as `timed_out`; `max_queue = 2` returned `QUEUE_FULL` for the fourth agent. The test `waiting_slot_holders_do_not_deadlock` is the adversarial case (two slots, a holder with three queued children and a grandchild, all waiting).
+
+Verifier notes (5a): a woken `Idle` agent joins the FIFO line behind runs that never started (only a run resuming from `wait` or a prompt has priority); this is deliberate and was seen live (an idle agent got `queued (position 2 of 2)` behind a never-started run), so a parent that is woken by a child notice can wait behind children it spawned, which is slower but cannot deadlock. A cycle of waits cannot form because `wait` is scoped to the caller's subtree. A driver that panics settles its run `failed` through a drop guard, and an `acquire` that is cancelled or finds its run stopping passes a slot it held to the head of the line at once. Timeouts are lowered to one year so `Instant` arithmetic cannot overflow. `timeout_secs=0` is raised to 1 s by the clamp (the tool schema already says `minimum: 1`). The deadline test `a_wait_pushes_every_clone_back_by_its_length` was a test bug, not a deadline bug: the timer was built as the argument of `paused_while`, so it started before `paused_at` was taken and could finish a hair under the wait (about a third of runs on a quiet machine); the timer now starts inside the paused future. A seeded model test (`pool_invariants_over_many_seeds`, 1000 seeds) checks held <= cap, no run both held and queued, work conservation and position consistency after every step.
+
+### Phase 5b: background permission routing
+
+Goal: a background agent's permission prompts reach the user (or are denied when unattended)
+without pinning a slot.
+Interfaces: `PermissionBroker` (receiver end for `enforce`), `unattended_permissions` config.
+Files: `maki-agent/src/permissions.rs` (`PermissionBroker`; `enforce` `:755`, `:830` unchanged),
+`types.rs` (request attribution), `maki-ui` prompt component, `maki-acp/src/permissions.rs`.
+Steps: (1) broker per agent run; (2) attributed prompt in the TUI queue; (3) ACP title;
+(4) 120 s timeout then deny and the slot released while waiting; (5) headless and unattended =
+deny with the "report via send" text; `[agent.runs] unattended_permissions` mirror enum;
+(6) quiet `waiting for permission` notice after 60 s with main idle.
+Tests: `perm::background_prompt_reaches_ui_with_run_name`, `perm::timeout_denies_and_run_continues`,
+`perm::slot_released_while_prompt_pending`, `perm::unattended_deny_text_mentions_send`,
+`perm::headless_allow_under_yolo_allows`.
+E2E: agent asked to `touch /tmp/e2e/x` with no rule: prompt shows `name (handle)`; denying
+lets the agent report.
+Commit: `feat: background permission routing`.
+
+Notes from the build: the broker is `runs/broker.rs` (not `permissions.rs`), and `enforce` is untouched except for one arm: a new `PermissionAnswer::Unavailable(reason)` that only the host makes (timeout, unattended, too many prompts) and that denies with the reason verbatim instead of "rejected by the user". Each agent run owns a `PermissionBroker` whose receiver is the run's `user_response_rx` and whose sender is the `SubagentInfo.answer_tx` stamped on every event of the run, so the TUI's and ACP's existing per-subagent routing delivers answers by request id to that run only. The driver sees the `PermissionRequest` in `forward` and calls `broker.begin`, which releases the slot (`release_slot`, the same hook as `wait`), starts the timer on the hub clock and lets the request through; unattended or over-cap prompts are answered at once and never shown. The tool dispatcher's `gate` calls `UnitHub::prompt_resolved` when the call returns, which removes the pending entry, drains answers that arrived too late (so a stale allow cannot be picked up by a later call with the same id), emits `PermissionWithdrawn` and takes the slot back with priority unless the call was cancelled; the turn end clears anything left. `enforce` holds the answer channel while it waits, so a run has one prompt at a time and a parallel call queues behind it without its own timeout until it is its turn. Config keys are `permission_timeout_secs` (default 120) and `unattended_permissions` (`deny` default, `inherit_yolo`); `inherit_yolo` allows only a prompt that still reached the broker under `--yolo`, which is a plugin-escalated ask, because yolo already allows every other call before any prompt. Over 8 pending prompts in the session the ninth is denied at once with a text that sends the run to its parent. New event `PermissionWithdrawn { id }` takes a timed-out or stopped run's prompt off the screen; a finished or idle run also drops its prompts. The prompt shows `agent name (handle)`; Esc on a run's prompt denies it, and a cancelled turn keeps a run's prompts and its answer routes (they used to be cleared with the turn's). The SDK stream host (`sdk_mode`) cannot route a run's answer, so it runs with `attended_runs = false` and gets the unattended policy; ACP routes through its existing subagent path with `name (handle)` in the title. The quiet `waiting for permission` notice is a new `NoticeKind::Permission` sent after 60 s while `main` is idle. Verifier hardening: a prompt is shown and answered under a fresh id (`<tool id>~<n>`) and every answer goes through a pump in the broker that passes on only one naming a prompt still pending, so a late `y` cannot be taken by a later prompt of a call that reuses the tool call id (a model may). The UI keeps a run's answer route when the main turn ends (it was wiped by `Done`/`Error`, which made the prompt unanswerable until its timeout), ignores keys for 400 ms after the prompt on screen was withdrawn under the user, puts the main agent's own asks ahead of waiting run asks (not the one shown), and shows model-controlled text in the prompt with control and bidi characters replaced by marks. Left as is: `inherit_yolo` also allows a plugin-escalated ask unattended (it reaches the broker under yolo), a legacy Lua subagent inside a run does not release the slot or time out on its prompt, and two parallel calls of one run that share a tool call id can resolve each other's pending entry. The status badge waits for 7a. The 5a anomaly (an `Idle` settle shortly before the next request of the same agent) is the normal wake path: `settle_idle` frees the slot, a send wakes the run and the driver calls `acquire` before every turn; the driver now also asks before each nudge turn, and `a_turn_never_runs_without_a_slot` (a provider stub that checks the hub's held set on every request) proves no turn runs slotless over prompt, idle and wake. Verified live (real model, PTY, debug build): the prompt showed `agent echoer (ag-...)`, `y` let `echo routed` run and the result held `routed`, `n` gave the run the documented denial, two runs queued their prompts attributed correctly, a 12 s `permission_timeout_secs` denied with the documented text and removed the prompt, a `stop` while the prompt showed removed it, and `maki -p` denied with the "report this to your parent with send" text.
+
+### Phase 6a: journal and lost reconciliation
+
+Files: `maki-storage/src/runs.rs` (new `RunJournal`; `SessionRef` is a storage type,
+`maki-storage/src/id.rs:109`), `maki-storage/src/lib.rs`, `maki-storage/src/sessions.rs` (`StoredRun`
+`:640`, per-turn writes, delete path), `runs/journal.rs`, `runs/mod.rs` (`reconcile`),
+`maki-ui/src/app/session.rs:166,253-301`.
+Interfaces: `RunJournal::{open(&SessionRef), append, replay}`, `JournalRecord`, `UnitHub::reconcile`.
+Steps: (1) journal with header, torn-line tolerance, off-lock writes, size-threshold
+compaction (7.3); (2) message body file; (3) pid file with start time; (4) reconcile per 7.3;
+(5) `StoredRun`, per-turn incremental transcript; (6) clean-shutdown `mark`; (7) session delete
+removes the dir; (8) shell log retention; (9) UI restore of native tabs read-only.
+Tests: `journal::replay_ignores_torn_last_line`, `journal::unknown_record_and_future_version`,
+`journal::compaction_on_size_threshold_while_live`, `journal::message_bodies_survive`,
+`reconcile::running_agent_becomes_lost`, `reconcile::orphan_killed_only_when_start_time_matches`,
+`reconcile::lost_notice_queued_once_idempotent`, `storage::stored_run_roundtrip_and_old_session_loads`,
+`session::delete_removes_runs_dir`, `logs::retention_by_size_and_age`.
+E2E: SIGKILL the printed maki PID with an agent running; `--continue` shows a `lost` notice.
+Commit: `feat: run journal and lost reconciliation`.
+
+Notes from the build: the journal is `maki-storage/src/runs.rs` (`RunJournal`, `Replay`, `Entry`/`JournalRecord`), the hub side is `runs/journal.rs`, and `start_session` opens the journal and runs `UnitHub::reconcile` before the first spawn, so the TUI (session load) and headless `-r` need no extra call; a disabled `[agent.runs]` returns before any path is resolved. Deviations from 7.3: (1) there is no `<handle>.pid` file; the shell's pgid and `/proc` start ticks are a `proc` record in the journal, fsynced as soon as the process exists (same check: start ticks equal and the pid still leads its own group, else `process gone`; the KILL after the grace re-checks the start time); (2) later records are keyed by `handle`, only `spawn` carries the id; (3) `spawn` stores the spec as `{prompt, subagent_type, audience, model, model_tier, thinking, output_schema, fork, one_shot, timeout_secs}` (the tool list is derived from the audience); (4) a message body is queued to the writer before `send` returns, not written synchronously, so it is durable within 250 ms; (5) all lost runs are told in ONE `Lost` notice ("N runs were lost ..."; a single run uses the 3.7 wording without the transcript clause, since nothing serves transcripts before 6b), and an undelivered notice is re-queued at the next start from its journaled text until a `delivered` or `consumed` record exists (notices now reach `confirm_landed`, so they are acked like messages); (6) terminal runs of an earlier process are not restored into the table, only the newly lost ones; (7) the write queue holds 4096 records and a full queue drops the record and writes a `gap` record, a producer never blocks, and past 4x the compaction threshold after compaction only critical records are written; (8) a second process on the same session fails the `journal.lock` try-lock, runs without a journal and does not reconcile (it would mark the live process's runs lost); (9) a journal with a header `v` above 1 is read-only (runs listed lost, no kill, nothing written). `StoredRun` exists on `StoredSubagent` (round-trips, old sessions load); 6b populates it. Step 9 (read-only restore of native tabs, populating `StoredRun` from hub state) is NOT part of 6a as built: it needs the per-turn transcripts that 6b persists (7.4) and the `RunsView` tab model of 7a, so it moves to 6b (populate `StoredRun` together with the transcript write) and 7a (the restored tabs); until then a resumed session shows lost runs through the `Lost` notice and `runs`. Shell logs keep the existing retention in `paths::runs_dir` (7 days, 512 MiB per session) and `Session::delete` removes the run dir. Tests live in `runs::journal::tests` and `maki-storage runs::tests`.
+
+Verifier notes (6a): (1) Orphan kill is gated on ALL of: the `proc` record belongs to a run of this session's own journal (one dir per session, one `journal.lock` per dir, so another session's shells are never read), `boot` equals the current `boot_stamp()` (kernel boot id plus the `/proc/self/ns/pid` link; a record from another boot, another pid namespace or without a stamp is `process gone`, never signalled), `/proc/<pgid>/stat` start ticks equal the record, and that process leads its own group (`pgrp == pgid`). The check is repeated right before the TERM (the remaining race, pid reuse inside those microseconds, needs the recorded process to die and a pid wrap meanwhile). After the TERM grace the KILL goes out when the leader is still the recorded process, or when it is gone but the group still has members (while a member lives the pid cannot be reused, so the group is still ours). A group whose leader was already gone at reconcile is NOT signalled: nothing proves it is the recorded group (a legitimately orphaned grandchild group is left alone). (2) The `proc` record is durable before the shell runs user code: the shell is started as a wrapper `sh -c 'read -r _ <&3 || exit 127; exec 3<&-; exec sh -c "$1"'` that blocks on a pipe until the parent has queued and fsynced the record and then writes a byte; the exec keeps pid and start time. If maki dies in between, the pipe hits EOF and the child exits 127 unrun, so no unrecorded orphan can run a command. (`pre_exec` cannot wait: `spawn` blocks until exec.) (3) Critical records (`hdr`, `spawn`, `term`, `proc`, `mark`) never take the drop path: they wait up to 5 s for queue room (the writer drains in milliseconds) and only then are counted as dropped with a warning; only non-critical records are dropped on a full queue. (4) Lines over 1 MiB are skipped unread (a 100 MB line cannot exhaust memory, the torn-tail scan reads the file tail only); the journal and its files are opened `O_NOFOLLOW` and a symlinked run dir is refused. (5) `runs::shutdown_all()` (signals and normal exit) now also settles every registered hub: running shells get `term killed (session ended)`, the `mark` is written and the journal is flushed, so after SIGTERM or a graceful quit the shells are not reported lost; agents running at that moment are still lost at the next start. (6) A write failure is a warning in the log and `journal_degraded()`, not a user-visible notice yet.
+
+### Phase 6b: cold revive
+
+Goal: `send` to a finished, lost or evicted agent revives it from its transcript.
+Files: `runs/mod.rs` (`revive`), `runs/journal.rs`, `maki-storage/src/sessions.rs`.
+Interfaces: `UnitHub::revive(id, first: InboxItem) -> Result<(), UnitError>`.
+Steps: persist full `AgentSpec` in the `spawn` record; `revive(id, first)` rebuilds the runner
+(7.4); tombstones for evicted runs; unread messages from the message file are redelivered.
+Tests: `revive::completed_agent_cold_resumes_from_transcript`, `revive::one_shot_not_revivable`,
+`revive::spec_restored_model_tools_schema`, `revive::evicted_tombstone_still_revivable`,
+`revive::pending_messages_redelivered`.
+E2E: after the 6a crash, the model `send`s to the lost agent and gets a reply.
+Commit: `feat: cold revive of runs`.
+
+Notes from the build: transcripts are written by the hub, not the session: the driver appends the messages a turn added to `<journal dir>/transcripts/<handle>.ndjson` (`runs/transcript.rs`, one JSON `Message` per line, 0600, a shorter history rewrites the file, a torn tail ends the read) before the state change, so a crash loses at most the turn in flight. This replaced the plan to read `Session.subagent_messages` because the hub has no session; the UI still keeps its own copy through `SubagentHistory`. The `spawn` record already held the full `AgentSpec` (6a); `agent_spec_from_json` is its one reader and the launch (system prompt, tool frame, structured_output tool, model from `model_tier`) is rebuilt by `AgentLaunch::prepare` at revive time. Deviations from 7.4: (1) `revive` is `UnitHub::revive(from, plan, launch, transcript, text, kind)` and `revive_plan(from, to)` decides whether a `send` needs it (`Ok(None)` for a live run); the `send` tool does the async part (load transcript off the executor, prepare the launch) because the hub cannot await under its lock. (2) The rebuilt run starts with the transcript as its history (`launch.fork`, `launch.revived`) and its first user message is only the framed inbox items, not `spec.prompt`. (3) A revived run journals a `state` record `revived`, which reopens the finished run in `Replay` (term cleared), so a crash after a revive loses the run again; it is a critical record. (4) Pending journaled messages for the run (`accepted` or `held`, body present) are redelivered ahead of the new one under fresh message ids, and the old ones are acked `dropped` with reason `revived`. (5) Not revivable: shells (`NOT_AGENT`), agents with no transcript file (all `RECIPIENT_TERMINAL`); there is no sanitize check for a `Failed` agent, the history is repaired by the dangling-call closing the driver already does at turn start. (6) Eviction has no timer: `UnitHub::sweep` runs at spawn, terminal settle, `list`, and after an agent goes idle (from the driver, outside the inbox lock), so an expired idle agent leaves at the next one of those. Idle agents past `max_idle` (least recently active first) or `idle_timeout`, with no live children, become `Done(Completed)` ("left memory while idle") with no notice; their driver is cancelled. Finished runs beyond `max_retained` (oldest finish first, no live children) move to `UnitTable.tombstones`; handle and name keep resolving to them, `runs` lists them as one line each and `runs(id)` shows that line, `session_max_runs` counts them. (7) Tombstones are not separate journal records: the `spawn` and `term` records are the tombstone, and compaction keeps a finished agent older than 24 h while its transcript file exists (`Replay.dir`). At the next start `reconcile` adopts the newest 256 finished agents that have a transcript as tombstones, and lost agents are revivable like any `Done`. (8) Config: `max_retained` 64, `max_idle` 16, `idle_timeout_secs` 1800 (all minimum 1). (9) `RunStarted` carries `parent`, `depth` and `one_shot`; the UI keeps them per tab and `sync_subagents` fills `StoredSubagent.run` (`StoredRun`) with the last state seen, so a resumed session knows its native runs; restoring read-only tabs from it stays with 7a. A message typed into a finished run's tab does not revive it yet (that path is the UI inbox, not `send`). Tests: `runs::agent_run::revive::*` (the five from the plan plus `idle_timeout_and_max_idle_evict_silently`, `missing_transcript_is_not_revivable`, `finished_runs_of_an_earlier_process_are_tombstones`), `runs::transcript::tests`, `maki-storage runs::tests` (`revived_state_reopens_a_finished_run`, `old_agent_with_a_transcript_survives_compaction`), `ui::native_run_is_stored_with_its_state`. Not verified live against a real model.
+
+### Phase 7a: /runs and status line
+
+Goal: the user sees and stops runs from the TUI.
+Interfaces: `RunsView` in `App`, `/stop <name|all>` command.
+Files: `maki-ui/src/app/{tasks.rs,mod.rs,session.rs}` (`RunsView`, `diff_task_states`
+`tasks.rs:184` logic ported), `components/runs_picker.rs`, `components/status_bar.rs`,
+`commands.rs` (`/stop`), `chat.rs` (notice row collapse), keybindings, docgen outputs
+(commands, keybindings) in this commit. The Lua `task` picker stays for legacy runs.
+Tests: `ui::runs_picker_rows_tree_and_states`, `ui::status_segment_hidden_at_zero`,
+`ui::notice_row_collapsed_and_expands`, `ui::esc_in_tab_stops_run_cascade`,
+`ui::stop_command_all`, `ui::permission_badge_shown`.
+E2E: PTY with three agents and a shell; assert the segment and `/runs` rows in
+`/tmp/e2e/tui.log`; `/stop all` leaves all terminal.
+Commit: `feat: runs view and status line`.
+
+Notes from the build: the view is `maki-ui/src/app/runs.rs` (`RunsView`, fed from `RunStarted`, `RunStateChanged` and `RunFinished` at the top of `deliver`, before the tab routing, so shell runs that have no tab are counted too) and the picker is `components/runs_picker.rs`; the command is `/runs` as the design says, not `/tasks`, which stays the Lua picker. Rows show tree indent, name, handle, kind, state glyph, age and a `!` when the run has a prompt waiting; Enter focuses the tab. The status segment is `[runs 3 running 1 queued 2 lost !]`, hidden when there is nothing to say, with the `!` taken from `PermissionPrompt::waiting_runs`. `/stop <name|handle|all>` goes through a new `Action::StopRuns` to `UnitHub::stop` (all stops every live top-level run and what it started). Typing in a native agent tab no longer goes to the legacy inbox: `Action::SendToRun` calls `deliver_to_run` in `maki-ui/src/agent/mod.rs`, which does `send` as the hub's `user` sender for a live run and otherwise the same revive the `send` tool does (transcript load, `AgentLaunch::prepare` from `AgentSeed::tool_context`, `UnitHub::revive`). The revive announces itself with a `RunStateChanged`, and a finished tab that sees a non-idle state reopens (`Chat::reopen`); the new run has a new broker, so every stamped event of a run handle refreshes the UI's answer route. A refusal (not revivable, no transcript) is a notice in the main chat. A finished run's tab takes input, a one-shot run included: the message revives it. Restored tabs: a stored native run comes back as a tab with `run` set, finished with the outcome of its stored state, and a stored state that could still change (`running`, `queued`, `idle`, `stopping`) reads as `lost` in the tab, the rows and the segment; a run with no `SubagentHistory` transcript in the session still gets a tab (empty), since the hub's journal transcript is what revive uses. Deviations: the `s`, `x` and `r` keys of the picker are not built (the picker search takes letters; `/stop` and typing in the tab cover them), there is no cost or progress column, the notice-row collapse, the Esc-in-tab cascade and `/stop` keybindings are left for a later pass, and the shell log viewer stays with 7b. Tests: `app::runs::tests`, `components::runs_picker::tests`, and in `app::tests` `status_segment_hidden_at_zero`, `permission_badge_shown`, `runs_command_lists_tree_and_enter_focuses_the_tab`, `stop_command_all`, `typing_into_a_finished_run_tab_revives_it`, `a_revived_run_answers_prompts_on_its_new_route`, `restored_native_tab_is_read_only_until_a_message_revives_it`, `restored_run_that_was_live_reads_as_lost`. `deliver_to_run` itself is not covered by a test (it needs a live hub and provider in the UI crate); the hub half is covered by `runs::agent_run::revive::*`. Not verified live against a real model.
+
+### Phase 7b: log viewer, headless output, docs page
+
+Goal: shell logs viewable, headless run output, user docs.
+Interfaces: CLI flags `--join-timeout`, `--quiet-runs`.
+Files: transient log viewer panel, `src/print.rs` (`--join-timeout`, `--quiet-runs`, stderr
+transition lines, JSON `run_*` events), `maki-agent/src/headless.rs`, `site/docs/content/`
+page for agents (content root `maki-docgen/src/main.rs:17`; the page is hand-written).
+Tests: `ui::log_viewer_tails_by_offset`, `print::run_lines_on_stderr`,
+`print::join_timeout_flag_parsed`, `docgen::check_clean`. E2E: `maki -p --join-timeout 30`.
+Commit: `feat: run log viewer and headless run output`.
+
+Notes from the build: `--join-timeout <SECS>` and `--quiet-runs` are clap flags (`src/cli.rs`) carried in `PrintParams`; the timeout resolves flag, then `MAKI_JOIN_TIMEOUT_SECS`, then 600 (`resolve_join_timeout`, an unparsable env value falls back to 600). `maki -p` prints a stderr line per `RunStarted`, `RunStateChanged` and `RunFinished` (`maki: run sh-x name started [shell] (from ag-y)`, handles resolved to names from the start event); `--quiet-runs` silences those lines only. With `--output-format stream-json` or `--verbose` the same events become `run_started`, `run_state` and `run_finished` objects (handle, session_id, plus name/kind/parent/depth, state, or reason/detail). Deviations: the Claude Code wire-format note at the top of `print.rs` says not to invent fields, and these `run_*` objects are our own; they are additive and only appear when runs are on. ACP prints nothing for runs (its notices ride the next prompt), and SDK mode ignores them. Tests are `print::tests::{join_timeout_flag_parsed, run_lines_on_stderr, run_objects_are_typed}`, and the viewer's are `components::log_viewer::tests::log_viewer_tails_by_offset` plus three more; the E2E with a live model was not run. The viewer is `maki-ui/src/components/log_viewer.rs`, opened by Enter on a shell row of `/runs` (it replaces the "Shell runs have no tab" flash). It reads `<state>/runs/<session>/<handle>.log` by byte offset: the first read starts at most 64 KiB from the end at a line boundary, each poll reads only what was appended (256 KiB cap), a shrunk file restarts at 0, and 2000 lines are kept. The UI finds the log by the session id and the hub's naming, not through the hub, so a shell run of a hub that could not write logs shows "no log for this run". The viewer polls on the smooth frame while open. No follow toggle or search. The docs page is `site/docs/content/agents/_index.md` (hand-written, linked from the docs index); docgen output did not change otherwise. The suspected double echo in `send_to_run_tab` is not real: the hub does not emit an event for a delivered user message (`land_run_messages` only writes history), so the tab shows the text once.
+
+### Phase 8: hardening and e2e soak
+
+Goal: remove shortcuts, prove robustness, enable by default.
+Files: `maki-agent/tests/runs_soak.rs` (uses `test_support`), docs.
+Steps: (1) property test of random spawn/send/stop/wait sequences with `MockProvider` and
+`ManualClock` asserting: no live run under a terminal ancestor, one terminal transition,
+slots never exceed limits, no notice delivered after consume, no await under the hub lock;
+(2) fault injection: runner ignoring cancel, journal write errors, provider errors; (3) hub
+drop joins all tasks; (4) 20-agent live fan-out with `max_agents` 4; (5) notice context
+growth bounded; (6) `enabled = true` by default (the switch stays); (7) 100 idle runs cost no
+CPU (event-driven waits).
+Tests: `soak::invariants_hold_over_random_ops`, `soak::runner_ignoring_cancel_force_settled`,
+`soak::journal_write_failure_degrades`, `soak::hub_drop_has_no_live_tasks`,
+`soak::notice_bytes_bounded`, `hub::no_timers_when_idle`.
+E2E: the fan-out plus mid-run Esc, `/new`, quit; no orphan PIDs, clean journal `mark`.
+Commit: `feat: harden native runs and enable by default`.
+
+Notes from the build (partial P8; the default stays off): (1) The flaky `loader::tests::live_event_handle_does_not_hang_after_begin_shutdown` was a real race in the `maki-lua` thread exit (`runtime::spawn`): it drained the request queues and then called `clear_client_pool()`, which joins curl threads and is slow under load; a request an `EventHandle` clone sent during that window sat in the queue (a dropped flume receiver does not free queued messages), so its reply sender lived on and `collect_prompt_slots` blocked. The pool clear now runs first, then the drain, then both receivers are dropped at once; 150 stress iterations under CPU load pass (the hang was never reproduced locally, so this is a reasoned fix, and a tiny send-between-drain-and-drop window remains). (2) Journal degradation: when the writer fails, the hub tells `main` once with a quiet `NoticeKind::Journal` notice ("runs are no longer saved"); it is raised from `flush_notices` (no lock held) at the next settle, because the writer is asynchronous, so a hub that never settles again says nothing. Test `journal::tests::journal_write_failure_degrades_with_one_notice`. (3) Soak: `runs/soak.rs` (a unit-test module, not `maki-agent/tests/runs_soak.rs`, because `test_support` is crate-private) runs 150 real shell spawns with stops and natural exits at `max_shells` 6 and checks the cap, no left-over process group (from the journal `proc` records), no pending or in-flight notices, main's inbox within `MAX_PENDING`, and `units` within `max_retained` with the rest as tombstones; a second test drops the hub with six live shells and checks every group dies. Tombstones are bounded only by `session_max_runs`. (4) The clean mark and "nothing lost after shutdown" are covered by `journal::tests::clean_shutdown_with_a_running_shell_reports_nothing_lost` and the soak test (`clean_mark` after `shutdown`). Later in P8: `agent_run::chaos` adds the random-op property test (400 seeds of 150 spawn, send, stop, wait and revive ops with a seeded chaos provider: slots within `max_agents`, no illegal state transition, no leaked task, hub freed) and the provider-error and cancel-ignoring-runner faults; a headless live run with 5 background agents on the linken model completed, left no process and wrote a clean mark. The `runs` shutdown race in `maki-lua` is now closed on the caller side too: replies are awaited with `recv_reply`, which turns a request stranded in a dead host's queue into an error. Still not done: the 20-agent fan-out with `max_agents` 4, Esc, `/new` and quit E2E, and a timer-driven test of the force settle (smol's global executor has one thread by default, so a runner that blocks it also stalls the timer). (5) Recommendation on `enabled = true`: do not flip it yet. Evidence for: shells, agents, inboxes, notices, journal, revive and the UI are unit and real-process tested, the soak shows no leaks, and live PTY checks passed in phases 2 to 5. Evidence against: the property and fan-out suites and the live E2E above were not run, the journal-degraded notice is new, a second registry (Lua `task`) still coexists, `inherit_yolo` is misnamed (below), and the frame fingerprint changes once. Flip it after the missing suites and one live fan-out with Esc, `/new` and quit show no orphan PIDs. `unattended_permissions = "inherit_yolo"` is left as is: renaming a config value is a user-visible break and it needs a deprecation alias, so it is not a cheap change; it only means "allow plugin-escalated asks under yolo".
+
+Notes from the build (P8 follow-up): (1) Force settle is now driven by a real timer on a dedicated thread (`maki-force-settle`, `watch_for_force_settle`), not the shared smol executor, so a runner that blocks its thread cannot stall it. The test `runner_ignoring_cancel_is_force_settled_once` no longer calls `force_settle` directly; it advances the manual clock and waits for the timer thread to settle the run. (2) Watch lines are stripped of terminal escapes (`watch::strip_ansi`: CSI, OSC, charset and two-byte escapes) before the regex runs, and the stripped text is what a `Match` notice carries. Tests `ansi_escapes_are_stripped` and `anchored_pattern_matches_coloured_output` (`^ERROR` on red output). A bare `\r` progress rewrite is not interpreted. (3) `unattended_permissions = "inherit_yolo"` is now `"allow_under_yolo"` (`UnattendedMode::AllowUnderYolo`). `UnattendedMode` has a hand-written `Deserialize`, so the old spelling still parses to the same mode and logs a deprecation warning; the config docs (generated) name the alias. Tests `unattended_permissions_accepts_new_name_and_old_alias` and `unattended_permissions_rejects_unknown_value`, and `headless_allow_under_yolo_allows`. The "misnamed" objection in note (5) is resolved. (4) Decision: `max_retained` caps the full units in the table only; it does not cap tombstones. Tombstones are one-line entries bounded by `session_max_runs` (a tombstone is a run this process spawned, so units plus tombstones never exceed the spawn cap) plus at most 256 adopted from an earlier process. Fix found on the way: the spawn check used `units + tombstones`, so adopted tombstones counted against the cap and a restart with a long history could refuse every spawn; it now uses a per-process `spawned` counter. Test `adopted_tombstones_do_not_use_up_the_session_run_cap`, and the soak asserts `units <= max_retained` and `units + tombstones == spawns`. (5) When the leader is gone and an orphan outside its process group (for example after `setsid`) keeps the output pipe open past `DRAIN_GRACE`, the supervisor now calls `ShellRun::abandon_drain` instead of dropping the pump task; the pump then ends its read, flushes the watch (partial line and held limiter lines) and returns. Test `orphan_holding_the_pipe_does_not_lose_held_watch_lines` (fails by timeout without the fix; the orphan sleeps 20 s). (6) Fan-out: unit test `twenty_agent_fan_out_with_four_slots_queues_and_completes` (scripted provider, `max_agents` 4, 20 gated agents) checks that only 4 start, 16 queue, each finish promotes exactly one, the pool never exceeds 4, every request comes from a slotted run, and all 20 complete with their own result. Live headless run on the linken model (isolated XDG `/tmp/e2e-p8b`, `max_agents` 4, 12 one-shot agents each running `sleep 4`): all 12 completed; the first 8 were admitted (the default `max_children_per_run` is 8, the model got `SPAWN_LIMIT` for the rest and retried as runs finished, so the 12 were not all in flight at once), `a5` to `a8` only turned `running` as `a1` to `a4` finished (the queue), no `maki` or `sleep` process was left and the journal ends with `clean_shutdown`. Note the model had to work around the child cap itself; this is the intended limit, not a hub fault. (7) TUI E2E (PTY, `/tmp/e2e-p8b/tui.py`, a copy of the v5 runner built on `vt.py`, minus the proxy, isolated XDG, linken model, runs enabled, `--yolo`): the model started a background shell (`sleep 301`) and an agent that ran `sleep 302`; Esc on the main turn left both processes running; `/new` killed both (neither process left) and wrote the old session's journal terms and the mark; Ctrl-C twice then exited and wrote the new session's mark. This found a real bug: `shutdown` wrote `clean_shutdown` before the cancelled agent wrote its `term`, and a record after the mark voids it on replay (`Replay.clean_mark`). `shutdown` now waits up to 1.5 s for cancelled agents to settle (then force-settles them) before the mark; test `shutdown_writes_the_clean_mark_after_a_running_agent_ends` (fails without the fix). Known and benign: a shell stopped by shutdown can get two `term` records (the supervisor's `failed`/SIGTERM and the hub's `killed`/`session ended`); replay keeps the later one. (8) Appendix B, Lua side. `maki.run` (`maki-lua/src/api/run.rs`, registered next to `maki.task`) has `enabled(ctx)`, `spawn(ctx, opts)`, `send(ctx, opts)`, `runs(ctx, opts?)`, `wait(ctx, opts)` and `stop(ctx, opts)`. They take the tool handler's ctx like `maki.agent.*`, accept exactly the fields of the model tool of the same name (validated against the same schema) and go through the same hub, via new host entry points in `maki-agent/src/tools/runs.rs` (`host_spawn`, `host_wait`, `host_call`; `spawn` and `wait` were split so the tool and the host share the code). `spawn` returns `{handle, name, kind, state, text}`, `wait` returns one table per run (`state`, `settled`, `done`, `reason`, `detail`, `exit_code`, `summary`, `structured`, `full_text_path`), `send`, `runs` and `stop` return the text a model would get; every call answers `(value, err)`, and without runs every call but `enabled` is an error pair. Permissions: `spawn` is guarded by `run`, the others by `agent` (`#[lua_fn(guard = ...)]`, so the manifest drift test sees them). Registered in `docs.rs`, docgen regenerated (`lua-api` page and `plugins/maki.d.luau`). Tests: `api::run::tests` (real hub and real shell runs: spawn, wait, runs, send, stop, runs disabled, permission denied) and the `maki_run_has_expected_functions` spec. `plugins/task` now delegates: when `maki.run.enabled(ctx)` the `task` tool spawns a native one-shot agent (`subagent_type`, `model_tier`, `thinking`, `output_schema` map to `spawn` fields, `notify = "never"`), waits in 600 s slices, stops the run if the task is cancelled, and maps the result back (partial text for a non-completed run, JSON for `output_schema`). The hub then owns its slot (`max_agents` and the queue replace the plugin's `max_concurrent` semaphore), and `/runs` shows it. When runs are off, or `allow_model` is on and the call names an exact `model` (native `spawn` has no such field), the old `maki.agent.session` path runs unchanged; its tests are untouched. Tests: `task_policy::delegated::*` (a real hub and scripted provider: a task becomes a finished one-shot run with no Lua session, a failing run is an error, cancelling the task ends the wait with `cancelled`) and the updated `native_and_legacy_task_enabled`. Not done on purpose: the plugin, `maki.task.*`, `BackgroundSessions` and `maki.agent.session` are kept, since `task` has to work with runs off; the delegated task's tab is the native run's tab, not a Lua task row. A live headless run on the linken model (isolated XDG) found that `plugins/task/plugin.toml` lacked `agent = true`, which `maki.run.wait` needs (unit tests load plugin source with every permission and hid it); the manifest now grants it, test `manifest_grants_the_permissions_delegation_needs`, and the rerun returned the subagent's text through `task` as a finished native run.
+
+Notes from the build (P10, the rebase onto upstream 0.6.5): upstream moved a lot under this branch. `main` is now 70348ec0 ("chore(deps): move monty to crates.io 1.x"), and the branch was rebased onto it (70 commits replayed; `native-agents-backup-pre-rebase2` holds the old tip). Three things needed care. (1) Upstream reworked `plugins/task` around a new `runner.lua` (the shared session path) and `background.lua` (the `background = true` path), and the native delegation stayed in `init.lua`. The two now sit side by side: `init.lua` speaks the hub's language, `runner.lua` the session's, and the schema, the options and the error wording live in the runner so they cannot drift. The native path also takes `background = true` now, with `notify = "wake"` so the hub wakes the parent with the result instead of the plugin blocking. (2) Upstream's `Message` carries a flat `context_update` tag (older logs nested it), `LiveFacts` grew `topology`, `StoredFrame.system` is an `Option`, and `SessionMailbox::notify` takes a `display` line; the scripted provider, the frame builder and the mailbox tests follow. (3) The merge dropped the run inbox's ack plumbing: `land_run_messages` stopped noting the landed items and nothing confirmed them, so a message a parent sent to a running agent stayed `accepted` and never landed. `note_landed`/`take_landed` and `confirm_landed` are back. The upstream lint also caught `ctx:promote()` reading an optional key with `get::<Option<String>>`, which cannot tell `maki.NIL` from absent; it uses `TableExt::opt` now. Upstream's own tree fails the provider-plugin, catalog and `configured_overlay` suites in a full run (order-dependent), and this branch is at parity with it. Tests: the rebase fixes carry the suites they broke; `task_policy::native_and_legacy_task_enabled` loads the plugin without the stub `wait` tool, because the native `wait` owns that name.
+
+Notes from the build (P9, the delegated task's time limit): the `task` tool delegates to a native one-shot run, and the run took the hub's `default_timeout_secs` (30 min) because the plugin passed no timeout of its own. The model had no way to ask for more: the `task` schema had no `timeout_secs`, and the run's clock starts when it starts working, so a queued run lost nothing but a running one lost everything. Six subagents of a real session died at exactly 1800 s after 55 to 122 turns each, and the parent got 52 to 128 bytes of partial text. The legacy `maki.agent.session` path had no wall clock at all, so enabling runs quietly imposed one. The fix: `timeout_secs = 0` now asks for the session maximum (`max_timeout_secs`, 24 h by default) instead of meaning "one second", the `spawn` schema says so, and `plugins/task` asks for the maximum when the model names no limit and passes the model's own number when it does. `UnitView` grew a `timeout_secs` field so a run's limit is visible. Tests: `runs::tests::a_zero_timeout_asks_for_the_session_maximum` and `runs::tests::an_agent_without_a_timeout_gets_the_default` (the hub), and `task_policy::delegated::the_delegated_task_asks_for_the_session_maximum` and `::the_delegated_task_takes_a_timeout_from_the_caller` (the plugin). A live headless run with `default_timeout_secs = 45` and a subagent that slept 100 s reproduced the cut-off before the change and passed it after.
+
+Notes from the build (P11, cancelling a sub-agent): the report was "whenever a subagent is canceled, no more subagents can be spawned". Nothing leaked a slot on the plain hard-stop path, but four things added up. (1) The pool handed a slot to a run that could no longer work: a run that was stopped while it waited for a slot came back into the line when its wait was over, and the slot it got was held until it settled, up to five seconds later. Four of those and every later agent run sat at "queued" without starting. The pool now asks the hub whether a run may still work before it gives it one, and forgets a blocked run that was stopped meanwhile. (2) A spawn that took a slot went through a bare `grant`, so the run stayed `Queued` while it worked and its driver was never woken; a spawn now goes through `promote`, which says so and wakes the waiters. (3) A run that finished its turn stays available for a follow-up, but it holds no slot, yet it counted against the owner's child budget: a model that had started eight subagents could not start a ninth, and every later spawn came back as `SPAWN_LIMIT`. The budget now counts the children that are in flight; the count of live children a run waits for before it settles is unchanged, so a parent still outlives the children it started. (4) The `task` plugin stopped its native run from Lua, after the wait came back with a cancel: best effort, since the handler can be abandoned before it runs and its error was thrown away. A subagent left running holds one of the four agent slots and stays a child of its owner, so every later subagent queued behind a dead run. The run now belongs to the call that started it: the hub stops it when the call's token fires, which is the end of the turn. The plugin asks for that with `bind_to_caller`; a background task, which must outlive the turn, is spawned without it. Tests: `runs::cancel_repro` (the cancel paths that kept a slot), `runs::agent_run::an_idle_agent_does_not_use_up_the_child_budget` and `::a_woken_idle_agent_keeps_its_answer`, `maki_lua::api::run::tests::a_bound_run_is_stopped_with_its_caller`, and `task_policy::delegated::a_cancelled_task_leaves_the_next_task_free_to_spawn`. Left as is: the per-owner rate limit (`spawn_per_minute`, 10) charges a spawn that was cancelled, and `session_max_runs` (64) counts every spawn of the process; both are policy, and both are configurable.
+
+### Phase 12: background-only delegation, the child reports, the end wakes the parent
+
+Goal: the model delegates with one tool and never waits for the result. A delegated child is told, in its own task, that it must send its result to the parent; it ends after its turn, and its end wakes the parent. Two live defects go with it: a background child that parks in `Idle` after its turn, and a background child that is killed at the 30-minute default while it is still working. The model is `docs/design/background-agents.md`; this phase builds it.
+
+Files: `maki-agent/src/runs/agent.rs` (the child's first message, the delegation context); `maki-agent/src/agent/frame.rs` (the topology line); `maki-agent/src/prompts/research_tone.md`, `general_tone.md` (the truth about the result); `maki-agent/src/tools/runs.rs` (the `spawn` and `send` descriptions, the `one_shot` and `timeout_secs` schema text); `maki-agent/src/runs/mod.rs` (`into_kind` for the one-shot default and the timeout, `spawn_with` for the limit, the settlement notice that always wakes); `maki-agent/src/tools/mod.rs` (`ToolFilter::from_config` keeps the `task` tool out of the model's list); `maki-config/src/lib.rs` (the agent timeout default); `maki-agent/src/runs/journal.rs` (the journalled spec carries the resolved limit); `docs/design/background-agents.md` (new).
+
+Steps: (1) the child's first user message carries the return guidance ("You are a sub-agent. Your parent is {parent}. ... Before you finish, send your result to it with send({ to = "parent", message = ... })"), and the topology context update says the same in one line and carries the delegation scope ("your permission scope is the one you were started with ... a call that would need the user's approval is denied when nobody can answer it"); (2) the tone templates stop promising the parent an injected response ("Your entire response is injected into the parent agent's context" is false now: the child writes its answer into the message it sends); (3) the `spawn` description says that the child reports with `send` and that the parent is woken when it ends, the `send` description stops saying the final result reaches the parent on its own, and the parent's prompt gains the one-line delegation guidance ("Start independent delegations with `spawn` together in one assistant message and continue useful work while they run."); (4) a delegated child is one-shot by default (`into_kind`: `one_shot.unwrap_or(true)`), so it ends after its turn and the settlement notice carries its closing text; the idle notice stays for a continuable child (`one_shot: false`); (5) a settlement notice always wakes the parent; the wake budget of three keeps bounding the other notices; (6) the `task` tool leaves the model's tool list while native runs are enabled (`ToolFilter::from_config` excludes it by name, the way the host exclusions do, so every host gets it), and the plugin keeps it for the runs-off path and for the `/tasks` picker; (7) an agent run with no `timeout_secs` gets the session maximum instead of the 30-minute default: the hub already resolves an unnamed limit to the operator's `default_timeout_secs`, so the knob's default rises to the session maximum (`maki-config/src/lib.rs:99`) and an unattended child is not cut off in the middle of real work; (8) the run journal and `/runs` show the child as `completed` rather than `idle`.
+
+Tests: `runs::agent_run::a_delegated_child_is_told_to_report_to_its_parent`, `runs::agent_run::a_delegated_child_ends_after_its_turn`, `runs::agent_run::a_child_that_ends_wakes_the_parent`, `runs::agent_run::the_topology_line_tells_the_child_to_report`, `tools::runs::tests::the_spawn_description_says_the_child_reports`, `tools::runs::tests::the_task_tool_is_not_offered_while_runs_are_on`, `tools::runs::tests::an_agent_spawn_without_a_limit_gets_the_session_maximum`, `runs::tests::a_settlement_notice_always_wakes`, `task_policy::native_and_legacy_task_enabled` (the `task` tool is gone from the model's list with runs on and still there with runs off).
+
+E2E: a live PTY run (isolated XDG, runs enabled): ask the model to delegate a read-only investigation and to keep working while it runs. Expect: no `task` tool in the model's tool list, the child sends its result, the parent is woken and answers with it, and the journal shows the child `completed` (not `idle`) with no orphan process. Then a run with runs disabled: the legacy `task` tool still works.
+
+Commit: `feat: delegate in the background and let the child report`.
+
+Notes from the build (P12, the background-only delegation): the model delegates with one tool now, and the child reports. The `task` plugin's tool leaves the model's list while native runs are on: `ToolFilter::from_config` excludes it by name, the way the host exclusions do, so every host (the TUI, the headless driver, the Lua session path) shows the same list. The tool is not unregistered: the plugin still registers it for the runs-off path and for the `/tasks` picker, and the dispatcher refuses a call to a name the filter left out. A delegated child is one-shot by default (`into_kind`: `one_shot.unwrap_or(true)`), so it ends after its turn instead of parking in `Idle` waiting for a message that would never come; `one_shot: false` still asks for a child that stays available. The child is told, in its first user message, that it is a sub-agent and that it must send its result to the parent with `send({ to = "parent", message = ... })`, because the parent shares the workspace but not the transcript; the topology update says the same in one line and carries the delegation scope (the permission scope is fixed, and a call that would need the user's approval is denied when nobody can answer it, so the child must not retry it). The tone templates no longer promise the parent an injected response. The child's end wakes the parent: a settled agent's notice is never held back by the wake budget, because it is the result the parent asked for; it still counts towards the streak, so the noise behind it (a watch match, a shell that finished) is what the budget holds back. A shell's settlement is still budgeted. The limit an agent run gets by default is the session maximum, not 30 minutes: a child that was still working died at exactly 1800 s with 177 turns in it, and the knob that says so (`[agent.runs] default_timeout_secs`) now defaults to the session maximum. Deviations from the plan: the parent's one-line delegation guidance landed in the `spawn` tool's description rather than in a prompt slot, because the tool list is where the model reads it and a new slot would have changed every session's system prompt; the wake budget was not removed but narrowed, since the plan's version would have woken the parent for every background shell as well. Tests: `runs::agent_run::a_delegated_child_is_told_to_report_to_its_parent`, `::a_delegated_child_ends_after_its_turn`, `runs::tests::an_agent_run_is_one_shot_by_default` and `::an_agent_run_without_a_limit_gets_the_session_maximum`, `runs::notice_tests::a_settled_agent_wakes_even_when_the_budget_is_spent`, `tools::tests::the_task_tool_is_not_offered_while_runs_are_on`, `tools::runs::tests::schema_matches_snapshot` and the prompt snapshots under `maki-agent/src/prompts/tests/`. Not done: the legacy runs-off path still spawns and waits in place, and the `task` plugin's own background path is untouched; retiring them is a separate decision (Appendix B).
+
+Notes from the build (P12 follow-up): the guidance a delegated child reads must match the tools it has. The child was told to send its result with `send(to="parent")`, and a host that leaves `send` out of the tool set (a client with its own tools, say) had a child that could not obey: the instruction named a tool the child never saw. The hub knows the child's tool list when it builds the launch, so the return guidance and the topology line now have two forms: with `send`, the child is told to send its result and that sending does not end its turn; without it, the child is told that its final answer is the result the parent receives and that the answer must be a self-contained summary. The settlement notice carries that answer either way. The same holds for the parent: the topology line a child reads says the same thing its own tool set allows. Tests: `runs::agent_run::a_child_without_send_is_told_its_answer_is_the_result` and `agent::frame::tests::a_child_without_send_is_told_its_answer_is_the_result`.
+
+Notes from the build (P12 follow-up, the resumable child): P12 made a delegated child one-shot by default, so every child ends after its report, and the two rules that went with it made that end final: `revive_plan` refused a one-shot agent that had completed (`RECIPIENT_TERMINAL`), and the UI kept the tab of a finished one-shot run read-only (`run_tab_takes_input`). The result was that a child could not be resumed at all: a message typed in its task tab was dropped before it reached the hub, and the model's own `send` to it was refused. A child is a conversation, and a conversation the user cannot continue is half a feature, so both rules are gone. The hub revives a completed one-shot agent like any other (`revive_plan` keeps refusing shells and agents with no transcript file), and the tab of a finished native run takes input again. The revived run keeps the spec it had, so a one-shot child ends again after its turn and a continuable one stays available. The user is answered in the tab the message was typed in, and the child's end wakes the parent as it did before. Tests: `runs::agent_run::revive::a_completed_one_shot_agent_is_revivable` and `app::tests::a_completed_one_shot_run_tab_takes_input`.
+
+### Appendix B: post-v1 (out of the phase list)
+
+Not in v1; each needs its own decision and design pass:
+* Lua `maki.run.*`: DONE (see the notes at the end of phase 8). Still open: rewriting `maki.agent.session` over the hub (`maki-lua/src/api/agent.rs:731`).
+* Removing `plugins/task` and `maki.task.*` rewiring. When done it must handle
+  `maki-lua/src/api/task.rs`, `BackgroundSessions` (`maki-lua/src/background.rs:44`), the
+  bundled plugin registry entry (`maki-lua/src/loader.rs:145`, `include_dir!` of
+  `plugins/task`), `SubagentInbox` and legacy `task_id` paths, and `plugins.task.*` mapping.
+  Until then native `spawn` coexists with the Lua `task` tool. Partly done: with runs enabled the
+  `task` tool delegates to native `spawn` (notes at the end of phase 8); the plugin itself, its
+  `maki.task.*` picker, `BackgroundSessions` and the rest above stay, because `task` must keep
+  working when runs are off.
+* Non-unix job objects; ACP `tool_call_update` mapping; subtree cost budgets; idle unload to
+  disk; true bash promotion if 2c fell back to a hint; stdin `send` to shells.
+
+## 10. Risks, open questions, test strategy
+
+### 10.1 Risks
+
+1. Frame cache bust: adding five tools changes the frame fingerprint once. Mitigation:
+   fixed tool set per audience (5.2), single release note.
+2. History ownership: `Agent<'h>` borrows `&mut History` per run. Mitigation: one runner
+   per agent with an async mutex; never two runs concurrently.
+3. Deadlock through slot exhaustion (parents waiting on queued children): a run blocked in
+   `wait` or a permission prompt releases its slot and re-acquires on resume (6.1);
+   tested by `admit::wait_releases_slot_and_reacquires_first`.
+4. Notice injection correctness against provider rules (tool_use/tool_result pairing):
+   hard invariant with a dedicated test over both Anthropic and OpenAI shapes.
+5. Two registries (legacy Lua `task` plus hub) for the whole v1. Mitigation: the flag
+   defaults off, both coexist, the phase 3 matrix runs with both enabled.
+6. Process groups on non-unix: no grace; documented, tested on unix only.
+7. UI regressions in tab keys (handle vs `tool_use_id`): `app::tests.rs` is large;
+   legacy `task` keeps its tool_use_id keys, native runs use handles (no collision).
+8. Local models report cost 0; cost display is cosmetic there (6.3).
+9. Cold resume cache miss and token cost: accepted (7.4).
+10. Journal growth: compaction, cap on retained runs.
+
+### 10.2 Open questions (all DECIDED after review)
+
+1. DECIDED: `[agent.runs] enabled` stays a permanent kill switch, default off until phase 8 (hardening). Why: a feature that adds tools and background processes needs an escape hatch forever.
+2. DECIDED: wake budget 3 consecutive notice wakes, reset on user messages and on model-initiated `wait`/`runs` reads (4.3). Why: bounds interruptions without stranding results.
+3. DECIDED: background permission prompts go to the user, 120 s timeout then deny, the slot is released while waiting; headless and unattended = deny (6.2). Why: no unattended widening of permissions, no pinned slot.
+4. DECIDED: shells are killed on quit, orphans killed after a crash via pid file (start time must match), no re-adoption (7.2, 7.3). Why: re-adoption needs log tailing and pid-reuse handling for little gain.
+5. DECIDED: `max_agents` 4, depth 2, shells per owner 4, queue 16, default 30 min timeout for every agent (6.1). Why: local single-GPU models.
+6. DECIDED: sibling messaging OFF by default (parent/child plus `main`); `[agent.runs] siblings = true` enables it, and the ping-pong guard (4.7) is mandatory when on. Why: O(n^2) topology and loop risk.
+7. DECIDED: the model may set only `timeout_secs` (6.3). Why: budgets are operator policy.
+8. DECIDED: `maki-monitor` is not touched; the migration table is documented and phase 2b ships the replacement (8.3). Why: it is the user's plugin, not in this repo.
+9. DECIDED: `plugins.task.*` config keeps working; the Lua `task` tool stays in v1 and coexists with native `spawn` (appendix B). Why: no breaking change before a separate decision.
+10. DECIDED: no run renaming in v1. Why: names are addressing keys, stable for the model.
+
+### 10.3 Test strategy
+
+* Unit: every state transition, inbox rule and limit has a table-driven test with an
+  injected `Clock`; no `sleep`, no wall-clock assertions.
+* Hub integration: `MockProvider` and `StubStreamProvider` from the shared `test_support` module (private in `run.rs:1239`,`:1293` today) scripted turns; shell stubs via `sh -c`;
+  child process groups in a temp dir.
+* Persistence: fixture journals (golden files) for every version and corruption case.
+* UI: `maki-ui/src/app/tests.rs` helpers (`app_with_two_subagents`) extended; ratatui
+  buffer snapshots.
+* Headless and ACP: in-process `spawn`/`spawn_interactive` with a stub provider,
+  assert event streams and exit behaviour.
+* Docs: `docgen --check` in every phase.
+* Live e2e: the PTY runner, per phase, against the local model; flaky model output is
+  asserted by tool-call names and states, never by exact prose.
+* Property soak in phase 8 with deterministic seeds printed on failure.
+
+## Appendix A: toolchain recipe
+
+`cargo` is not on PATH and maki needs rustc 1.99. Per memory note
+`maki-fork-toolchain-and-ci.md`:
+
+```bash
+export PATH="/nix/store/$(ls /nix/store | grep -E '^[a-z0-9]+-rust-minimal-1\.99\.1$' | head -1)/bin:$PATH"
+RF=$(ls -d /nix/store/*rustfmt-preview-1.99* | grep -v '\.drv' | head -1)
+CL=/nix/store/5d1g1pdk5z3sqv3kmvrh2jb1r033rnqc-clippy-preview-1.99.1-x86_64-unknown-linux-gnu
+NX=/nix/store/q0anzqrazmdr8n1049ca28098q6lv2y8-cargo-nextest-0.9.146
+export PATH="$RF/bin:$CL/bin:$NX/bin:$PATH"
+export SYSROOT=$(rustc --print sysroot)   # required, or clippy cannot find std
+```
+
+CI runs nextest, not libtest: fmt, clippy `-D warnings`, `cargo nextest run --workspace`,
+`cargo run -p maki-docgen -- --check`.
+
+Notes from the build (P12 follow-up, the child the journal lost): a resumed session showed a child that could not be resumed at all. The hub did not know it: its journal record was never written (a journal that degraded, a process that could not take the lock), so its handle did not resolve and a message typed in its tab was refused with `UNKNOWN_RUN`. The journal is the fast path, but the session keeps what the run was (its name, its kind) and its transcript, and that is enough to bring the child back. `UnitHub::remember_run` takes a run back as a finished agent, with the transcript the session kept, so a message revives it like any other; the session tells the hub about the runs it remembers when it restores its tabs and before a message goes out, so the model's own `send` reaches them too. A child the session does not describe comes back read-only: the tools it comes back with are never wider than the ones it had. The transcript no longer needs the journal either, it goes to the session's runs directory, so a run keeps its history even when the journal could not be written. A refusal now says why in words (`its history was not kept, so there is nothing to continue from`) instead of the hub's code. Tests: `runs::agent_run::revive::a_remembered_run_can_be_revived` and `app::tests::a_remembered_run_keeps_its_kind`.
+
+Notes from the build (P13, the busy bar): a native run (a child the model spawned) works in the background like a plugin's task does, but `App::running_background_tasks` counted only the plugin ones, so the status bar sat still while a spawned child worked, and the quit and the rewind did not warn about it. A run is a background task: it counts, the bar spins, and the two warnings name it. Tests: `app::tests::a_working_native_run_counts_as_a_background_task`.
+
+Notes from the build (P13, the force settle of a revived run): a stop starts a force-settle timer (`FORCE_SETTLE_AFTER`, five seconds) that ends a run which ignores its cancel. The timer settled whatever run held the unit when it fired, so a run that was revived in the meantime was ended by the timer of the run it replaced: its unit became `Done(killed, "forced")` and its task was aborted. A revived child then could not report to its parent: `send` refuses a sender whose unit is done, and the answer was `NOT_REACHABLE`. The timer now watches the run it started for (`watch_for_force_settle(id, run)` -> `force_settle_run(id, &watched)`) and does nothing when a different run holds the unit. Tests: `runs::agent_run::revive::a_revived_run_is_not_force_settled_by_the_old_timer`.

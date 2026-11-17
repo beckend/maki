@@ -114,6 +114,8 @@ You can type to a moved subagent in its tab. Other task tabs have no input box, 
 
 `task_stop` only reaches tasks of its own chat. An unknown or finished id is an error that lists the running ids. A subagent inside a moved batch stops alone and at once, and what it did so far arrives with the batch result.
 
+`Esc` twice in a task's tab stops that task alone. What it started goes on working: a native run's children move up to its own parent, so a task the user stopped in front of them does not take its own workers down with it. `Ctrl+C` is the one that ends everything: the session's runs go down with it.
+
 ## Results
 
 A finished task reaches the model as a message that starts with `Background bash <id> (<summary>) finished:`, or `failed:`, followed by the output a foreground call would have returned. The transcript shows a one-line summary, and a click unfolds the output:

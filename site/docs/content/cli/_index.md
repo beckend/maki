@@ -28,6 +28,8 @@ If you pass a prompt (or pipe stdin) without `--print`, the TUI still opens and 
 | `--exit-on-done` | yes | n/a (always exits) | n/a |
 | `--background-timeout` | with `--exit-on-done` | yes (turns moves on) | yes (turns moves on) |
 | `--image` | error (use Ctrl+V paste) | yes | error (send images over the wire protocol) |
+| `--join-timeout` | error | yes | error |
+| `--quiet-runs` | no | yes | no |
 | `--verbose`, `--output-format` | no | yes | stream only |
 | `--system-prompt`, `--append-system-prompt` | yes | yes | yes |
 | `--session-id`, `--fork-session` | yes | yes | yes |
@@ -35,7 +37,7 @@ If you pass a prompt (or pipe stdin) without `--print`, the TUI still opens and 
 | `--permission-mode` | error | error | yes |
 | `--include-partial-messages` | no | no | yes |
 
-`no` means the flag is ignored. `error` means Maki exits before the run starts. Subcommands reject `--image`, `--max-turns`, `--permission-mode` and the system prompt flags, except that [`maki acp`](#maki-acp) and [`maki prompt`](#maki-prompt) take the system prompt flags.
+`no` means the flag is ignored. `error` means Maki exits before the run starts. Subcommands reject `--image`, `--max-turns`, `--permission-mode`, `--join-timeout` and the system prompt flags, except that [`maki acp`](#maki-acp) and [`maki prompt`](#maki-prompt) take the system prompt flags.
 
 ### Shared flags (detail)
 
@@ -43,6 +45,7 @@ If you pass a prompt (or pipe stdin) without `--print`, the TUI still opens and 
 |------|-------------|
 | `-p`, `--print` | Non-interactive run. See [Headless Mode](/docs/headless/) |
 | `--image <PATH>` | Attach an image in `--print` mode (repeatable). Paths must be png, jpeg, gif, or webp |
+| `--join-timeout <SECS>` | How long `--print` waits for [background runs](/docs/agents/#headless-mode) before it stops them (default `600`, or `MAKI_JOIN_TIMEOUT_SECS`). Only `--print` reads it |
 | `-m`, `--model <SPEC>` | Model as `provider/model-id`. Fallback: last used (skipped with a warning when its provider is gone or has no key) → `provider.default_model` in config → auto-detect from available providers |
 | `--verbose` | Full turn-by-turn messages in `--print` output |
 | `-c`, `--continue` | Resume the most recent session in this directory |
@@ -65,6 +68,7 @@ If you pass a prompt (or pipe stdin) without `--print`, the TUI still opens and 
 | `--append-system-prompt <TEXT>` | Add text to the end of the main agent's system prompt. Subagents do not get it, so put text they need in `AGENTS.local.md` |
 | `--permission-mode <MODE>` | SDK: `default`, `acceptEdits`, `plan`, or `bypassPermissions` |
 | `--include-partial-messages` | Stream partial deltas in SDK mode |
+| `--quiet-runs` | No run transition lines on stderr in `--print` mode. The stream-json objects stay |
 
 Pass the system prompt flags again when you resume a session. Other text, or none, rebuilds the prompt and [starts the cache over](/docs/context/#one-prompt-per-session).
 

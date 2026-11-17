@@ -153,6 +153,28 @@ With 0 you see only the header. The read, index and list tools default to 0, bec
 | `rtk` | bool | `true` | - | Rewrite the model's bash commands with [rtk](https://github.com/rtk-ai/rtk) when it is installed |
 | `shell` | string | `auto` | - | Shell for string commands on Windows (`jobstart`, UI `!`): `auto` (Git Bash if installed, else `cmd.exe`), `cmd`, or a path to an executable |
 
+### `agent.runs`
+
+| Field | Type | Default | Min | Description |
+|-------|------|---------|-----|-------------|
+| `enabled` | bool | `false` | - | Register the `spawn`, `send`, `runs`, `wait` and `stop` tools for background agents and shell jobs |
+| `max_depth` | u32 | `2` | 1 | Deepest agent nesting (the main agent is 0); an agent at this depth cannot spawn agents |
+| `max_children_per_run` | u32 | `8` | 1 | Most runs one run may have in flight at once; a finished run that stays available does not use it up |
+| `session_max_runs` | u32 | `64` | 1 | Most runs one session may start in total |
+| `siblings` | bool | `false` | - | Let runs with the same parent message each other with `send`. Off: a run reaches only its parent, its children and `main` |
+| `max_agents` | u32 | `4` | 1 | Agent runs that may work at once; more start queued, first come first served. A run waiting in `wait` does not count |
+| `max_shells` | u32 | `8` | 1 | Shell runs that may be running at once in the session |
+| `max_shells_per_owner` | u32 | `4` | 1 | Shell runs one run may have running at once |
+| `max_queue` | u32 | `16` | 1 | Agent runs that may wait for a free slot; a further `spawn` fails with QUEUE_FULL |
+| `spawn_per_minute` | u32 | `10` | 1 | Runs one run may start per rolling minute |
+| `default_timeout_secs` | u64 | `86400` | 1 | Wall clock limit of an agent run (seconds) unless `spawn` sets `timeout_secs`; counted from when it starts working. A delegated child works unattended, so the default is the session maximum rather than a short leash |
+| `max_timeout_secs` | u64 | `86400` | 1 | Largest `timeout_secs` a `spawn` may ask for (seconds); larger values are lowered to it |
+| `permission_timeout_secs` | u64 | `120` | 1 | How long a run's permission prompt waits for the user (seconds) before it is denied; the run gives up its slot meanwhile |
+| `unattended_permissions` | string | `deny` | - | A run's permission prompt when nobody can answer (`maki -p`): `deny`, or `allow_under_yolo` to allow it under `--yolo` (`inherit_yolo` is a deprecated alias) |
+| `max_retained` | u32 | `64` | 1 | Finished runs kept in memory; older ones leave a tombstone and can still be revived by `send` while their transcript exists |
+| `max_idle` | u32 | `16` | 1 | Idle agents kept in memory; the least recently active leaves silently and is revived by `send` |
+| `idle_timeout_secs` | u64 | `1800` | 1 | How long an agent may stay idle in memory (seconds) before it leaves silently; `send` revives it |
+
 ### `provider`
 
 | Field | Type | Default | Min | Description |
@@ -298,7 +320,7 @@ maki.setup({
 | `background_on_timeout` | boolean | `false` | - | Move a command that hits its timeout to the background instead of killing it. Applies to the main agent while background tasks are on; elsewhere the command is killed. |
 | `max_output_bytes` | integer | - | - | Override `agent.max_output_bytes` for this tool. |
 | `max_output_lines` | integer | - | - | Override `agent.max_output_lines` for this tool. |
-| `timeout_secs` | integer | `120` | 5 | Kill the command after this many seconds. A call's `timeout` param overrides it. |
+| `timeout_secs` | integer | `120` | 5 | Stop waiting for the command after this many seconds and kill it; with native runs enabled it keeps running as a background shell run instead. A call's `timeout` param overrides it. |
 
 ### `plugins.code_execution`
 

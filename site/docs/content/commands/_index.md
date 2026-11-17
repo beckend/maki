@@ -22,6 +22,8 @@ Type `/` in the input box to open the command palette.
 | `/model` | Switch model |
 | `/theme` | Switch color theme |
 | `/mcp` | Configure MCP servers |
+| `/runs` | List background runs and open their tabs |
+| `/stop` | Stop a background run by name or handle, or all of them |
 | `/login` | Authenticate with an LLM provider |
 | `/cd` | Change working directory |
 | `/btw` | Ask a quick question (no tools, no history pollution) |
