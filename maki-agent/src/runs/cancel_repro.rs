@@ -40,8 +40,8 @@ async fn settle_bounded(rig: &Rig, id: UnitId, within: Duration) -> UnitView {
 fn one_agent() -> UnitLimits {
     UnitLimits {
         max_agents: 1,
-        spawn_per_minute: u8::MAX,
-        max_children_per_run: u8::MAX,
+        spawn_per_minute: u32::MAX,
+        max_children_per_run: u32::MAX,
         max_depth: 4,
         session_max_runs: 1000,
         ..UnitLimits::default()

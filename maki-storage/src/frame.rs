@@ -44,7 +44,7 @@ pub struct LiveFacts {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TopologyFacts {
     /// Handle, name and depth.
-    pub me: (String, String, u8),
+    pub me: (String, String, u32),
     /// Handle and name; `None` for the main agent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<(String, String)>,
@@ -52,7 +52,7 @@ pub struct TopologyFacts {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub children: Vec<(String, String, u8)>,
     /// Deepest agent nesting, and whether siblings may message each other.
-    pub limits: (u8, bool),
+    pub limits: (u32, bool),
 }
 
 impl TopologyFacts {

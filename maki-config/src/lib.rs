@@ -89,22 +89,24 @@ pub const MIN_CONNECT_TIMEOUT_SECS: u64 = 1;
 pub const MIN_LOW_SPEED_TIMEOUT_SECS: u64 = 1;
 pub const MIN_STREAM_TIMEOUT_SECS: u64 = 10;
 
-pub const DEFAULT_RUNS_MAX_DEPTH: u32 = 2;
-pub const DEFAULT_RUNS_MAX_CHILDREN: u32 = 8;
-pub const DEFAULT_RUNS_SESSION_MAX: u32 = 64;
-pub const DEFAULT_RUNS_MAX_AGENTS: u32 = 4;
-pub const DEFAULT_RUNS_MAX_SHELLS: u32 = 8;
-pub const DEFAULT_RUNS_MAX_SHELLS_PER_OWNER: u32 = 4;
-pub const DEFAULT_RUNS_MAX_QUEUE: u32 = 16;
-pub const DEFAULT_RUNS_SPAWN_PER_MINUTE: u32 = 10;
+// The run limits are unlimited by default: a fork that spawns runs wants
+// them, not a ceiling it has to raise. A host that wants a ceiling sets it.
+pub const DEFAULT_RUNS_MAX_DEPTH: u32 = u32::MAX;
+pub const DEFAULT_RUNS_MAX_CHILDREN: u32 = u32::MAX;
+pub const DEFAULT_RUNS_SESSION_MAX: u32 = u32::MAX;
+pub const DEFAULT_RUNS_MAX_AGENTS: u32 = u32::MAX;
+pub const DEFAULT_RUNS_MAX_SHELLS: u32 = u32::MAX;
+pub const DEFAULT_RUNS_MAX_SHELLS_PER_OWNER: u32 = u32::MAX;
+pub const DEFAULT_RUNS_MAX_QUEUE: u32 = u32::MAX;
+pub const DEFAULT_RUNS_SPAWN_PER_MINUTE: u32 = u32::MAX;
 pub const DEFAULT_RUNS_AGENT_TIMEOUT_SECS: u64 = 86_400;
 pub const DEFAULT_RUNS_MAX_TIMEOUT_SECS: u64 = 86_400;
 pub const MIN_RUNS_MAX_DEPTH: u32 = 1;
 pub const MIN_RUNS_LIMIT: u32 = 1;
 pub const MIN_RUNS_TIMEOUT_SECS: u64 = 1;
 pub const DEFAULT_RUNS_PERMISSION_TIMEOUT_SECS: u64 = 120;
-pub const DEFAULT_RUNS_MAX_RETAINED: u32 = 64;
-pub const DEFAULT_RUNS_MAX_IDLE: u32 = 16;
+pub const DEFAULT_RUNS_MAX_RETAINED: u32 = u32::MAX;
+pub const DEFAULT_RUNS_MAX_IDLE: u32 = u32::MAX;
 pub const DEFAULT_RUNS_IDLE_TIMEOUT_SECS: u64 = 1800;
 
 pub const MIN_RETRY_BASE_MS: u64 = 1;
@@ -1581,13 +1583,13 @@ pub struct RunsConfig {
     )]
     pub enabled: bool,
 
-    #[config(default = DEFAULT_RUNS_MAX_DEPTH, min = MIN_RUNS_MAX_DEPTH, desc = "Deepest agent nesting (the main agent is 0); an agent at this depth cannot spawn agents")]
+    #[config(default = DEFAULT_RUNS_MAX_DEPTH, min = MIN_RUNS_MAX_DEPTH, desc = "Deepest agent nesting (the main agent is 0); unlimited by default, an agent at this depth cannot spawn agents")]
     pub max_depth: u32,
 
-    #[config(default = DEFAULT_RUNS_MAX_CHILDREN, min = MIN_RUNS_LIMIT, desc = "Most runs one run may have in flight at once; a finished run that stays available does not use it up")]
+    #[config(default = DEFAULT_RUNS_MAX_CHILDREN, min = MIN_RUNS_LIMIT, desc = "Most runs one run may have in flight at once; unlimited by default. A finished run that stays available does not use it up")]
     pub max_children_per_run: u32,
 
-    #[config(default = DEFAULT_RUNS_SESSION_MAX, min = MIN_RUNS_LIMIT, desc = "Most runs one session may start in total")]
+    #[config(default = DEFAULT_RUNS_SESSION_MAX, min = MIN_RUNS_LIMIT, desc = "Most runs one session may start in total; unlimited by default")]
     pub session_max_runs: u32,
 
     #[config(
@@ -1596,19 +1598,19 @@ pub struct RunsConfig {
     )]
     pub siblings: bool,
 
-    #[config(default = DEFAULT_RUNS_MAX_AGENTS, min = MIN_RUNS_LIMIT, desc = "Agent runs that may work at once; more start queued, first come first served. A run waiting in `wait` does not count")]
+    #[config(default = DEFAULT_RUNS_MAX_AGENTS, min = MIN_RUNS_LIMIT, desc = "Agent runs that may work at once; unlimited by default. More start queued, first come first served. A run waiting in `wait` does not count")]
     pub max_agents: u32,
 
-    #[config(default = DEFAULT_RUNS_MAX_SHELLS, min = MIN_RUNS_LIMIT, desc = "Shell runs that may be running at once in the session")]
+    #[config(default = DEFAULT_RUNS_MAX_SHELLS, min = MIN_RUNS_LIMIT, desc = "Shell runs that may be running at once in the session; unlimited by default")]
     pub max_shells: u32,
 
-    #[config(default = DEFAULT_RUNS_MAX_SHELLS_PER_OWNER, min = MIN_RUNS_LIMIT, desc = "Shell runs one run may have running at once")]
+    #[config(default = DEFAULT_RUNS_MAX_SHELLS_PER_OWNER, min = MIN_RUNS_LIMIT, desc = "Shell runs one run may have running at once; unlimited by default")]
     pub max_shells_per_owner: u32,
 
-    #[config(default = DEFAULT_RUNS_MAX_QUEUE, min = MIN_RUNS_LIMIT, desc = "Agent runs that may wait for a free slot; a further `spawn` fails with QUEUE_FULL")]
+    #[config(default = DEFAULT_RUNS_MAX_QUEUE, min = MIN_RUNS_LIMIT, desc = "Agent runs that may wait for a free slot; unlimited by default. A further `spawn` fails with QUEUE_FULL")]
     pub max_queue: u32,
 
-    #[config(default = DEFAULT_RUNS_SPAWN_PER_MINUTE, min = MIN_RUNS_LIMIT, desc = "Runs one run may start per rolling minute")]
+    #[config(default = DEFAULT_RUNS_SPAWN_PER_MINUTE, min = MIN_RUNS_LIMIT, desc = "Runs one run may start per rolling minute; unlimited by default")]
     pub spawn_per_minute: u32,
 
     #[config(default = DEFAULT_RUNS_AGENT_TIMEOUT_SECS, min = MIN_RUNS_TIMEOUT_SECS, desc = "Wall clock limit of an agent run (seconds) unless `spawn` sets `timeout_secs`; counted from when it starts working. A delegated child works unattended, so the default is the session maximum rather than a short leash")]
@@ -1628,10 +1630,10 @@ pub struct RunsConfig {
     )]
     pub unattended_permissions: UnattendedMode,
 
-    #[config(default = DEFAULT_RUNS_MAX_RETAINED, min = MIN_RUNS_LIMIT, desc = "Finished runs kept in memory; older ones leave a tombstone and can still be revived by `send` while their transcript exists")]
+    #[config(default = DEFAULT_RUNS_MAX_RETAINED, min = MIN_RUNS_LIMIT, desc = "Finished runs kept in memory; unlimited by default. Older ones leave a tombstone and can still be revived by `send` while their transcript exists")]
     pub max_retained: u32,
 
-    #[config(default = DEFAULT_RUNS_MAX_IDLE, min = MIN_RUNS_LIMIT, desc = "Idle agents kept in memory; the least recently active leaves silently and is revived by `send`")]
+    #[config(default = DEFAULT_RUNS_MAX_IDLE, min = MIN_RUNS_LIMIT, desc = "Idle agents kept in memory; unlimited by default. The least recently active leaves silently and is revived by `send`")]
     pub max_idle: u32,
 
     #[config(default = DEFAULT_RUNS_IDLE_TIMEOUT_SECS, min = MIN_RUNS_TIMEOUT_SECS, desc = "How long an agent may stay idle in memory (seconds) before it leaves silently; `send` revives it")]
@@ -3240,7 +3242,7 @@ mod tests {
                 runs.spawn_per_minute,
                 runs.default_timeout_secs
             ),
-            (4, 8, 4, 16, 10, 86_400)
+            (u32::MAX, u32::MAX, u32::MAX, u32::MAX, u32::MAX, 86_400)
         );
     }
 

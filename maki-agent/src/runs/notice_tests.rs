@@ -24,8 +24,8 @@ fn rig() -> Rig {
     let clock = Arc::new(ManualClock::default());
     let hub = UnitHub::new(
         UnitLimits {
-            max_agents: u8::MAX,
-            spawn_per_minute: u8::MAX,
+            max_agents: u32::MAX,
+            spawn_per_minute: u32::MAX,
             ..UnitLimits::default()
         },
         EventSender::new(tx, 0),

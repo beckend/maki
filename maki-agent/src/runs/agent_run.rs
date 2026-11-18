@@ -3329,7 +3329,7 @@ mod chaos {
 
     const SEEDS: u64 = 12;
     const OPS: usize = 150;
-    const MAX_AGENTS: u8 = 3;
+    const MAX_AGENTS: u32 = 3;
     const WATCHDOG: Duration = Duration::from_secs(180);
 
     struct Chaos {
@@ -3393,8 +3393,8 @@ mod chaos {
             max_children_per_run: 2,
             max_depth: 2,
             max_queue: 4,
-            spawn_per_minute: u8::MAX,
-            session_max_runs: u16::MAX,
+            spawn_per_minute: u32::MAX,
+            session_max_runs: u32::MAX,
             ..UnitLimits::default()
         }
     }
@@ -3561,7 +3561,7 @@ mod chaos {
                 _ => tokio::task::yield_now().await,
             }
             assert!(
-                rig.hub.slots_in_use() <= usize::from(MAX_AGENTS),
+                rig.hub.slots_in_use() <= MAX_AGENTS as usize,
                 "seed {seed}: {} slots in use",
                 rig.hub.slots_in_use()
             );
@@ -3701,7 +3701,7 @@ mod chaos {
         let rig = rig_with(
             &script,
             UnitLimits {
-                max_agents: SLOTS as u8,
+                max_agents: SLOTS as u32,
                 max_children_per_run: 30,
                 max_queue: 50,
                 spawn_per_minute: 100,

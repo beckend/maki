@@ -5,25 +5,25 @@ use maki_config::{RunsConfig, UnattendedMode};
 /// Timeouts above this are lowered, so `Instant + timeout` cannot overflow.
 const MAX_TIMEOUT_SECS: u64 = 365 * 24 * 3600;
 
-/// Caps of one hub, from `[agent.runs]`. Values above the field's range are
-/// saturated; zero is rejected by the config validation.
+/// Caps of one hub, from `[agent.runs]`. A cap of [`u32::MAX`] is no cap: the
+/// defaults leave every limit open, and a host that wants a ceiling sets one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UnitLimits {
-    pub max_agents: u8,
-    pub max_shells: u8,
-    pub max_shells_per_owner: u8,
-    pub max_depth: u8,
-    pub max_children_per_run: u8,
-    pub max_queue: u16,
-    pub spawn_per_minute: u8,
-    pub session_max_runs: u16,
+    pub max_agents: u32,
+    pub max_shells: u32,
+    pub max_shells_per_owner: u32,
+    pub max_depth: u32,
+    pub max_children_per_run: u32,
+    pub max_queue: u32,
+    pub spawn_per_minute: u32,
+    pub session_max_runs: u32,
     pub default_timeout: Duration,
     pub max_timeout: Duration,
     pub siblings: bool,
     pub permission_timeout: Duration,
     pub unattended: UnattendedMode,
-    pub max_retained: u16,
-    pub max_idle: u16,
+    pub max_retained: u32,
+    pub max_idle: u32,
     pub idle_timeout: Duration,
 }
 
@@ -35,17 +35,15 @@ impl Default for UnitLimits {
 
 impl From<&RunsConfig> for UnitLimits {
     fn from(config: &RunsConfig) -> Self {
-        let small = |v: u32| u8::try_from(v).unwrap_or(u8::MAX);
-        let wide = |v: u32| u16::try_from(v).unwrap_or(u16::MAX);
         Self {
-            max_agents: small(config.max_agents),
-            max_shells: small(config.max_shells),
-            max_shells_per_owner: small(config.max_shells_per_owner),
-            max_depth: small(config.max_depth),
-            max_children_per_run: small(config.max_children_per_run),
-            max_queue: wide(config.max_queue),
-            spawn_per_minute: small(config.spawn_per_minute),
-            session_max_runs: wide(config.session_max_runs),
+            max_agents: config.max_agents,
+            max_shells: config.max_shells,
+            max_shells_per_owner: config.max_shells_per_owner,
+            max_depth: config.max_depth,
+            max_children_per_run: config.max_children_per_run,
+            max_queue: config.max_queue,
+            spawn_per_minute: config.spawn_per_minute,
+            session_max_runs: config.session_max_runs,
             default_timeout: Duration::from_secs(config.default_timeout_secs.min(MAX_TIMEOUT_SECS)),
             max_timeout: Duration::from_secs(config.max_timeout_secs.min(MAX_TIMEOUT_SECS)),
             siblings: config.siblings,
@@ -53,8 +51,8 @@ impl From<&RunsConfig> for UnitLimits {
                 config.permission_timeout_secs.min(MAX_TIMEOUT_SECS),
             ),
             unattended: config.unattended_permissions,
-            max_retained: wide(config.max_retained),
-            max_idle: wide(config.max_idle),
+            max_retained: config.max_retained,
+            max_idle: config.max_idle,
             idle_timeout: Duration::from_secs(config.idle_timeout_secs.min(MAX_TIMEOUT_SECS)),
         }
     }
@@ -79,13 +77,23 @@ mod tests {
                 l.session_max_runs,
                 l.siblings
             ),
-            (4, 8, 4, 2, 8, 16, 10, 64, false)
+            (
+                u32::MAX,
+                u32::MAX,
+                u32::MAX,
+                u32::MAX,
+                u32::MAX,
+                u32::MAX,
+                u32::MAX,
+                u32::MAX,
+                false
+            )
         );
         assert_eq!(l.default_timeout, Duration::from_secs(86_400));
         assert_eq!(l.max_timeout, Duration::from_secs(86_400));
         assert_eq!(
             (l.max_retained, l.max_idle, l.idle_timeout),
-            (64, 16, Duration::from_secs(1800))
+            (u32::MAX, u32::MAX, Duration::from_secs(1800))
         );
     }
 
@@ -106,13 +114,13 @@ mod tests {
     }
 
     #[test]
-    fn oversized_values_saturate() {
+    fn a_cap_is_taken_as_it_is() {
         let config = RunsConfig {
             max_agents: 1000,
             max_queue: 1_000_000,
             ..RunsConfig::default()
         };
         let l = UnitLimits::from(&config);
-        assert_eq!((l.max_agents, l.max_queue), (u8::MAX, u16::MAX));
+        assert_eq!((l.max_agents, l.max_queue), (1000, 1_000_000));
     }
 }

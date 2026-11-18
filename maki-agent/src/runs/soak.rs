@@ -14,8 +14,8 @@ use super::*;
 use crate::Envelope;
 
 const SPAWNS: usize = 150;
-const MAX_SHELLS: u8 = 6;
-const MAX_RETAINED: u16 = 16;
+const MAX_SHELLS: u32 = 6;
+const MAX_RETAINED: u32 = 16;
 
 fn hub_in(dir: &std::path::Path) -> (Arc<UnitHub>, Arc<RunJournal>) {
     let (tx, rx) = unbounded_channel::<Envelope>();
@@ -24,8 +24,8 @@ fn hub_in(dir: &std::path::Path) -> (Arc<UnitHub>, Arc<RunJournal>) {
         UnitLimits {
             max_shells: MAX_SHELLS,
             max_shells_per_owner: MAX_SHELLS,
-            spawn_per_minute: u8::MAX,
-            session_max_runs: u16::MAX,
+            spawn_per_minute: u32::MAX,
+            session_max_runs: u32::MAX,
             max_retained: MAX_RETAINED,
             ..UnitLimits::default()
         },

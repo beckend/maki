@@ -108,7 +108,7 @@ struct RunObject<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     parent: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    depth: Option<u8>,
+    depth: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     state: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]

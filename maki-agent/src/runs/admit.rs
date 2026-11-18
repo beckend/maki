@@ -193,11 +193,11 @@ mod tests {
         )
     }
 
-    fn agents(n: u8) -> UnitLimits {
+    fn agents(n: u32) -> UnitLimits {
         UnitLimits {
             max_agents: n,
-            spawn_per_minute: u8::MAX,
-            max_children_per_run: u8::MAX,
+            spawn_per_minute: u32::MAX,
+            max_children_per_run: u32::MAX,
             max_depth: 4,
             session_max_runs: 1000,
             ..UnitLimits::default()
@@ -387,7 +387,7 @@ mod tests {
                 let _ = &seed;
                 let hub = hub_with(UnitLimits {
                     max_queue: 200,
-                    ..agents(CAP as u8)
+                    ..agents(CAP as u32)
                 });
                 let main = hub.main();
                 let token = CancelToken::none();
@@ -623,7 +623,7 @@ mod tests {
                 let hub = UnitHub::new(
                     UnitLimits {
                         max_queue: 500,
-                        ..agents(CAP as u8)
+                        ..agents(CAP as u32)
                     },
                     EventSender::new(tx, 0),
                     clock.clone(),

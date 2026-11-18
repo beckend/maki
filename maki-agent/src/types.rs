@@ -865,7 +865,7 @@ pub enum AgentEvent {
         kind: String,
         /// Handle of the run that started it, `None` for `main`.
         parent: Option<String>,
-        depth: u8,
+        depth: u32,
         one_shot: bool,
     },
     /// An agent run moved to `idle` or back to `running`.

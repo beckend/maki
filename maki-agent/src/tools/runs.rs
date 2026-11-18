@@ -890,7 +890,7 @@ fn list_or_show(
     let me = caller.map_or_else(|| "main".to_owned(), |v| v.name.to_string());
     let _ = writeln!(out, "{me} (you)");
     for v in &views {
-        let indent = "  ".repeat(usize::from(v.depth.saturating_sub(base_depth)));
+        let indent = "  ".repeat((v.depth.saturating_sub(base_depth)) as usize);
         let detail = v
             .progress
             .as_deref()

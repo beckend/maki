@@ -750,7 +750,7 @@ pub struct StoredRun {
     /// Last state seen: `running`, `idle`, `completed`, `lost`, ...
     pub state: String,
     #[serde(default)]
-    pub depth: u8,
+    pub depth: u32,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub one_shot: bool,
 }

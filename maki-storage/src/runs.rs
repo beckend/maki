@@ -111,7 +111,7 @@ pub struct SpawnRec {
     pub kind: String,
     pub owner: String,
     pub parent: String,
-    pub depth: u8,
+    pub depth: u32,
     pub desc: String,
     pub origin_tool_use_id: Option<String>,
     pub notify: String,

@@ -354,7 +354,7 @@ pub struct Unit {
     pub name: UnitName,
     pub owner: UnitId,
     pub parent: UnitId,
-    pub depth: u8,
+    pub depth: u32,
     pub kind: UnitKind,
     pub description: String,
     pub origin_tool_use_id: Option<Arc<str>>,
@@ -562,7 +562,7 @@ pub struct UnitView {
     pub name: UnitName,
     pub kind: RunKind,
     pub parent: UnitId,
-    pub depth: u8,
+    pub depth: u32,
     pub description: String,
     pub state: UnitState,
     pub age_secs: u64,
@@ -1000,7 +1000,7 @@ impl UnitHub {
         }
     }
 
-    fn depth_of(&self, table: &UnitTable, caller: UnitId) -> Result<u8, UnitError> {
+    fn depth_of(&self, table: &UnitTable, caller: UnitId) -> Result<u32, UnitError> {
         if caller == self.main {
             return Ok(0);
         }
@@ -1112,14 +1112,14 @@ impl UnitHub {
             return Err(UnitError::DepthLimit);
         }
         let busy = table.busy_children(caller);
-        if busy >= usize::from(self.limits.max_children_per_run)
-            || table.spawned >= usize::from(self.limits.session_max_runs)
+        if busy >= self.limits.max_children_per_run as usize
+            || table.spawned >= self.limits.session_max_runs as usize
         {
             return Err(UnitError::SpawnLimit);
         }
         if !is_agent {
-            let max = usize::from(self.limits.max_shells);
-            let per_owner = usize::from(self.limits.max_shells_per_owner);
+            let max = self.limits.max_shells as usize;
+            let per_owner = self.limits.max_shells_per_owner as usize;
             if table.running_shells(None) >= max {
                 return Err(UnitError::ShellLimit {
                     max,
@@ -1133,9 +1133,9 @@ impl UnitHub {
                 });
             }
         }
-        let max_agents = usize::from(self.limits.max_agents);
+        let max_agents = self.limits.max_agents as usize;
         let would_queue = is_agent && table.pool.would_queue(max_agents);
-        if would_queue && table.pool.queued_len() >= usize::from(self.limits.max_queue) {
+        if would_queue && table.pool.queued_len() >= self.limits.max_queue as usize {
             return Err(UnitError::QueueFull);
         }
         let now = self.clock.now();
@@ -1146,7 +1146,7 @@ impl UnitHub {
         {
             recent.pop_front();
         }
-        if recent.len() >= usize::from(self.limits.spawn_per_minute) {
+        if recent.len() >= self.limits.spawn_per_minute as usize {
             let wait = recent.front().map_or(SPAWN_WINDOW, |t| {
                 SPAWN_WINDOW - now.saturating_duration_since(*t)
             });
@@ -1375,7 +1375,7 @@ impl UnitHub {
         let (handle, name) = (unit.handle.to_string(), unit.name.to_string());
         // Every way a run ends passes here, so a slot cannot leak.
         table.pool.drop_run(id);
-        table.promote(usize::from(self.limits.max_agents));
+        table.promote(self.limits.max_agents as usize);
         let generation = table.settle_gen.entry(id).or_default();
         *generation += 1;
         let generation = *generation;
@@ -1415,7 +1415,7 @@ impl UnitHub {
         );
         table.idle_results.insert(id, result);
         table.pool.drop_run(id);
-        table.promote(usize::from(self.limits.max_agents));
+        table.promote(self.limits.max_agents as usize);
         let generation = table.settle_gen.entry(id).or_default();
         *generation += 1;
         let generation = *generation;
@@ -1807,7 +1807,7 @@ impl UnitHub {
                 let mut table = self.table();
                 let held = table.pool.drop_run(id);
                 if held {
-                    table.promote(usize::from(self.limits.max_agents));
+                    table.promote(self.limits.max_agents as usize);
                 }
                 self.release(table);
                 if held {
@@ -1830,7 +1830,7 @@ impl UnitHub {
             // A stopping run may still hold a slot: pass it on now.
             let held = table.pool.drop_run(id);
             if held {
-                table.promote(usize::from(self.limits.max_agents));
+                table.promote(self.limits.max_agents as usize);
             }
             self.release(table);
             if held {
@@ -1857,7 +1857,7 @@ impl UnitHub {
             );
             table.outbox.push(event);
         }
-        table.promote(usize::from(self.limits.max_agents));
+        table.promote(self.limits.max_agents as usize);
         let got = table.pool.holds(id);
         self.release(table);
         got.then_some(true)
@@ -1872,7 +1872,7 @@ impl UnitHub {
         let mut table = self.table();
         let held = table.pool.block(id, on);
         if held {
-            table.promote(usize::from(self.limits.max_agents));
+            table.promote(self.limits.max_agents as usize);
         }
         self.release(table);
         if held {
@@ -1890,7 +1890,7 @@ impl UnitHub {
     pub fn session_usage(&self) -> (usize, usize) {
         (
             self.table().units.len(),
-            usize::from(self.limits.session_max_runs),
+            self.limits.session_max_runs as usize,
         )
     }
 

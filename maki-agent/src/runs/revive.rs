@@ -237,7 +237,7 @@ impl UnitHub {
         }
         let id = plan.id;
         let pending = self.pending_messages(plan.handle.as_str());
-        let max_agents = usize::from(self.limits.max_agents);
+        let max_agents = self.limits.max_agents as usize;
         let msg_id = MessageId(self.message_seq.fetch_add(1, Ordering::Relaxed) + 1);
         let now = self.clock.now();
         let mut table = self.table();
@@ -445,7 +445,7 @@ impl UnitHub {
             .map(|u| (u.last_activity, u.id))
             .collect();
         idle.sort_by_key(|(at, _)| *at);
-        let mut over = idle.len().saturating_sub(usize::from(self.limits.max_idle));
+        let mut over = idle.len().saturating_sub(self.limits.max_idle as usize);
         for (at, id) in idle {
             let expired = now.saturating_duration_since(at) >= self.limits.idle_timeout;
             if !(expired || over > 0) || table.live_children(id) > 0 {
@@ -457,7 +457,7 @@ impl UnitHub {
             }
         }
         let all_done = table.units.values().filter(|u| u.state.is_done()).count();
-        let excess = all_done.saturating_sub(usize::from(self.limits.max_retained));
+        let excess = all_done.saturating_sub(self.limits.max_retained as usize);
         if excess > 0 {
             let mut done: Vec<(Option<SystemTime>, UnitId)> = table
                 .units
