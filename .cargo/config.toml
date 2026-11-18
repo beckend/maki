@@ -2,3 +2,13 @@
 # which rustc's `-nodefaultlibs` musl link would otherwise drop.
 [target.aarch64-unknown-linux-musl]
 rustflags = ["-C", "link-arg=-lgcc"]
+
+# The tests share state that belongs to the process: the provider plugin
+# registry, the tool registry, the catalog, the model tiers and the
+# per-user directories. Nextest gives every test its own process, so they
+# never meet; plain `cargo test` runs them as threads of one process, where
+# they read and write each other's state. One test at a time keeps them
+# apart, and the env overrides the tests set are then the only ones in
+# flight.
+[env]
+RUST_TEST_THREADS = "1"

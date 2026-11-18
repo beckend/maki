@@ -973,9 +973,19 @@ impl Provider for CatalogProvider {
     }
 }
 
+/// Seeds the shared catalog for a test.
+///
+/// The catalog is one catalog for the whole process, so a test that seeds it
+/// replaces what the test before it left behind: under a runner that keeps
+/// every test in one process, the first seed would otherwise answer every
+/// later test.
 #[cfg(test)]
 pub(crate) fn seed_catalog_for_tests(index: schema::CatalogIndex, state_dir: StateDir) {
-    let _ = SHARED_CATALOG.set(Mutex::new(CatalogData::from_index(index, &state_dir)));
+    let data = CatalogData::from_index(index, &state_dir);
+    match SHARED_CATALOG.get() {
+        Some(catalog) => *catalog.lock().unwrap() = data,
+        None => drop(SHARED_CATALOG.set(Mutex::new(data))),
+    }
 }
 
 #[cfg(test)]
@@ -2813,6 +2823,10 @@ mod tests {
 
     #[test]
     fn available_if_warm_returns_false_when_catalog_cold() {
+        let (_tmp, state_dir) = temp_state_dir();
+        // A catalog without the provider answers the way a cold one does, and
+        // this test cannot count on being the first to seed the shared one.
+        super::warm_empty_catalog_for_tests(state_dir);
         assert!(!available_if_warm("opencode-go"));
     }
 }

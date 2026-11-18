@@ -385,8 +385,12 @@ pub(crate) mod transport {
 /// first, since the base dirs are resolved once per process, and keep the
 /// guard for the whole test.
 pub fn isolated_home() -> IsolatedHome {
+    // The lock comes first: the environment is process-wide, and a test that
+    // is still waiting for its turn must not point the environment at its own
+    // home while the test that holds the lock is working.
+    let guard = home_lock();
     let home = TempDir::new().expect(TEMPDIR_FAILED);
-    // SAFETY: The environment is process-wide, and the lock below is what
+    // SAFETY: The environment is process-wide, and the lock above is what
     // keeps another test from reading it while this one works. Callers set up
     // the environment before starting work that can read it.
     unsafe {
@@ -407,7 +411,7 @@ pub fn isolated_home() -> IsolatedHome {
     }
     IsolatedHome {
         home,
-        _guard: Some(home_lock()),
+        _guard: Some(guard),
     }
 }
 
@@ -439,12 +443,10 @@ fn home_lock() -> MutexGuard<'static, ()> {
 
 #[cfg(test)]
 mod tests {
-    use std::io;
     use std::panic::catch_unwind;
     use std::path::PathBuf;
 
     use maki_config::providers::base_url_env_var;
-    use maki_storage::paths;
     use test_case::test_case;
 
     use super::*;
@@ -466,18 +468,24 @@ mod tests {
         Canned::json(200, B_BODY),
     ];
 
-    #[test_case(paths::config_dir ; "config")]
-    #[test_case(paths::data_dir ; "data")]
-    #[test_case(paths::state_dir ; "state")]
-    #[test_case(paths::logs_dir ; "logs")]
-    #[test_case(paths::cache_dir ; "cache")]
-    fn isolated_home_contains_user_directories(resolve: fn() -> io::Result<PathBuf>) {
+    /// The per-user directories the environment names are inside the home.
+    ///
+    /// The directories themselves are resolved once per process, so a runner
+    /// that keeps every test in one process resolves them for whichever test
+    /// came first. The environment is what the isolation sets, and it is what
+    /// the resolution reads, so the environment is what this checks.
+    #[test_case("XDG_CONFIG_HOME", "config" ; "config")]
+    #[test_case("XDG_DATA_HOME", "data" ; "data")]
+    #[test_case("XDG_STATE_HOME", "state" ; "state")]
+    #[test_case("XDG_CACHE_HOME", "cache" ; "cache")]
+    fn isolated_home_contains_user_directories(var: &str, dir: &str) {
         let home = isolated_home();
-        let directory = resolve().unwrap();
+        let named = std::env::var_os(var).unwrap_or_else(|| panic!("{var} is not set"));
+        let named = PathBuf::from(named);
         assert!(
-            directory.starts_with(home.path()),
+            named.starts_with(home.path().join(dir)),
             "{DIRECTORY_ESCAPED}: {}",
-            directory.display()
+            named.display()
         );
     }
 
