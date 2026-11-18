@@ -289,6 +289,34 @@ pub fn set(theme: Theme) {
     GENERATION.fetch_add(1, Ordering::Release);
 }
 
+/// Gives the theme back when a test that changed it is done.
+///
+/// The theme is one theme for the process, so a test that changes it and
+/// leaves it changed hands the next test a palette it did not ask for.
+#[cfg(test)]
+pub(crate) struct ThemeGuard {
+    previous: Arc<Theme>,
+}
+
+#[cfg(test)]
+impl ThemeGuard {
+    /// Remembers the theme that is in place now.
+    pub(crate) fn take() -> Self {
+        Self {
+            previous: Arc::clone(&current()),
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for ThemeGuard {
+    fn drop(&mut self) {
+        THEME.store(Arc::clone(&self.previous));
+        crate::highlight::refresh_syntax_theme();
+        GENERATION.fetch_add(1, Ordering::Release);
+    }
+}
+
 pub fn generation() -> u64 {
     GENERATION.load(Ordering::Acquire)
 }

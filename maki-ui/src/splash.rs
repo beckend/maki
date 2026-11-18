@@ -727,6 +727,7 @@ status_dim = { fg = "magenta" }
     /// The test sets its theme because the default theme uses RGB colors.
     #[test]
     fn a_palette_theme_draws_the_field_without_truecolor() {
+        let _theme = theme::ThemeGuard::take();
         theme::set(theme::Theme::from_toml(ANSI_THEME).expect(ANSI_THEME_NAME));
 
         let mut splash = Splash::new(true);

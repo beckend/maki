@@ -2162,7 +2162,14 @@ fn live_snapshot_uses_panel_generation() {
     panel.tool_start(start("t1", BASH_TOOL_NAME));
     panel.tool_snapshot("t1", rendered_snapshot(), None);
 
-    assert_eq!(panel.snapshot_gen_of("t1"), Some(0), "{LIVE_PANEL_GEN_MSG}");
+    // The generation is the one the panel was built with, which is whatever
+    // the theme was at that moment: a theme another test changed leaves the
+    // counter higher than it was.
+    assert_eq!(
+        panel.snapshot_gen_of("t1"),
+        Some(panel.theme_generation),
+        "{LIVE_PANEL_GEN_MSG}"
+    );
 }
 
 #[test]
@@ -2802,6 +2809,7 @@ fn drain_highlight_worker(panel: &mut MessagesPanel) {
 /// straight back in with no test to catch it.
 #[test]
 fn theme_switch_repaints_highlighted_code() {
+    let _theme = theme::ThemeGuard::take();
     theme::set(theme::load_by_name("dracula").unwrap());
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     panel.tool_start(start("t1", "read"));
@@ -2826,6 +2834,7 @@ fn theme_switch_repaints_highlighted_code() {
     let dracula = code_span_styles(&panel, "t1");
     assert!(!dracula.is_empty(), "no highlighted keywords to compare");
 
+    let _theme = theme::ThemeGuard::take();
     theme::set(theme::load_by_name("tokyonight").unwrap());
     render(&mut panel, 80, 20);
     drain_highlight_worker(&mut panel);
@@ -2879,6 +2888,7 @@ user_bg = { bg = "surface" }
 
 #[test]
 fn user_message_uses_user_bg_and_user_text() {
+    let _theme = theme::ThemeGuard::take();
     crate::theme::set(Theme::from_toml(USER_BG_THEME).unwrap());
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     panel.push(DisplayMessage::new(
@@ -3411,6 +3421,7 @@ fn scrollbar_sits_on_the_theme_window_background() {
         .find(|e| e.name == "dracula")
         .unwrap()
         .toml;
+    let _theme = theme::ThemeGuard::take();
     crate::theme::set(crate::theme::Theme::from_toml(dracula).unwrap());
 
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());

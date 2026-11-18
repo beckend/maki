@@ -485,12 +485,14 @@ mod tests {
     /// so the streams have to be handed the new colours before they repaint.
     #[test]
     fn theme_switch_repaints_the_streams() {
+        let _theme = theme::ThemeGuard::take();
         theme::set(theme::load_by_name(THEME_A).expect(THEME_A));
         let mut m = modal();
         answer_a_question(&mut m);
         let before = stream_styles(&mut m);
         assert!(!before.is_empty(), "nothing rendered to compare");
 
+        let _theme = theme::ThemeGuard::take();
         theme::set(theme::load_by_name(THEME_B).expect(THEME_B));
 
         assert_ne!(

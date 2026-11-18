@@ -2008,6 +2008,7 @@ mod tests {
         // ambient theme comes from the user's state dir and may reverse
         // instead, so pin one that paints.
         const THEME: &str = "dracula";
+        let _theme = theme::ThemeGuard::take();
         theme::set(theme::load_by_name(THEME).expect(THEME));
         let mut input = chip(Reveal::Never);
         let red = mark(0..CHIP_TEXT.len(), hl(fg(RED)));

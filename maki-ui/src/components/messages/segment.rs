@@ -582,6 +582,7 @@ mod tests {
             "reuse must fire across a width change; highlight lines are width-independent"
         );
 
+        let _theme = theme::ThemeGuard::take();
         theme::set(theme::load_by_name(OTHER_THEME).unwrap());
         assert!(
             seg.reuse_highlight(&key(), (1, 3)).is_none(),

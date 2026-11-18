@@ -2152,6 +2152,7 @@ mod tests {
 
     #[test]
     fn default_span_resolves_to_theme_tool() {
+        let _theme = theme::ThemeGuard::take();
         theme::set(theme::load_by_name("dracula").expect("dracula theme"));
         assert_eq!(
             resolve_span_style(&SpanStyle::Default),

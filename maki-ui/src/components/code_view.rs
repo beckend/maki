@@ -715,6 +715,7 @@ mod tests {
 
     #[test]
     fn diff_change_spans_uses_sign_style_for_prefix_only() {
+        let _theme = theme::ThemeGuard::take();
         theme::set(
             theme::Theme::from_toml(
                 r##"
@@ -767,6 +768,7 @@ diff_new_line_nr = { fg = "new_nr" }
 
     #[test]
     fn render_diff_wires_dedicated_sign_and_line_nr_styles() {
+        let _theme = theme::ThemeGuard::take();
         theme::set(theme::Theme::from_toml(DIFF_GUTTER_TEST_THEME).expect("theme must parse"));
 
         let before = "keep\nold\n";

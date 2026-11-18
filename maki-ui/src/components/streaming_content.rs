@@ -284,6 +284,7 @@ mod tests {
     fn renderer_resets_between_messages(via_take_all: bool) {
         // The default syntect theme paints every scope the same colour, so
         // without a real one a leaked language would not show up in the styles.
+        let _theme = theme::ThemeGuard::take();
         theme::set(theme::load_by_name(THEME_A).expect(THEME_A));
         let style = Style::default();
         let mut sc = StreamingContent::new("", style, style, INSTANT);
@@ -318,6 +319,7 @@ mod tests {
         cache.get_or_update(&mut renderer, FIRST_MESSAGE, "", style, style, TEST_WIDTH);
         let before = cache.lines.clone();
 
+        let _theme = theme::ThemeGuard::take();
         theme::set(theme::load_by_name(THEME_B).expect(THEME_B));
         let rerendered =
             cache.get_or_update(&mut renderer, FIRST_MESSAGE, "", style, style, TEST_WIDTH);

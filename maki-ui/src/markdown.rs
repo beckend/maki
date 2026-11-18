@@ -580,6 +580,7 @@ mod tests {
     #[test]
     fn the_code_memo_follows_the_theme_and_ignores_the_width() {
         const WIDTHS: [u16; 3] = [NARROW_WIDTH, TEST_WIDTH, WIDE_WIDTH];
+        let _theme = theme::ThemeGuard::take();
         theme::set(theme::load_by_name(THEME_A).expect(THEME_A));
         let under_a = WIDTHS.map(render_code);
         assert!(
@@ -587,6 +588,7 @@ mod tests {
             "the narrow width must actually wrap a code line"
         );
 
+        let _theme = theme::ThemeGuard::take();
         theme::set(theme::load_by_name(THEME_B).expect(THEME_B));
         for (a, b) in under_a.iter().zip(WIDTHS.map(render_code)) {
             assert_eq!(lines_text(a), lines_text(&b), "text must not change");
@@ -597,6 +599,7 @@ mod tests {
             );
         }
 
+        let _theme = theme::ThemeGuard::take();
         theme::set(theme::load_by_name(THEME_A).expect(THEME_A));
         assert_eq!(
             WIDTHS.map(render_code),
