@@ -15,6 +15,7 @@ use std::io::Cursor;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::ops::Index;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 #[cfg(test)]
 use std::time::Duration;
@@ -298,6 +299,40 @@ static PROVIDER_LOAD: Mutex<()> = Mutex::new(());
 pub fn with_provider_load<T>(load: impl FnOnce() -> T) -> T {
     let _guard = PROVIDER_LOAD.lock().unwrap_or_else(|e| e.into_inner());
     load()
+}
+
+/// The registry the plugin providers live in is one registry for the whole
+/// process, and a load replaces it whole, so the tests that write to it take
+/// turns: a load that ran while another test was reading its entry would take
+/// that entry away.
+static PLUGIN_REGISTRY_BUSY: AtomicBool = AtomicBool::new(false);
+
+/// A guard that holds the plugin registry for as long as it lives. A test that
+/// registers a provider, reads it back or replaces it keeps this for its whole
+/// body.
+///
+/// The wait is a spin, not a lock: a test holds this across its awaits, and a
+/// lock guard that outlives an await is a footgun the compiler warns about.
+pub struct PluginRegistryGuard;
+
+impl PluginRegistryGuard {
+    pub fn acquire() -> Self {
+        while PLUGIN_REGISTRY_BUSY.swap(true, Ordering::AcqRel) {
+            std::thread::yield_now();
+        }
+        Self
+    }
+}
+
+impl Drop for PluginRegistryGuard {
+    fn drop(&mut self) {
+        PLUGIN_REGISTRY_BUSY.store(false, Ordering::Release);
+    }
+}
+
+/// A guard that holds the plugin registry for as long as it lives.
+pub fn plugin_registry_guard() -> PluginRegistryGuard {
+    PluginRegistryGuard::acquire()
 }
 
 /// Registers `authored` like a bundled plugin load would, with `host` as its

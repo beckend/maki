@@ -1885,7 +1885,7 @@ mod tests {
     use futures::FutureExt;
     use maki_config::PROVIDER_BUILTINS;
     use maki_config::providers::base_url_env_var;
-    use maki_storage::auth::{PluginAuthData, save_plugin_auth};
+    use maki_storage::auth::{PluginAuthData, delete_plugin_auth, save_plugin_auth};
     use test_case::test_case;
 
     use super::spec::{UNKNOWN_MODEL_CONTEXT_WINDOW, UNKNOWN_MODEL_MAX_OUTPUT};
@@ -2125,10 +2125,16 @@ mod tests {
     }
 
     fn entry_with(hooks: ProviderHooks) -> Arc<PluginEntry> {
-        const SLUG: &str = "in-memory";
-        let decl = decl(SLUG);
+        entry_named("in-memory", hooks)
+    }
+
+    /// An entry under a slug of its own. The store the plugin reads is
+    /// shared by the process, so a test that writes to it takes a slug no
+    /// other test writes to.
+    fn entry_named(slug: &str, hooks: ProviderHooks) -> Arc<PluginEntry> {
+        let decl = decl(slug);
         let auth = AuthState::new();
-        auth.redeclare(SLUG, None, &decl.net_hosts, KeyHeader::Bearer)
+        auth.redeclare(slug, None, &decl.net_hosts, KeyHeader::Bearer)
             .unwrap();
         let target = Target::Codec(Protocol::Openai);
         Arc::new(PluginEntry {
@@ -2172,6 +2178,7 @@ mod tests {
     #[test_case("has/slash", false ; "has_slash")]
     #[test_case("has space", false ; "has_space")]
     fn slug_validation(input: &str, expected: bool) {
+        let _guard = crate::test_support::plugin_registry_guard();
         assert_eq!(is_valid_slug(input), expected);
     }
 
@@ -2189,6 +2196,7 @@ mod tests {
         after_one: &str,
         after_two: &str,
     ) {
+        let _guard = crate::test_support::plugin_registry_guard();
         let hook = Arc::new(CountingAuth::new(rotating));
         let entry = entry_with(ProviderHooks {
             auth: Some(hook.clone()),
@@ -2220,16 +2228,27 @@ mod tests {
     /// the store, the next 401 is ours to refresh.
     #[tokio::test]
     async fn a_refresh_after_a_foreign_rotation_reloads() {
+        let _guard = crate::test_support::plugin_registry_guard();
         let _home = isolated_home();
         let hook = Arc::new(CountingAuth::new(true));
-        let entry = entry_with(ProviderHooks {
-            auth: Some(hook.clone()),
-            ..ProviderHooks::default()
-        });
+        let entry = entry_named(
+            "rotation-plugin",
+            ProviderHooks {
+                auth: Some(hook.clone()),
+                ..ProviderHooks::default()
+            },
+        );
 
-        entry.run_auth(AuthPurpose::Resolve).await.unwrap();
         let dir = StateDir::resolve().unwrap();
-        save_plugin_auth(&dir, &entry.decl.slug, &PluginAuthData::default()).unwrap();
+        // The store is the one the process resolved, so it may hold what an
+        // earlier run left behind. Start from a slug the store does not know.
+        delete_plugin_auth(&dir, &entry.decl.slug).ok();
+        entry.run_auth(AuthPurpose::Resolve).await.unwrap();
+        // Another process rotated the store. The stamp is a hash of what the
+        // store holds, so the rotation has to hold a different credential.
+        let mut rotated = PluginAuthData::new();
+        rotated.insert("api_key".to_owned(), serde_json::json!("rotated"));
+        save_plugin_auth(&dir, &entry.decl.slug, &rotated).unwrap();
         entry.run_auth(AuthPurpose::Refresh).await.unwrap();
         entry.run_auth(AuthPurpose::Refresh).await.unwrap();
 
@@ -2248,6 +2267,7 @@ mod tests {
     /// of its work on resolve.
     #[tokio::test]
     async fn a_reload_before_the_first_request_still_resolves() {
+        let _guard = crate::test_support::plugin_registry_guard();
         let hook = Arc::new(CountingAuth::new(true));
         let entry = entry_with(ProviderHooks {
             auth: Some(hook.clone()),
@@ -2269,6 +2289,7 @@ mod tests {
     /// fresh cell, and returning to the first does not resurrect its token.
     #[tokio::test]
     async fn owner_changes_do_not_reuse_another_packages_auth_gate() {
+        let _guard = crate::test_support::plugin_registry_guard();
         const SLUG: &str = "owner-auth-test";
         const FIRST_OWNER: &str = "first-owner";
         const NEXT_OWNER: &str = "next-owner";
@@ -2322,6 +2343,7 @@ mod tests {
 
     #[tokio::test]
     async fn reload_keeps_the_auth_state() {
+        let _guard = crate::test_support::plugin_registry_guard();
         const SLUG: &str = "reload-plugin";
         let hook = Arc::new(CountingAuth::new(true));
         let with_hook = || {
@@ -2358,6 +2380,7 @@ mod tests {
     /// load runs still gets the generation that is actually serving.
     #[test]
     fn a_new_load_drops_the_entries_of_the_previous_one() {
+        let _guard = crate::test_support::plugin_registry_guard();
         const SLUG: &str = "stale-plugin";
         const CREDENTIALS_DROPPED: &str = "credentials must outlive the load that registered them";
         register_loaded(registration(SLUG)).unwrap();
@@ -2378,6 +2401,7 @@ mod tests {
     /// slug the first had already declared was free to be declared again.
     #[test]
     fn a_second_load_waits_for_the_one_in_progress() {
+        let _guard = crate::test_support::plugin_registry_guard();
         const FIRST: &str = "overlapping-first";
         const SECOND: &str = "overlapping-second";
         const STILL_STAGED: &str = "the load in progress must still hold what it staged";
@@ -2427,6 +2451,7 @@ mod tests {
     /// behind in a registry the whole process shares.
     #[test]
     fn a_host_that_drives_no_phases_can_load_more_than_once() {
+        let _guard = crate::test_support::plugin_registry_guard();
         const SLUG: &str = "phased-host-plugin";
         let load = || {
             let slug = SLUG.to_owned();
@@ -2446,6 +2471,7 @@ mod tests {
     /// the newest that serves, since its hooks are the ones a later load built.
     #[test]
     fn declaring_the_same_provider_twice_is_one_declaration() {
+        let _guard = crate::test_support::plugin_registry_guard();
         const SLUG: &str = "twice-declared-plugin";
         const NOT_TWICE: &str = "the same declaration twice is still one declaration";
         begin_load();
@@ -2472,6 +2498,7 @@ mod tests {
     /// never publish it.
     #[test]
     fn a_registration_after_the_load_published_is_refused() {
+        let _guard = crate::test_support::plugin_registry_guard();
         const SLUG: &str = "after-the-load";
         register_loaded(registration(SLUG)).unwrap();
         let error = register(registration(SLUG), DeclAuthority::Bundled, &[]).unwrap_err();
@@ -2482,6 +2509,7 @@ mod tests {
     /// panics, and every synchronous entry point still answers.
     #[test]
     fn create_calls_no_hook() {
+        let _guard = crate::test_support::plugin_registry_guard();
         const SLUG: &str = "sync-plugin";
         let mut reg = registration(SLUG);
         reg.hooks = ProviderHooks {
@@ -2517,6 +2545,7 @@ mod tests {
     /// which is what a user does after the old one was revoked.
     #[test]
     fn a_declared_key_env_decides_availability() {
+        let _guard = crate::test_support::plugin_registry_guard();
         const SLUG: &str = "keyed-plugin";
         const ENV_VAR: &str = "MAKI_TEST_KEYED_PLUGIN_KEY";
         const KEY: &str = "sk-keyed";
@@ -2557,6 +2586,7 @@ mod tests {
         header: &str,
         bearer: bool,
     ) {
+        let _guard = crate::test_support::plugin_registry_guard();
         const SLUG: &str = "header-plugin";
         const ENV_VAR: &str = "MAKI_TEST_HEADER_PLUGIN_KEY";
         const KEY: &str = "sk-header";
@@ -2587,6 +2617,7 @@ mod tests {
     #[test_case(None, 0 ; "unmarked_tier_defaults_to_its_first_row")]
     #[test_case(Some(1), 1 ; "a_marked_row_stays_the_default")]
     fn every_declared_tier_has_one_default(marked: Option<usize>, expected: usize) {
+        let _guard = crate::test_support::plugin_registry_guard();
         const SLUG: &str = "tiered-plugin";
         const SECOND_MODEL: &str = "plug-2";
         let mut reg = registration(SLUG);
@@ -2612,6 +2643,7 @@ mod tests {
     /// through a `base` keeps it for the fast-priced rows it borrows.
     #[test]
     fn the_anthropic_base_lends_fast_mode() {
+        let _guard = crate::test_support::plugin_registry_guard();
         const SLUG: &str = "fast-plugin";
         register_loaded(based(SLUG, super::super::anthropic::SLUG)).unwrap();
 
@@ -2631,6 +2663,7 @@ mod tests {
     /// declaration leaves uncovered.
     #[test]
     fn a_base_lends_the_rows_a_declaration_leaves_out() {
+        let _guard = crate::test_support::plugin_registry_guard();
         const SLUG: &str = "lending-plugin";
         register_loaded(based(SLUG, super::super::anthropic::SLUG)).unwrap();
 
@@ -2656,6 +2689,7 @@ mod tests {
     /// declarations in the same load are none of its business.
     #[test]
     fn a_discarded_plugin_leaves_nothing_staged() {
+        let _guard = crate::test_support::plugin_registry_guard();
         const PLUGIN: &str = "failed-plugin";
         const SLUG: &str = "failed-plugin-slug";
         const BYSTANDER: &str = "bystander-plugin";
@@ -2688,6 +2722,7 @@ mod tests {
     /// Unloading the package releases the slug again.
     #[test]
     fn a_failed_load_keeps_its_granted_slugs_owned() {
+        let _guard = crate::test_support::plugin_registry_guard();
         const PACKAGE: &str = "failed-package";
         const SLUG: &str = "granted-but-failed";
         const OTHER: &str = "other-package-slug";
@@ -2714,6 +2749,7 @@ mod tests {
     /// package a `/reload` skips (disabled or removed) keeps no slug owned.
     #[test]
     fn a_new_load_cycle_drops_stale_grants() {
+        let _guard = crate::test_support::plugin_registry_guard();
         const STALE: &str = "stale-grant-slug";
         const OWNED: &str = "a granted slug is owned";
         const RESET: &str = "a new load cycle must drop the previous grants";
@@ -2731,6 +2767,7 @@ mod tests {
     /// the end, what it minted lands, and the gate stays shut until it has.
     #[tokio::test]
     async fn a_refresh_outlives_the_caller_that_started_it() {
+        let _guard = crate::test_support::plugin_registry_guard();
         const MINT_DROPPED: &str = "what the abandoned refresh minted never landed";
         let hook = Arc::new(ParkedAuth {
             entered: Notify::new(),
@@ -2765,6 +2802,7 @@ mod tests {
         hooked: bool,
         expected: usize,
     ) {
+        let _guard = crate::test_support::plugin_registry_guard();
         const KEY_ENV: &str = "MAKI_TEST_401_KEY";
         const KEY: &str = "sk-rejected";
         const PROMPT: &str = "read a.txt";
@@ -2817,6 +2855,7 @@ mod tests {
     #[test_case(Protocol::Google, "google-origin-plugin" ; "google")]
     #[tokio::test]
     async fn every_codec_posts_to_the_declared_origin(protocol: Protocol, slug: &str) {
+        let _guard = crate::test_support::plugin_registry_guard();
         const ENV_VAR: &str = "MAKI_TEST_CODEC_ORIGIN_KEY";
         const KEY: &str = "sk-gateway";
         const PROMPT: &str = "hi";
@@ -2862,6 +2901,7 @@ mod tests {
     #[test_case(Protocol::OpenaiResponses, "responses-session-plugin" ; "openai_responses")]
     #[tokio::test]
     async fn every_session_codec_carries_the_declared_session_id(protocol: Protocol, slug: &str) {
+        let _guard = crate::test_support::plugin_registry_guard();
         const ENV_VAR: &str = "MAKI_TEST_SESSION_CARRIER_KEY";
         const KEY: &str = "sk-session";
         const PROMPT: &str = "hi";
@@ -2924,43 +2964,45 @@ mod tests {
 
     /// Only an origin the user or maki chose skips the side-call guard, never
     /// the one a third-party decl wrote.
-    #[test_case(DeclAuthority::ThirdParty, None, None ; "third_party_declared_origin")]
-    #[test_case(DeclAuthority::ThirdParty, Some(OTHER_BASE_URL), Some(OTHER_BASE_URL) ; "third_party_user_origin")]
-    #[test_case(DeclAuthority::Bundled, None, Some(EXAMPLE_BASE_URL) ; "bundled_declared_origin")]
+    #[test_case(DeclAuthority::ThirdParty, None, None, "vouch-third-party" ; "third_party_declared_origin")]
+    #[test_case(DeclAuthority::ThirdParty, Some(OTHER_BASE_URL), Some(OTHER_BASE_URL), "vouch-user-origin" ; "third_party_user_origin")]
+    #[test_case(DeclAuthority::Bundled, None, Some(EXAMPLE_BASE_URL), "vouch-bundled" ; "bundled_declared_origin")]
     fn vouched_origin_is_the_users_or_makis(
         authority: DeclAuthority,
         configured: Option<&str>,
         expected: Option<&str>,
+        slug: &str,
     ) {
-        const SLUG: &str = "vouch-plugin";
+        let _guard = crate::test_support::plugin_registry_guard();
         if let Some(configured) = configured {
-            unsafe { std::env::set_var(base_url_env_var(SLUG), configured) };
+            unsafe { std::env::set_var(base_url_env_var(slug), configured) };
         }
-        register_loaded_as(registration(SLUG), authority, &[SLUG.to_owned()]).unwrap();
+        register_loaded_as(registration(slug), authority, &[slug.to_owned()]).unwrap();
 
         let expected = expected.map(|url| Url::parse(url).unwrap());
-        assert_eq!(vouched_origin(SLUG), expected);
+        assert_eq!(vouched_origin(slug), expected);
     }
 
-    #[test_case(None, "example.com:443" ; "the_default_port_spelled_out")]
-    #[test_case(Some("http://[::1]:8080/v1"), "[::1]:8080" ; "an_ipv6_origin")]
-    fn effective_authority_names_the_port(configured: Option<&str>, expected: &str) {
-        const SLUG: &str = "authority-plugin";
+    #[test_case(None, "example.com:443", "authority-default" ; "the_default_port_spelled_out")]
+    #[test_case(Some("http://[::1]:8080/v1"), "[::1]:8080", "authority-ipv6" ; "an_ipv6_origin")]
+    fn effective_authority_names_the_port(configured: Option<&str>, expected: &str, slug: &str) {
+        let _guard = crate::test_support::plugin_registry_guard();
         if let Some(configured) = configured {
-            unsafe { std::env::set_var(base_url_env_var(SLUG), configured) };
+            unsafe { std::env::set_var(base_url_env_var(slug), configured) };
         }
         register_loaded_as(
-            registration(SLUG),
+            registration(slug),
             DeclAuthority::ThirdParty,
-            &[SLUG.to_owned()],
+            &[slug.to_owned()],
         )
         .unwrap();
 
-        assert_eq!(effective_authority(SLUG).as_deref(), Some(expected));
+        assert_eq!(effective_authority(slug).as_deref(), Some(expected));
     }
 
     #[test]
     fn a_declaration_builds_its_own_spec_row() {
+        let _guard = crate::test_support::plugin_registry_guard();
         const SLUG: &str = "row-plugin";
         const ENV_VAR: &str = "MAKI_TEST_ROW_PLUGIN_KEY";
         const CONTEXT_WINDOW: u32 = 64_000;
@@ -2989,6 +3031,7 @@ mod tests {
     #[test_case(Some(BUILTIN_SLUG) ; "base_lends_its_provider")]
     #[test_case(Some(AUTHORITATIVE_SLUG) ; "base_lends_its_authoritative_catalog")]
     fn undeclared_curation_and_limits(base: Option<&str>) {
+        let _guard = crate::test_support::plugin_registry_guard();
         const SLUG: &str = "defaults-plugin";
         let reg = match base {
             Some(base) => based(SLUG, base),
@@ -3031,6 +3074,7 @@ mod tests {
         dialect: Option<&str>,
         expected: Option<Effort>,
     ) {
+        let _guard = crate::test_support::plugin_registry_guard();
         let slug = format!("adaptive-codec-{}", dialect.unwrap_or("plain"));
         let mut reg = registration(&slug);
         reg.decl.openai = dialect.map(|name| {
@@ -3052,6 +3096,7 @@ mod tests {
         toggle_only: bool,
         required: bool,
     ) {
+        let _guard = crate::test_support::plugin_registry_guard();
         let slug = format!("effective-thinking-{dialect}-{toggle_only}-{required}");
         let mut reg = registration(&slug);
         let fields = if toggle_only {
@@ -3113,6 +3158,7 @@ mod tests {
         expected: ThinkingConfig,
         expected_body: Value,
     ) {
+        let _guard = crate::test_support::plugin_registry_guard();
         let slug = format!("typed-thinking-budget-{toggle_only}");
         let mut reg = registration(&slug);
         reg.decl.models[0].supports_thinking = Some(true);
@@ -3147,6 +3193,7 @@ mod tests {
     #[test_case(Protocol::Google ; "google_codec_ignores_fields")]
     #[test_case(Protocol::OpenaiResponses ; "responses_codec_ignores_fields")]
     fn inactive_codec_fields_do_not_change_thinking(protocol: Protocol) {
+        let _guard = crate::test_support::plugin_registry_guard();
         let slug = format!("inactive-thinking-{protocol:?}").to_lowercase();
         let mut reg = registration(&slug);
         reg.decl.codec = Some(protocol);
@@ -3191,6 +3238,7 @@ mod tests {
         model_id: &str,
         uses_fields: bool,
     ) {
+        let _guard = crate::test_support::plugin_registry_guard();
         for required in [false, true] {
             for toggle_only in [false, true] {
                 let slug = format!("native-fields-{base}-{required}-{toggle_only}");
@@ -3258,6 +3306,7 @@ mod tests {
         dialect: bool,
         uses_fields: bool,
     ) {
+        let _guard = crate::test_support::plugin_registry_guard();
         let mut route = base.map_or_else(
             || registration(THINKING_ROUTE),
             |base| based(THINKING_ROUTE, base),
@@ -3304,6 +3353,7 @@ mod tests {
     #[test_case("zai", Some(Effort::High) ; "base_with_a_fixed_level")]
     #[test_case(BUILTIN_SLUG, None ; "base_with_an_adaptive_mode")]
     fn a_based_declaration_sends_adaptive_as_its_base(base: &str, expected: Option<Effort>) {
+        let _guard = crate::test_support::plugin_registry_guard();
         let slug = format!("adaptive-based-on-{base}");
         register_loaded(based(&slug, base)).unwrap();
 
@@ -3316,6 +3366,7 @@ mod tests {
     /// use.
     #[test]
     fn a_codec_provider_takes_its_discovered_tiers() {
+        let _guard = crate::test_support::plugin_registry_guard();
         const SLUG: &str = "discovered-tiers-plugin";
         const DISCOVERED_TIER: ModelTier = ModelTier::Weak;
         let mut reg = registration(SLUG);
@@ -3342,6 +3393,7 @@ mod tests {
         provider_max_output: Option<Option<u32>>,
         expected_max_output: Option<u32>,
     ) {
+        let _guard = crate::test_support::plugin_registry_guard();
         const SLUG: &str = "limits-plugin";
         let mut reg = registration(SLUG);
         reg.decl.max_output_tokens = provider_max_output;
@@ -3360,6 +3412,7 @@ mod tests {
 
     #[test]
     fn listing_a_model_does_not_move_its_limits() {
+        let _guard = crate::test_support::plugin_registry_guard();
         const SLUG: &str = "unstated-limits-plugin";
         const UNLISTED_MODEL: &str = "other-model";
         register_loaded(registration(SLUG)).unwrap();
@@ -3390,6 +3443,7 @@ mod tests {
     #[test_case(Some(serde_json::json!(4096)), Some(Some(4096)) ; "published")]
     #[test_case(None, None ; "left_out")]
     fn a_declared_output_cap_round_trips(stated: Option<Value>, expected: Option<Option<u32>>) {
+        let _guard = crate::test_support::plugin_registry_guard();
         let decl: ProviderDecl = serde_json::from_value(authored_cap(stated.clone())).unwrap();
         assert_eq!(decl.max_output_tokens, expected);
 
@@ -3399,6 +3453,7 @@ mod tests {
 
     #[test]
     fn a_true_output_cap_is_refused() {
+        let _guard = crate::test_support::plugin_registry_guard();
         let authored = authored_cap(Some(serde_json::json!(true)));
         assert!(serde_json::from_value::<ProviderDecl>(authored).is_err());
     }
@@ -3408,6 +3463,7 @@ mod tests {
     /// from rather than storing it twice.
     #[test]
     fn a_dialect_is_resolved_by_name() {
+        let _guard = crate::test_support::plugin_registry_guard();
         const KNOWN: &str = "deepseek";
         const UNKNOWN: &str = "not-a-dialect";
         let authored = |name: &str| {
@@ -3533,6 +3589,7 @@ mod tests {
 
     #[test]
     fn replay_reasoning_registers_on_the_responses_codec() {
+        let _guard = crate::test_support::plugin_registry_guard();
         let mut reg = registration("replay-reasoning-plugin");
         reg.decl.codec = Some(Protocol::OpenaiResponses);
         reg.decl.replay_reasoning = true;
@@ -3592,6 +3649,7 @@ mod tests {
     #[test_case(plan_off_the_declared_hosts, |e| matches!(e, RegisterError::UndeclaredBaseUrl(_)) ; "plan_base_url_must_be_declared")]
     #[test_case(two_defaults_for_a_tier, |e| matches!(e, RegisterError::InvalidModels { .. }) ; "one_default_per_tier")]
     fn registration_rejects(mutate: fn(&mut Registration), expected: fn(&RegisterError) -> bool) {
+        let _guard = crate::test_support::plugin_registry_guard();
         const SLUG: &str = "rejected-plugin";
         begin_load();
         let mut reg = registration(SLUG);
@@ -3606,6 +3664,7 @@ mod tests {
     /// the phases, must not be refused for saying the same thing twice.
     #[test]
     fn the_same_declaration_twice_is_one_declaration() {
+        let _guard = crate::test_support::plugin_registry_guard();
         const SLUG: &str = "same-declaration-plugin";
         begin_load();
         register(registration(SLUG), DeclAuthority::Bundled, &[]).unwrap();
@@ -3626,6 +3685,7 @@ mod tests {
     #[test_case(BUNDLED_SLUG, DeclAuthority::ThirdParty ; "third_party_on_a_bundled_slug")]
     #[test_case(BUNDLED_SLUG, DeclAuthority::Config ; "config_on_a_bundled_slug")]
     fn a_shipped_slug_is_reserved(slug: &str, authority: DeclAuthority) {
+        let _guard = crate::test_support::plugin_registry_guard();
         let error = register_loaded_as(registration(slug), authority, &[]).unwrap_err();
 
         assert!(matches!(error, RegisterError::ReservedSlug(_)), "{error}");
@@ -3638,6 +3698,7 @@ mod tests {
     /// ships stays reserved.
     #[test]
     fn a_config_load_registers_any_slug_maki_does_not_ship() {
+        let _guard = crate::test_support::plugin_registry_guard();
         const SLUG: &str = "config-registered";
         const REGISTERED: &str = "the config load must register the slug";
         register_loaded_as(registration(SLUG), DeclAuthority::Config, &[]).expect(REGISTERED);
@@ -3652,6 +3713,7 @@ mod tests {
     /// (`an_ungranted_slug_is_refused`).
     #[test]
     fn a_third_party_plugin_replaces_a_served_catalog_slug() {
+        let _guard = crate::test_support::plugin_registry_guard();
         const CATALOG_SLUG: &str = "served-catalog";
         const TAKEOVER_FAILED: &str = "the registration must have taken the slug";
         const REPLACED: &str = "the catalog must stop listing the replaced slug";
@@ -3690,6 +3752,7 @@ mod tests {
     /// inside the binary: that is maki's own say so, no grant needed.
     #[test]
     fn an_ungranted_slug_is_refused() {
+        let _guard = crate::test_support::plugin_registry_guard();
         const NOT_TAKEN: &str = "a refused slug must not be serving it";
         const STILL_LISTED: &str = "the catalog must keep listing the refused slug";
         const BUNDLED_TAKEOVER_FAILED: &str = "a bundled plugin registers without a grant";
@@ -3752,6 +3815,7 @@ mod tests {
 
     #[tokio::test]
     async fn map_error_absent_leaves_the_error_untouched() {
+        let _guard = crate::test_support::plugin_registry_guard();
         let provider = provider_with(ProviderHooks::default());
         let error = provider
             .mapped::<()>(Err(api_error(NOT_RETRYABLE, None)))
@@ -3771,6 +3835,7 @@ mod tests {
     /// stay maki's to decide.
     #[tokio::test]
     async fn map_error_remaps_the_status_only() {
+        let _guard = crate::test_support::plugin_registry_guard();
         const RETRY_AFTER: Duration = Duration::from_secs(7);
         const REMAPPED: &str = "slow down";
         let provider = provider_with(ProviderHooks {
@@ -3795,6 +3860,7 @@ mod tests {
 
     #[test]
     fn plugin_auth_rejects_an_undeclared_base_url() {
+        let _guard = crate::test_support::plugin_registry_guard();
         const SLUG: &str = "egress-plugin";
         let hosts = vec![EXAMPLE_HOST.to_string()];
         let declared = format!("{EXAMPLE_BASE_URL}/v1");
@@ -3826,6 +3892,7 @@ mod tests {
     #[test_case("http://127.0.0.1:8080/v1", "127.0.0.1", true ; "plaintext_to_a_loopback_address")]
     #[test_case("ftp://example.com/v1", EXAMPLE_HOST, false ; "a_scheme_that_is_neither")]
     fn base_url_scheme(url: &str, host: &str, accepted: bool) {
+        let _guard = crate::test_support::plugin_registry_guard();
         const SLUG: &str = "scheme-plugin";
         let hosts = vec![host.to_string()];
         assert_eq!(
@@ -3839,6 +3906,7 @@ mod tests {
     #[test_case("https://example.com:9443/v1", "example.com:443", false ; "another_port")]
     #[test_case("http://[::1]:8080/v1", "[::1]:8080", true ; "a_loopback_ipv6_on_its_port")]
     fn base_url_port(url: &str, host: &str, accepted: bool) {
+        let _guard = crate::test_support::plugin_registry_guard();
         const SLUG: &str = "port-plugin";
         let hosts = vec![host.to_string()];
         assert_eq!(
@@ -3865,6 +3933,7 @@ mod tests {
         still_covered: bool,
         expected: Option<&str>,
     ) {
+        let _guard = crate::test_support::plugin_registry_guard();
         const SLUG: &str = "redeclare-plugin";
         let declaration = |covers_the_lease: bool| {
             let mut reg = registration(SLUG);
