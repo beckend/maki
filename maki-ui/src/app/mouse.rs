@@ -109,7 +109,7 @@ impl App {
         // A finished tab has no input box, so the paste goes to the main
         // chat, the way typed keys do.
         if !self.chat_accepts_input() {
-            self.last_esc = None;
+            self.disarm_esc();
             self.set_active_chat(MAIN_CHAT);
         }
         let mut any_image = false;

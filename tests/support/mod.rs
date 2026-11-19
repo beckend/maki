@@ -18,6 +18,9 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
+#[cfg(unix)]
+pub mod tui;
+
 /// The model the mock answers for. A built-in provider, so the binary resolves
 /// it without a catalog download.
 pub const MOCK_MODEL: &str = "anthropic/claude-sonnet-4-20250514";
@@ -37,8 +40,14 @@ const CACHE_DIR: &str = "cache";
 const CONFIG_DIR: &str = "config";
 const CONTENT_LENGTH: &str = "content-length";
 const DATA_DIR: &str = "data";
+/// The answer to a request without a body: the model list of a provider
+/// that has none. The catalog is not a turn, and a warning about it would
+/// sit in the way of what a test waits for.
+const EMPTY_MODEL_LIST: &str = r#"{"data":[],"has_more":false}"#;
 const HOME: &str = "HOME";
 const JOURNAL: &str = "journal.ndjson";
+const KEEP_ALIVE: &[u8] = b": keep-alive\n\n";
+const KEEP_ALIVE_EVERY: Duration = Duration::from_millis(50);
 const LOOPBACK: &str = "127.0.0.1:0";
 const LOG_EXTENSION: &str = "log";
 const PATH: &str = "PATH";
@@ -59,37 +68,78 @@ const USER_DIRS: &[(&str, &str)] = &[
     ("XDG_CACHE_HOME", CACHE_DIR),
 ];
 
+/// What the mock does with a request.
+pub enum Reply {
+    /// The body of the answer, sent and closed.
+    Body(String),
+    /// Nothing is sent. The turn stays in flight until the client hangs up,
+    /// and the hang-up is the sign that the turn was cancelled.
+    Hold,
+}
+
 /// A provider on loopback that answers every request from one script and
 /// keeps what the client sent.
 pub struct MockProvider {
     base_url: String,
     requests: Arc<Mutex<Vec<Value>>>,
+    hung_up: Arc<Mutex<Vec<usize>>>,
 }
 
 impl MockProvider {
     /// Serves `answer` for every request. The answer gets the index of the
     /// request and the body the client sent.
     pub fn serve(answer: impl Fn(usize, &Value) -> String + Send + Sync + 'static) -> Self {
+        Self::serve_with(move |index, body| Reply::Body(answer(index, body)))
+    }
+
+    /// Serves every request from `reply`, which says whether the request is
+    /// answered or held open.
+    pub fn serve_with(reply: impl Fn(usize, &Value) -> Reply + Send + Sync + 'static) -> Self {
         let listener = TcpListener::bind(LOOPBACK).expect(BIND_FAILED);
         let base_url = format!("http://{}", listener.local_addr().expect(BIND_FAILED));
         let requests = Arc::new(Mutex::new(Vec::new()));
+        let hung_up = Arc::new(Mutex::new(Vec::new()));
         let log = Arc::clone(&requests);
+        let gone = Arc::clone(&hung_up);
+        let reply = Arc::new(reply);
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { return };
-                let Some(body) = read_body(&mut stream) else {
-                    continue;
-                };
-                let parsed: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
-                let index = {
-                    let mut guard = log.lock().unwrap_or_else(|e| e.into_inner());
-                    guard.push(parsed.clone());
-                    guard.len() - 1
-                };
-                write_sse(&mut stream, &answer(index, &parsed));
+                let log = Arc::clone(&log);
+                let gone = Arc::clone(&gone);
+                let reply = Arc::clone(&reply);
+                // A connection of its own: a held one keeps the turn in
+                // flight, and the next request has to be served meanwhile.
+                std::thread::spawn(move || {
+                    let Some(body) = read_body(&mut stream) else {
+                        return;
+                    };
+                    if body.is_empty() {
+                        // A request without a body is not a turn: the model
+                        // catalog the app fetches at startup. It gets an
+                        // answer of its own, so the app has nothing to warn
+                        // about while a test waits for the screen.
+                        write_json(&mut stream, EMPTY_MODEL_LIST);
+                        return;
+                    }
+                    let parsed: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                    let index = {
+                        let mut guard = log.lock().unwrap_or_else(|e| e.into_inner());
+                        guard.push(parsed.clone());
+                        guard.len() - 1
+                    };
+                    match reply(index, &parsed) {
+                        Reply::Body(body) => write_sse(&mut stream, &body),
+                        Reply::Hold => hold(&mut stream, &gone, index),
+                    }
+                });
             }
         });
-        Self { base_url, requests }
+        Self {
+            base_url,
+            requests,
+            hung_up,
+        }
     }
 
     /// The origin the provider answers on.
@@ -97,9 +147,18 @@ impl MockProvider {
         &self.base_url
     }
 
-    /// The bodies the client sent, in order.
+    /// The bodies of the turns the client sent, in order. A request without
+    /// a body is not a turn, and it is not in here.
     pub fn requests(&self) -> Vec<Value> {
         self.requests
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// The requests whose client hung up while the mock held them open.
+    pub fn hung_up(&self) -> Vec<usize> {
+        self.hung_up
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
@@ -136,6 +195,37 @@ fn write_sse(stream: &mut TcpStream, body: &str) {
     );
     let _ = stream.write_all(response.as_bytes());
     let _ = stream.flush();
+}
+
+/// One JSON answer, with the length the client needs to read it.
+fn write_json(stream: &mut TcpStream, body: &str) {
+    let response = format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let _ = stream.write_all(response.as_bytes());
+    let _ = stream.flush();
+}
+
+/// Keeps a request in flight: the body never ends, so the turn that waits
+/// for it waits until the client hangs up. The hang-up is recorded, because
+/// it is the only sign that the turn was cancelled rather than answered.
+fn hold(stream: &mut TcpStream, hung_up: &Arc<Mutex<Vec<usize>>>, index: usize) {
+    let head = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n";
+    if stream.write_all(head.as_bytes()).is_err() {
+        return;
+    }
+    let _ = stream.flush();
+    // A comment every so often: the client reads it as no event at all, and
+    // its read never stalls.
+    while stream.write_all(KEEP_ALIVE).is_ok() {
+        let _ = stream.flush();
+        std::thread::sleep(KEEP_ALIVE_EVERY);
+    }
+    hung_up
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(index);
 }
 
 /// One Anthropic SSE frame.

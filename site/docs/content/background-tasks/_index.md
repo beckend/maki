@@ -114,7 +114,7 @@ You can type to a moved subagent in its tab. Other task tabs have no input box, 
 
 `task_stop` only reaches tasks of its own chat. An unknown or finished id is an error that lists the running ids. A subagent inside a moved batch stops alone and at once, and what it did so far arrives with the batch result.
 
-`Esc` twice in a task's tab stops that task alone. What it started goes on working: a native run's children move up to its own parent, so a task the user stopped in front of them does not take its own workers down with it. `Ctrl+C` is the one that ends everything: the session's runs go down with it.
+`Esc` twice acts on the view it starts in: a task's tab stops that task alone, never the main chat. A native run's tab stops it even after the turn that started it ended, since the run outlives the turn. What it started goes on working: a native run's children move up to its own parent, so a task the user stopped in front of them does not take its own workers down with it. `Ctrl+C` is the one that ends everything: the session's runs go down with it.
 
 ## Results
 

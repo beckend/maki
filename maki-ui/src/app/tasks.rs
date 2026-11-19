@@ -748,9 +748,13 @@ impl App {
                 id: id.to_owned(),
                 plugin: Arc::clone(plugin),
             },
-            None if live && self.chat_index.get(id) == Some(&idx) => Action::CancelSubagent {
-                tool_use_id: id.to_owned(),
-            },
+            // A native run outlives the turn that started it, so the routing
+            // cache no longer holds it: its handle is its identity.
+            None if live && (self.chat_index.get(id) == Some(&idx) || native) => {
+                Action::CancelSubagent {
+                    tool_use_id: id.to_owned(),
+                }
+            }
             _ => return Err(format!("{NOT_RUNNING_ERR}{id}")),
         };
         // A native run's children move up to its own parent when it stops, so

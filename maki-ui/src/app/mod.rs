@@ -587,6 +587,10 @@ pub struct App {
     pub(super) selection_state: Option<SelectionState>,
     pub(super) clipboard: ClipboardState,
     pub(super) last_esc: Option<Instant>,
+    /// The chat a double Esc was armed in, so the second Esc acts on the
+    /// view the first one armed. `None` is an arming that names no view, and
+    /// it belongs to the view it is used in.
+    pub(super) last_esc_chat: Option<usize>,
     /// The last key was a `Ctrl+C` that copied, see [`Self::handle_ctrl`].
     quit_copied: bool,
     pub(super) last_quit: Option<Instant>,
@@ -739,6 +743,7 @@ impl App {
             selection_state: None,
             clipboard: ClipboardState::new(),
             last_esc: None,
+            last_esc_chat: None,
             quit_copied: false,
             last_quit: None,
             background_elsewhere: 0,
@@ -1000,14 +1005,27 @@ impl App {
     }
 
     /// Whether the agent behind the chat in front is at work: the main
-    /// chat's turn, or a task still working. The main chat waiting on a
-    /// background task is not, since a prompt starts right away.
+    /// chat's turn and what it has queued, or a task still working. The main
+    /// chat waiting on a background task is not, since a prompt starts right
+    /// away.
     pub(super) fn active_chat_working(&self) -> bool {
         if self.is_main_chat() {
-            self.status == Status::Streaming
+            self.parent_working()
         } else {
             self.chats[self.active_chat].task_status() == TaskStatus::Working
         }
+    }
+
+    /// The parent's own pending work: the turn it runs, the input queued
+    /// for it and the wake waiting for it. A background run is not the
+    /// parent's work and does not count: the parent's Esc leaves the runs
+    /// alone.
+    fn parent_working(&self) -> bool {
+        self.runs_turn()
+            || self.live_mailbox().is_some_and(|mailbox| {
+                let backlog = mailbox.backlog();
+                backlog.wake && self.takes_wake()
+            })
     }
 
     /// Stores this tab's focus into the mode every tab shares, so only the
@@ -2408,8 +2426,10 @@ impl App {
     /// A message typed while watching a running subagent is for that
     /// subagent, see [`Self::queue_for_subagent`]. `Esc` follows the chat in front
     /// too: armed twice in a running subagent's chat it cancels that subagent
-    /// alone. A chat without an input box, see [`Self::chat_accepts_input`],
-    /// answers only the mode toggle, and Esc goes back to the main chat.
+    /// alone, and the arming belongs to the chat it was made in, so it never
+    /// answers for another view. A chat without an input box, see
+    /// [`Self::chat_accepts_input`], answers only the mode toggle, and Esc goes
+    /// back to the main chat.
     ///
     /// While the agent in front works, `Esc` drops a selection and arms the
     /// cancel in the same press, for the reason [`Self::reserved_by_host`]
@@ -2424,7 +2444,7 @@ impl App {
             return match key.code {
                 KeyCode::Tab if !self.is_bash_input() => self.toggle_mode(),
                 KeyCode::Esc => {
-                    self.last_esc = None;
+                    self.disarm_esc();
                     self.set_active_chat(MAIN_CHAT);
                     vec![]
                 }
@@ -2437,7 +2457,7 @@ impl App {
                         .modifiers
                         .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
                 {
-                    self.last_esc = None;
+                    self.disarm_esc();
                     self.set_active_chat(MAIN_CHAT);
                     let mode = self.sync_input_mode();
                     self.handle_chat_key(key, sight, mode)
@@ -2492,7 +2512,7 @@ impl App {
             }
             InputAction::Passthrough(key) => {
                 if key.code != KeyCode::Esc {
-                    self.last_esc = None;
+                    self.disarm_esc();
                 }
                 match key.code {
                     KeyCode::Up if working => {
@@ -2512,12 +2532,34 @@ impl App {
         }
     }
 
-    fn handle_esc(&mut self, working: bool) -> Vec<Action> {
-        let in_subagent = !self.is_main_chat();
-        let armed = self
+    /// Arms the double Esc in the chat in front. The arming names the chat
+    /// it was made in, so a second Esc in another chat is not armed: it arms
+    /// that chat instead.
+    fn arm_esc(&mut self) {
+        self.last_esc = Some(Instant::now());
+        self.last_esc_chat = Some(self.active_chat);
+    }
+
+    fn disarm_esc(&mut self) {
+        self.last_esc = None;
+        self.last_esc_chat = None;
+    }
+
+    /// Whether the double Esc is armed in the chat in front.
+    fn esc_armed(&mut self) -> bool {
+        let fresh = self
             .last_esc
             .take()
-            .is_some_and(|t| t.elapsed() < self.status_bar.flash_duration);
+            .is_some_and(|at| at.elapsed() < self.status_bar.flash_duration);
+        fresh
+            && self
+                .last_esc_chat
+                .is_none_or(|chat| chat == self.active_chat)
+    }
+
+    fn handle_esc(&mut self, working: bool) -> Vec<Action> {
+        let in_subagent = !self.is_main_chat();
+        let armed = self.esc_armed();
         if armed {
             return if in_subagent {
                 self.handle_subagent_cancel()
@@ -2527,7 +2569,7 @@ impl App {
                 self.open_rewind_picker()
             };
         }
-        self.last_esc = Some(Instant::now());
+        self.arm_esc();
         let hint = if in_subagent || working {
             FLASH_CANCEL
         } else {
@@ -2774,7 +2816,13 @@ impl App {
 
     fn handle_subagent_cancel(&mut self) -> Vec<Action> {
         let id = self.active_task_id();
-        self.stop_task(&id).into_iter().collect()
+        match self.stop_task(&id) {
+            Ok(action) => vec![action],
+            Err(refusal) => {
+                self.flash(refusal);
+                vec![]
+            }
+        }
     }
 
     /// `None` means the owner has no [`Overlay`] of its own, as for the plan

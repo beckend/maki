@@ -10954,6 +10954,111 @@ fn stopping_a_native_run_leaves_the_work_it_started_alone() {
     );
 }
 
+/// A native run outlives the turn that started it, so the routing cache no
+/// longer holds it when the user stops it: its handle is its identity.
+#[test]
+fn double_esc_stops_a_native_run_after_the_turn_ended() {
+    const HANDLE: &str = "ag-k3x9ab";
+    let mut app = streaming_app();
+    let native = |event| {
+        subagent_msg_with_run_id(event, HANDLE, Some("reader"), maki_agent::BACKGROUND_RUN_ID)
+    };
+    app.update(native(AgentEvent::RunStarted {
+        handle: HANDLE.into(),
+        name: "reader".into(),
+        kind: "agent".into(),
+        parent: None,
+        depth: 1,
+        one_shot: false,
+    }));
+    // The work the reader started, with its own tab.
+    start_subagent(&mut app, "kid", "kid");
+    let kid = *app.chat_index.get("kid").expect("the kid has a tab");
+    app.chats[kid].parent = Some(TaskParent::Started(Arc::from(HANDLE)));
+
+    let reader = *app.chat_index.get(HANDLE).expect("the run has a tab");
+    app.active_chat = reader;
+    // The turn ends, and the routing cache goes with it.
+    app.status = Status::Idle;
+    app.chat_index.clear();
+    app.last_esc = Some(Instant::now());
+    let actions = app.update(Msg::Key(key(KeyCode::Esc)));
+
+    assert_eq!(actions.len(), 1);
+    assert!(matches!(
+        &actions[0],
+        Action::CancelSubagent { tool_use_id } if tool_use_id == HANDLE
+    ));
+    assert!(app.chats[reader].is_finished(), "the run in front stops");
+    assert!(
+        !app.chats[kid].is_finished(),
+        "the work it started goes on working"
+    );
+}
+
+/// The double Esc acts on the view it starts in: the arming in a run's tab
+/// does not answer for the parent.
+#[test]
+fn a_double_esc_in_a_run_tab_does_not_cancel_the_parent() {
+    const HANDLE: &str = "ag-k3x9ab";
+    let mut app = streaming_app();
+    let native = |event| {
+        subagent_msg_with_run_id(event, HANDLE, Some("reader"), maki_agent::BACKGROUND_RUN_ID)
+    };
+    app.update(native(AgentEvent::RunStarted {
+        handle: HANDLE.into(),
+        name: "reader".into(),
+        kind: "agent".into(),
+        parent: None,
+        depth: 1,
+        one_shot: false,
+    }));
+    let reader = *app.chat_index.get(HANDLE).expect("the run has a tab");
+    app.active_chat = reader;
+    // The first Esc arms the run's tab.
+    assert!(app.update(Msg::Key(key(KeyCode::Esc))).is_empty());
+
+    // The user goes back to the parent, whose turn is running.
+    app.set_active_chat(MAIN_CHAT);
+    let actions = app.update(Msg::Key(key(KeyCode::Esc)));
+
+    assert!(
+        !actions
+            .iter()
+            .any(|action| matches!(action, Action::CancelAgent { .. })),
+        "the parent's cancel is not the run's to answer"
+    );
+    assert!(!app.chats[reader].is_finished(), "the run goes on working");
+    assert_eq!(app.status, Status::Streaming, "the parent still works");
+}
+
+/// The parent has work queued for it, so the double Esc interrupts the
+/// parent instead of opening the rewind picker.
+#[test]
+fn double_esc_with_queued_input_cancels_the_parent() {
+    let mut app = test_app();
+    type_and_submit(&mut app, "hello");
+    app.status = Status::Idle;
+    app.run_id = 1;
+    app.state
+        .session_mut()
+        .push_message(Message::user("hello".into()));
+    app.queue_and_notify(queued_msg("queued"));
+    assert_eq!(app.queue.len(), 1);
+
+    let actions = app.update(Msg::Key(key(KeyCode::Esc)));
+    assert!(actions.is_empty());
+
+    let actions = app.update(Msg::Key(key(KeyCode::Esc)));
+    assert_eq!(actions.len(), 1, "the parent's turn is interrupted");
+    assert!(matches!(&actions[0], Action::CancelAgent { .. }));
+    assert!(
+        !app.rewind_picker.is_open(),
+        "the rewind picker stays closed"
+    );
+    assert!(app.queue.is_empty(), "the queued input goes with the turn");
+}
+
 #[test]
 fn subagent_cancel_then_navigate_back_main_unaffected() {
     let mut app = app_with_active_subagent();

@@ -347,7 +347,7 @@ impl App {
         self.close_all_overlays();
         self.permission_prompt.clear();
         self.status_bar.clear_flash();
-        self.last_esc = None;
+        self.disarm_esc();
         self.last_quit = None;
         self.background_moves = BackgroundMoves::default();
         self.early_finals.clear();
