@@ -32,12 +32,16 @@ const SPAWN_TOOL: &str = "spawn";
 const TOOL_ID: &str = "toolu_spawn";
 /// The label the run gets, so the test can see it on screen.
 const RUN_LABEL: &str = "esc-e2e-reader";
+/// The label of the run in the status bar, when its view is in front.
+const RUN_LABEL_IN_BAR: &str = "[esc-e2e-reader]";
 /// The prompt the run gets, so the test can tell its request from the
 /// parent's.
 const RUN_PROMPT: &str = "run-marker-42";
-/// What the app draws while it works.
+/// What the app draws while it works. It is the terminal title, an escape
+/// sequence the app writes whole.
 const WORKING: &str = "state=working";
-/// What the app draws when it has nothing to do.
+/// What the app draws when it has nothing to do. It is the terminal title,
+/// an escape sequence the app writes whole.
 const IDLE: &str = "state=idle";
 /// The hint the app draws when the first Esc armed the cancel.
 const CANCEL_HINT: &str = "Press esc again to stop";
@@ -129,6 +133,40 @@ fn run_request(provider: &MockProvider) -> Option<usize> {
     })
 }
 
+/// The terminal writes only the cells that change, so a word can come in
+/// pieces: the diff skips a cell whose character did not change and moves
+/// the cursor over it. The screen is put back together, so the search finds
+/// the word the user sees.
+#[test]
+fn a_word_the_terminal_wrote_in_pieces_is_one_word_again() {
+    // The status bar before the flash: the warning about the provider the
+    // app fell back to, whose letters the flash shares.
+    let before = b"\x1b[40;1H\x1b[38;2;255;180;84m \xe2\xa0\x8b\x1b[1m\x1b[38;2;149;230;203m [BUILD]\x1b[22m\x1b[39m Opencode Go: unknown provider 'opencode-go' (using static fallback)\x1b[38;2;90;102;115m..pX1PCD5";
+    // The flash: the same letters as the warning, so the diff skips them
+    // and the word arrives in four pieces.
+    let flash = b"\x1b[40;12H\x1b[38;2;255;143;64mPr\x1b[40;15H\x1b[38;2;255;143;64mss esc agai\x1b[40;27H\x1b[38;2;255;143;64m t\x1b[40;30H\x1b[38;2;255;143;64m stop...";
+    let mut bytes = before.to_vec();
+    bytes.extend_from_slice(flash);
+
+    assert!(
+        !String::from_utf8_lossy(&bytes).contains(CANCEL_HINT),
+        "the bytes do not hold the word in one piece"
+    );
+    let screen = support::tui::screen_of(&bytes);
+    assert!(
+        screen.iter().any(|row| row.contains(CANCEL_HINT)),
+        "the screen holds the word: {screen:?}"
+    );
+
+    // A word that is drawn across two rows is not a word on the screen.
+    let across = b"\x1b[40;100HPress\x1b[39;1H esc again to stop";
+    let screen = support::tui::screen_of(across);
+    assert!(
+        !screen.iter().any(|row| row.contains(CANCEL_HINT)),
+        "a word across two rows is no word: {screen:?}"
+    );
+}
+
 /// The parent's view: the turn in front is the parent's own, and the double
 /// Esc ends it.
 #[test]
@@ -146,7 +184,11 @@ fn a_double_esc_in_the_parent_view_stops_the_parent_turn() {
         support::wait_for(|| provider.requests().len() == 1),
         "the request reached the provider"
     );
-    assert!(tui.wait_for(WORKING), "the app is working: {}", tui.drawn());
+    assert!(
+        tui.wait_for_title(WORKING),
+        "the app is working: {}",
+        tui.drawn()
+    );
 
     // The first Esc arms the cancel, and the app says so.
     let before = tui.mark();
@@ -171,7 +213,7 @@ fn a_double_esc_in_the_parent_view_stops_the_parent_turn() {
         tui.drawn_since(before)
     );
     assert!(
-        tui.wait_for_since(before, IDLE),
+        tui.wait_for_title_since(before, IDLE),
         "the app is idle: {}",
         tui.drawn_since(before)
     );
@@ -237,6 +279,11 @@ fn a_double_esc_in_a_run_view_stops_that_run_and_not_the_parent() {
         "the run's view is in front: {}",
         tui.drawn()
     );
+    assert!(
+        tui.wait_for(RUN_LABEL_IN_BAR),
+        "the status bar names the run: {}",
+        tui.screen().join("\n")
+    );
 
     // The first Esc arms the cancel in the run's view, and the app says so.
     let before = tui.mark();
@@ -262,9 +309,9 @@ fn a_double_esc_in_a_run_view_stops_that_run_and_not_the_parent() {
         tui.drawn_since(before)
     );
     assert!(
-        !tui.drawn().contains(TURN_CANCELLED),
+        !tui.shows(TURN_CANCELLED),
         "the parent's turn went on: {}",
-        tui.drawn()
+        tui.screen().join("\n")
     );
     assert!(tui.alive(), "a cancel is not an exit");
 }
