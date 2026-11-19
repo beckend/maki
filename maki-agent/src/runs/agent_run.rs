@@ -26,6 +26,8 @@ use crate::tools::test_support::stub_ctx;
 
 pub(super) const PARENT: &str = "PARENT-SCRIPT";
 pub(super) const CHILD: &str = "CHILD-TASK";
+/// A message cap that is clearly not the default, so a test proves it is in force.
+pub(super) const TEST_MAX_MESSAGE_BYTES: u32 = 64;
 
 pub(super) enum Step {
     Reply(StreamResponse),
@@ -1185,15 +1187,21 @@ mod hub {
     #[tokio::test]
     async fn send_errors_are_the_documented_codes() {
         let script = Script::new(vec![(CHILD, vec![])]);
-        let rig = rig(&script);
+        let rig = rig_with(
+            &script,
+            UnitLimits {
+                max_message_bytes: TEST_MAX_MESSAGE_BYTES,
+                ..UnitLimits::default()
+            },
+        );
         let a = spawn(&rig, CHILD, json!({})).await;
         let main = rig.hub.main();
         let send = |to, text: String| rig.hub.send(main, to, text, DeliveryKind::Steer);
         assert_eq!(send(main, "x".into()).unwrap_err(), UnitError::SelfSend);
-        let big = "x".repeat(crate::runs::inbox::MAX_MESSAGE_BYTES + 1);
+        let big = "x".repeat(TEST_MAX_MESSAGE_BYTES as usize + 1);
         assert_eq!(
             send(a.id, big).unwrap_err().to_string(),
-            "TOO_LARGE max=16384"
+            format!("TOO_LARGE max={TEST_MAX_MESSAGE_BYTES}")
         );
         assert_eq!(
             send(UnitId::new(), "x".into()).unwrap_err(),
@@ -2600,6 +2608,28 @@ mod revive {
         assert_eq!(saved.len(), first_turn + 2, "the follow-up and its reply");
         // Same identity.
         assert_eq!(rig.hub.get(ack.id).unwrap().handle, ack.handle);
+    }
+
+    /// A revived run takes the hub's message cap like any other run.
+    #[tokio::test]
+    async fn a_revive_refuses_a_message_over_the_cap() {
+        let script = Script::new(vec![(CHILD, vec![Step::Reply(reply("the answer"))])]);
+        let (rig, _dir) = journaled(
+            &script,
+            UnitLimits {
+                max_message_bytes: TEST_MAX_MESSAGE_BYTES,
+                ..UnitLimits::default()
+            },
+        );
+        let ack = spawn(&rig, CHILD, json!({})).await;
+        assert_eq!(settle(&rig, ack.id).await.state.label(), "idle");
+        stop(&rig, ack.id).await;
+        let big = "x".repeat(TEST_MAX_MESSAGE_BYTES as usize + 1);
+        let err = revive(&rig, ack.id, &big).await.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!("TOO_LARGE max={TEST_MAX_MESSAGE_BYTES}")
+        );
     }
 
     /// A run the journal lost is taken back from what the session kept: the

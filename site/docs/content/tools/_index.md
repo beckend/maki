@@ -326,7 +326,7 @@ transcript, so a result that is not sent is lost.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `message` | string | yes | Up to 16 KiB. Be self-contained. |
+| `message` | string | yes | Not capped by default. Be self-contained. |
 | `mode` | string | no | steer (default): next step of a running recipient, wakes an idle one. followup: after the recipient's current turn ends, as its own turn. quiet: delivered at the recipient's next model request, never wakes. |
 | `to` | string | yes | Run id or name, or "parent" / "main". |
 

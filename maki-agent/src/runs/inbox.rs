@@ -23,8 +23,6 @@ fn settled_agent(info: &NoticeInfo) -> bool {
     info.kind == NoticeKind::Settled && info.handle.starts_with(super::AGENT_HANDLE_PREFIX)
 }
 
-/// Hard limit of one message, in bytes.
-pub const MAX_MESSAGE_BYTES: usize = 16384;
 /// Pending items per inbox.
 pub const MAX_PENDING: usize = 32;
 /// Pending `Followup` items per inbox.
@@ -174,6 +172,8 @@ struct State {
 
 pub struct Inbox {
     state: Mutex<State>,
+    /// Largest message this inbox takes, in bytes; [`u32::MAX`] is no cap.
+    max_message_bytes: usize,
     wake_tx: flume::Sender<()>,
     wake_rx: flume::Receiver<()>,
 }
@@ -188,16 +188,17 @@ pub(crate) enum Accepted {
 
 pub(crate) struct Guard<'a> {
     state: MutexGuard<'a, State>,
+    max_message_bytes: usize,
 }
 
 impl Default for Inbox {
     fn default() -> Self {
-        Self::new(Phase::Running)
+        Self::new(Phase::Running, u32::MAX as usize)
     }
 }
 
 impl Inbox {
-    pub(crate) fn new(phase: Phase) -> Self {
+    pub(crate) fn new(phase: Phase, max_message_bytes: usize) -> Self {
         let (wake_tx, wake_rx) = flume::unbounded();
         Self {
             state: Mutex::new(State {
@@ -207,6 +208,7 @@ impl Inbox {
                 buckets: HashMap::new(),
                 dropped_notices: 0,
             }),
+            max_message_bytes,
             wake_tx,
             wake_rx,
         }
@@ -215,6 +217,7 @@ impl Inbox {
     pub(crate) fn lock(&self) -> Guard<'_> {
         Guard {
             state: self.state.lock().unwrap_or_else(|e| e.into_inner()),
+            max_message_bytes: self.max_message_bytes,
         }
     }
 
@@ -441,9 +444,9 @@ impl Guard<'_> {
         if self.state.phase == Phase::Closed {
             return Err(UnitError::RecipientTerminal);
         }
-        if item.text.len() > MAX_MESSAGE_BYTES {
+        if item.text.len() > self.max_message_bytes {
             return Err(UnitError::TooLarge {
-                max: MAX_MESSAGE_BYTES,
+                max: self.max_message_bytes,
             });
         }
         let state = &mut *self.state;
@@ -644,18 +647,24 @@ mod tests {
             .enqueue(item(n, UnitId::new(), kind, text, now), now)
     }
 
+    /// A cap that is clearly not the default, so a test proves it is in force.
+    const TEST_MAX_MESSAGE_BYTES: usize = 64;
+
     #[test]
     fn caps_reject_toolarge_and_full() {
-        let inbox = Inbox::default();
-        let big = "x".repeat(MAX_MESSAGE_BYTES + 1);
+        let inbox = Inbox::new(Phase::Running, TEST_MAX_MESSAGE_BYTES);
+        let big = "x".repeat(TEST_MAX_MESSAGE_BYTES + 1);
         let err = put(&inbox, 1, DeliveryKind::Steer, &big).unwrap_err();
-        assert_eq!(err.to_string(), "TOO_LARGE max=16384");
+        assert_eq!(
+            err.to_string(),
+            format!("TOO_LARGE max={TEST_MAX_MESSAGE_BYTES}")
+        );
         assert!(inbox.is_empty());
         put(
             &inbox,
             2,
             DeliveryKind::Steer,
-            &"x".repeat(MAX_MESSAGE_BYTES),
+            &"x".repeat(TEST_MAX_MESSAGE_BYTES),
         )
         .unwrap();
 
@@ -673,6 +682,13 @@ mod tests {
             put(&inbox, 99, DeliveryKind::Quiet, "q"),
             Err(UnitError::InboxFull { .. })
         ));
+    }
+
+    #[test]
+    fn the_default_takes_a_message_far_over_the_old_cap() {
+        let inbox = Inbox::default();
+        put(&inbox, 1, DeliveryKind::Steer, &"x".repeat(64 * 1024)).unwrap();
+        assert_eq!(inbox.len(), 1);
     }
 
     #[test]
@@ -761,7 +777,7 @@ mod tests {
         let now = Instant::now();
         for n in 0..4 {
             let from = UnitId::new();
-            let text = "x".repeat(MAX_MESSAGE_BYTES);
+            let text = "x".repeat(DRAIN_BYTES / 2);
             inbox
                 .lock()
                 .enqueue(item(n, from, DeliveryKind::Quiet, &text, now), now)

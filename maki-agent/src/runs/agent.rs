@@ -382,6 +382,7 @@ impl AgentRun {
         root: &CancelToken,
         info: SubagentInfo,
         broker: Arc<PermissionBroker>,
+        max_message_bytes: usize,
     ) -> Arc<Self> {
         let (trigger, token) = root.child();
         Arc::new(Self {
@@ -391,7 +392,7 @@ impl AgentRun {
             soft: AtomicBool::new(false),
             timed_out: AtomicBool::new(false),
             info,
-            inbox: Arc::new(Inbox::new(Phase::Running)),
+            inbox: Arc::new(Inbox::new(Phase::Running, max_message_bytes)),
             broker,
             #[cfg(test)]
             pauses: Mutex::default(),

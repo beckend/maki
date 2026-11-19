@@ -230,9 +230,10 @@ impl UnitHub {
         text: String,
         kind: DeliveryKind,
     ) -> Result<SendAck, UnitError> {
-        if text.len() > inbox::MAX_MESSAGE_BYTES {
+        let max_message_bytes = self.limits.max_message_bytes as usize;
+        if text.len() > max_message_bytes {
             return Err(UnitError::TooLarge {
-                max: inbox::MAX_MESSAGE_BYTES,
+                max: max_message_bytes,
             });
         }
         let id = plan.id;
@@ -295,7 +296,12 @@ impl UnitHub {
             control: Arc::default(),
             parent_call: None,
         };
-        let run = AgentRun::new(&self.cancel, info, broker);
+        let run = AgentRun::new(
+            &self.cancel,
+            info,
+            broker,
+            self.limits.max_message_bytes as usize,
+        );
         table.agents.insert(id, Arc::clone(&run));
         table.pool.request(id, false);
         table.promote(max_agents);
@@ -334,7 +340,9 @@ impl UnitHub {
         self.ack_insert(from, msg_id, id, AckState::Accepted);
         self.release(table);
         for (_, redone) in pending {
-            let _ = self.deliver(id, &run.inbox, redone, now, false);
+            if let Err(e) = self.deliver(id, &run.inbox, redone, now, false) {
+                tracing::warn!(%e, handle = %plan.handle, "could not redeliver a pending message");
+            }
         }
         if let Err(e) = self.deliver(id, &run.inbox, item, now, false) {
             self.acks().remove(from, msg_id);

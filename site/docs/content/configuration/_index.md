@@ -167,6 +167,7 @@ With 0 you see only the header. The read, index and list tools default to 0, bec
 | `max_shells_per_owner` | u32 | `4294967295` | 1 | Shell runs one run may have running at once; unlimited by default |
 | `max_queue` | u32 | `4294967295` | 1 | Agent runs that may wait for a free slot; unlimited by default. A further `spawn` fails with QUEUE_FULL |
 | `spawn_per_minute` | u32 | `4294967295` | 1 | Runs one run may start per rolling minute; unlimited by default |
+| `max_message_bytes` | u32 | `4294967295` | 1 | Largest message one run may send, in bytes; unlimited by default |
 | `default_timeout_secs` | u64 | `86400` | 1 | Wall clock limit of an agent run (seconds) unless `spawn` sets `timeout_secs`; counted from when it starts working. A delegated child works unattended, so the default is the session maximum rather than a short leash |
 | `max_timeout_secs` | u64 | `86400` | 1 | Largest `timeout_secs` a `spawn` may ask for (seconds); larger values are lowered to it |
 | `permission_timeout_secs` | u64 | `120` | 1 | How long a run's permission prompt waits for the user (seconds) before it is denied; the run gives up its slot meanwhile |

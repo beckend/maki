@@ -43,7 +43,6 @@ pub const FLUSH_INTERVAL: Duration = Duration::from_millis(250);
 /// How long a critical record waits for queue room before it is dropped.
 const CRITICAL_WAIT: Duration = Duration::from_secs(5);
 pub const QUEUE_CAP: usize = 4096;
-pub const MAX_BODY: usize = 16 * 1024;
 /// A journal line longer than this is corrupt: records are a few hundred bytes.
 pub const MAX_LINE: usize = 1024 * 1024;
 /// Terminal runs older than this are dropped at compaction.
@@ -278,7 +277,7 @@ impl Replay {
     pub fn parse_reader(reader: impl BufRead) -> Self {
         let mut replay = Self::default();
         let mut n = 0;
-        for_each_line(reader, |line, torn_tail| {
+        for_each_line(reader, MAX_LINE, |line, torn_tail| {
             n += 1;
             let Some(line) = line else {
                 warn!(line = n, "skipping oversized journal line");
@@ -467,15 +466,19 @@ impl Replay {
 }
 
 /// Calls `f(line, torn_tail)` for every line without its newline; `line` is
-/// `None` for one longer than [`MAX_LINE`], which is consumed but not kept.
+/// `None` for one longer than `max_line`, which is consumed but not kept.
 /// `torn_tail` marks a last line with no newline.
-fn for_each_line(mut reader: impl BufRead, mut f: impl FnMut(Option<&[u8]>, bool)) {
+fn for_each_line(
+    mut reader: impl BufRead,
+    max_line: usize,
+    mut f: impl FnMut(Option<&[u8]>, bool),
+) {
     let mut buf = Vec::new();
     loop {
         buf.clear();
         let got = match reader
             .by_ref()
-            .take(MAX_LINE as u64 + 1)
+            .take(max_line.saturating_add(1) as u64)
             .read_until(b'\n', &mut buf)
         {
             Ok(0) | Err(_) => return,
@@ -484,7 +487,7 @@ fn for_each_line(mut reader: impl BufRead, mut f: impl FnMut(Option<&[u8]>, bool
         let newline = buf.last() == Some(&b'\n');
         if newline {
             buf.pop();
-        } else if got > MAX_LINE {
+        } else if got > max_line {
             // Skip the rest of the oversized line.
             let mut ended = false;
             loop {
@@ -514,7 +517,9 @@ fn for_each_line(mut reader: impl BufRead, mut f: impl FnMut(Option<&[u8]>, bool
     }
 }
 
-/// Message bodies by id; a torn, corrupt or oversized line is skipped.
+/// Message bodies by id; a torn or corrupt line is skipped. A body is as
+/// long as the message it holds, so no line here is cut: the run inbox caps
+/// the message, and what it took is what comes back.
 pub fn read_bodies(dir: &Path) -> HashMap<String, String> {
     #[derive(Deserialize)]
     struct Line {
@@ -525,7 +530,7 @@ pub fn read_bodies(dir: &Path) -> HashMap<String, String> {
     let Ok(file) = File::open(dir.join(MESSAGES_FILE)) else {
         return out;
     };
-    for_each_line(io::BufReader::new(file), |line, _| {
+    for_each_line(io::BufReader::new(file), usize::MAX, |line, _| {
         if let Some(l) = line.and_then(|l| serde_json::from_slice::<Line>(l).ok()) {
             out.insert(l.id, l.body);
         }
@@ -873,11 +878,7 @@ impl Writer {
     }
 
     fn write_body(&mut self, id: &str, body: &str) -> io::Result<()> {
-        let mut end = body.len().min(MAX_BODY);
-        while !body.is_char_boundary(end) {
-            end -= 1;
-        }
-        let line = serde_json::json!({"id": id, "body": &body[..end]});
+        let line = serde_json::json!({"id": id, "body": body});
         let mut file = private_options().open(self.dir.join(MESSAGES_FILE))?;
         writeln!(file, "{line}")
     }
@@ -998,6 +999,10 @@ mod tests {
     use std::sync::atomic::AtomicU64;
 
     use super::*;
+
+    /// Longer than the old 16 KiB cut and than a journal line: the body is
+    /// written whole, so it has to come back whole.
+    const BIG_BODY: usize = 1024 * 1024 + 100;
 
     fn spawn(handle: &str) -> JournalRecord {
         JournalRecord::Spawn(SpawnRec {
@@ -1145,12 +1150,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let j = open(dir.path());
         j.append(spawn("ag-1"));
-        let big = "x".repeat(MAX_BODY + 100);
+        let big = "x".repeat(BIG_BODY);
         j.append(JournalRecord::Msg(MsgRec {
             id: "m-1".into(),
             to: "ag-1".into(),
             stage: "accepted".into(),
-            body: Some(big),
+            body: Some(big.clone()),
             ..MsgRec::default()
         }));
         j.append(JournalRecord::Msg(MsgRec {
@@ -1166,7 +1171,7 @@ mod tests {
             ..AckRec::default()
         }));
         let r = j.replay();
-        assert_eq!(r.messages[0].rec.body.as_ref().unwrap().len(), MAX_BODY);
+        assert_eq!(r.messages[0].rec.body.as_ref().unwrap(), &big);
         assert!(r.messages[0].pending() && !r.messages[1].pending());
         let line = fs::read_to_string(dir.path().join(JOURNAL_FILE)).unwrap();
         assert!(!line.contains("second"), "bodies stay out of the journal");
@@ -1175,7 +1180,7 @@ mod tests {
         let j = open(dir.path());
         let r = j.replay();
         assert_eq!(r.messages.len(), 1);
-        assert_eq!(r.messages[0].rec.body.as_ref().unwrap().len(), MAX_BODY);
+        assert_eq!(r.messages[0].rec.body.as_ref().unwrap(), &big);
         assert!(
             !fs::read_to_string(dir.path().join(MESSAGES_FILE))
                 .unwrap()

@@ -40,7 +40,7 @@ changing the UI tab model beyond consuming new events.
 | Notice dedupe | wait/kill only | none | any consuming read (wait, runs peek, stop) |
 | Wake budget | opt-in, jobs only | none | default 3 consecutive notice wakes on main, agents and shells |
 | Delivery acks | accepted only | none | accepted, delivered |
-| Inbox bounds | unbounded | mailbox 100 (`live_session.rs:18`) | 32 pending, 16 KiB/message, per-pair rate limit |
+| Inbox bounds | unbounded | mailbox 100 (`live_session.rs:18`) | 32 pending, message size uncapped unless set, per-pair rate limit |
 | Siblings | not in core | no | parent/child and `main` by default; siblings via config only |
 | Crash | notice lost, ids dangle | stranded tabs dropped | journal, `lost` state, notice on next wake |
 | Stop | request, no escalation, no cascade | `cancel_all` per run | cascade by default, TERM, grace 5 s, KILL, returns after settle |
@@ -358,7 +358,7 @@ mid-run progress.
 ```json
 {"type":"object","required":["to","message"],"properties":{
   "to": {"type":"string","description":"Run id or name, or \"parent\" / \"main\"."},
-  "message": {"type":"string","description":"Up to 16 KiB. Be self-contained."},
+  "message": {"type":"string","description":"Not capped by default. Be self-contained."},
   "mode": {"enum":["steer","followup","quiet"],"description":"steer (default): next step of a running recipient, wakes an idle one. followup: after the recipient's current turn ends, as its own turn. quiet: delivered at the recipient's next model request, never wakes."}
 }}
 ```
@@ -366,9 +366,9 @@ mid-run progress.
 Result: `message m-17 queued for ag-k3x9ab (running); use runs(id) to see delivery`. Stable error
 codes: `UNKNOWN_RUN`, `NOT_REACHABLE` (outside tree or policy, including siblings when off),
 `RECIPIENT_TERMINAL` (shells, one_shot completed, unrepairable), `NOT_AGENT` (shells take no
-messages in v1), `INBOX_FULL retry_after=Ns`, `TOO_LARGE max=16384`, `RATE_LIMITED
-retry_after=Ns`, `HELD` (ping-pong guard, 4.7), `SELF`. A `send` to a terminal revivable agent
-revives it (7.4).
+messages in v1), `INBOX_FULL retry_after=Ns`, `TOO_LARGE max=N` (N is the message cap in force),
+`RATE_LIMITED retry_after=Ns`, `HELD` (ping-pong guard, 4.7), `SELF`. A `send` to a terminal
+revivable agent revives it (7.4).
 
 ### 3.3 `wait`
 
@@ -572,7 +572,7 @@ pub struct InboxItem {
     pub id: MessageId,         // "m-17", per-hub counter
     pub from: UnitId,
     pub kind: DeliveryKind,
-    pub text: String,          // <= 16384 bytes
+    pub text: String,          // <= the hub's message cap (uncapped by default)
     pub enqueued: Instant,
 }
 pub enum DeliveryKind {
@@ -701,7 +701,7 @@ context.
 
 | Limit | Default |
 |---|---|
-| Message size | 16384 bytes, hard reject `TOO_LARGE` |
+| Message size | uncapped by default (`[agent.runs] max_message_bytes`), hard reject `TOO_LARGE` |
 | Pending items per inbox | 32, `INBOX_FULL retry_after` |
 | Pending Followups per inbox | 8 |
 | Notice text | 4096 bytes (3072 head, 768 tail) |
@@ -865,6 +865,7 @@ so docgen emits it. Defaults:
 | `default_timeout` | 30 min | wall clock for every agent unless `spawn.timeout_secs` says otherwise |
 | `session_max_runs` | 64 | the only spawn backstop (6.3) |
 | `siblings` | false | sibling `send` (4.7) |
+| `max_message_bytes` | uncapped | a message over the cap is refused with `TOO_LARGE` (4.7) |
 
 Only `Running` agents consume an agent slot. Capacity gates execution, not existence
 (dsh's `ACTIVATION_LIMIT_REACHED` is an error; here excess spawns queue). Admission is FIFO.
@@ -1025,7 +1026,7 @@ created `0700`:
 
 ```
 journal.ndjson          append-only event log (durable source for the run table)
-messages.ndjson         message bodies (<= 16 KiB each), so messages to a crashed child survive
+messages.ndjson         message bodies (whole, as long as the message), so messages to a crashed child survive
 <handle>.log            shell merged output, append-only
 <handle>.pid            pgid and process start time of a live shell (orphan cleanup)
 <handle>.result.txt     spill of a truncated agent result (2.6)
@@ -1054,9 +1055,9 @@ Rules:
   `fsync` on `spawn`, `term` and `mark`, other records flushed every 250 ms and at shutdown.
   A torn last line is ignored on replay. Journal write failure degrades to memory-only with
   one warning notice and never fails a spawn.
-* Message bodies go to `messages.ndjson` (separate file, same torn-line rules), up to 16 KiB
-  each, written before `send` returns `accepted`; bodies of delivered messages are dead weight
-  and dropped at compaction. Pending bodies are redelivered after a crash (cold revive,
+* Message bodies go to `messages.ndjson` (separate file, same torn-line rules), written whole, as
+  long as the message, before `send` returns `accepted`; bodies of delivered messages are dead
+  weight and dropped at compaction. Pending bodies are redelivered after a crash (cold revive,
   7.4).
 * Spec: `spawn` persists the full `AgentSpec` (model, tool filter, schema, audience,
   thinking, timeout) so cold revive rebuilds the same agent.

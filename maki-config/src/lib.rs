@@ -99,6 +99,8 @@ pub const DEFAULT_RUNS_MAX_SHELLS: u32 = u32::MAX;
 pub const DEFAULT_RUNS_MAX_SHELLS_PER_OWNER: u32 = u32::MAX;
 pub const DEFAULT_RUNS_MAX_QUEUE: u32 = u32::MAX;
 pub const DEFAULT_RUNS_SPAWN_PER_MINUTE: u32 = u32::MAX;
+/// A message is not capped unless a host caps it.
+pub const DEFAULT_RUNS_MAX_MESSAGE_BYTES: u32 = u32::MAX;
 pub const DEFAULT_RUNS_AGENT_TIMEOUT_SECS: u64 = 86_400;
 pub const DEFAULT_RUNS_MAX_TIMEOUT_SECS: u64 = 86_400;
 pub const MIN_RUNS_MAX_DEPTH: u32 = 1;
@@ -852,6 +854,7 @@ pub struct RunsFileConfig {
     pub max_shells_per_owner: Option<u32>,
     pub max_queue: Option<u32>,
     pub spawn_per_minute: Option<u32>,
+    pub max_message_bytes: Option<u32>,
     pub default_timeout_secs: Option<u64>,
     pub max_timeout_secs: Option<u64>,
     pub permission_timeout_secs: Option<u64>,
@@ -1613,6 +1616,9 @@ pub struct RunsConfig {
     #[config(default = DEFAULT_RUNS_SPAWN_PER_MINUTE, min = MIN_RUNS_LIMIT, desc = "Runs one run may start per rolling minute; unlimited by default")]
     pub spawn_per_minute: u32,
 
+    #[config(default = DEFAULT_RUNS_MAX_MESSAGE_BYTES, min = MIN_RUNS_LIMIT, desc = "Largest message one run may send, in bytes; unlimited by default")]
+    pub max_message_bytes: u32,
+
     #[config(default = DEFAULT_RUNS_AGENT_TIMEOUT_SECS, min = MIN_RUNS_TIMEOUT_SECS, desc = "Wall clock limit of an agent run (seconds) unless `spawn` sets `timeout_secs`; counted from when it starts working. A delegated child works unattended, so the default is the session maximum rather than a short leash")]
     pub default_timeout_secs: u64,
 
@@ -1659,6 +1665,9 @@ impl RunsConfig {
             spawn_per_minute: file
                 .spawn_per_minute
                 .unwrap_or(DEFAULT_RUNS_SPAWN_PER_MINUTE),
+            max_message_bytes: file
+                .max_message_bytes
+                .unwrap_or(DEFAULT_RUNS_MAX_MESSAGE_BYTES),
             default_timeout_secs: file
                 .default_timeout_secs
                 .unwrap_or(DEFAULT_RUNS_AGENT_TIMEOUT_SECS),
@@ -3219,6 +3228,7 @@ mod tests {
     #[test_case("max_shells_per_owner" ; "max_shells_per_owner")]
     #[test_case("max_queue" ; "max_queue")]
     #[test_case("spawn_per_minute" ; "spawn_per_minute")]
+    #[test_case("max_message_bytes" ; "max_message_bytes")]
     #[test_case("default_timeout_secs" ; "default_timeout_secs")]
     #[test_case("max_timeout_secs" ; "max_timeout_secs")]
     #[test_case("permission_timeout_secs" ; "permission_timeout_secs")]
@@ -3240,9 +3250,18 @@ mod tests {
                 runs.max_shells_per_owner,
                 runs.max_queue,
                 runs.spawn_per_minute,
+                runs.max_message_bytes,
                 runs.default_timeout_secs
             ),
-            (u32::MAX, u32::MAX, u32::MAX, u32::MAX, u32::MAX, 86_400)
+            (
+                u32::MAX,
+                u32::MAX,
+                u32::MAX,
+                u32::MAX,
+                u32::MAX,
+                u32::MAX,
+                86_400
+            )
         );
     }
 

@@ -958,7 +958,7 @@ impl UnitHub {
             events: events.with_run_id(crate::BACKGROUND_RUN_ID),
             cancel,
             cancel_root: Mutex::new(Some(trigger)),
-            main_inbox: Arc::new(Inbox::new(Phase::Idle)),
+            main_inbox: Arc::new(Inbox::new(Phase::Idle, limits.max_message_bytes as usize)),
             wake: Mutex::new(WakeBudget::default()),
             main_busy: AtomicBool::new(false),
             notices_in_flight: AtomicUsize::new(0),
@@ -1249,7 +1249,12 @@ impl UnitHub {
                     control: Arc::default(),
                     parent_call: None,
                 };
-                let run = AgentRun::new(&self.cancel, info, broker);
+                let run = AgentRun::new(
+                    &self.cancel,
+                    info,
+                    broker,
+                    self.limits.max_message_bytes as usize,
+                );
                 table.agents.insert(id, Arc::clone(&run));
                 Some((spec, launch, run))
             }
@@ -2234,9 +2239,10 @@ impl UnitHub {
         if from == to {
             return Err(UnitError::SelfSend);
         }
-        if text.len() > inbox::MAX_MESSAGE_BYTES {
+        let max_message_bytes = self.limits.max_message_bytes as usize;
+        if text.len() > max_message_bytes {
             return Err(UnitError::TooLarge {
-                max: inbox::MAX_MESSAGE_BYTES,
+                max: max_message_bytes,
             });
         }
         let id = MessageId(self.message_seq.fetch_add(1, Ordering::Relaxed) + 1);
@@ -3109,6 +3115,46 @@ mod tests {
             hub.spawn(first.id, request(RunKind::Shell, "d"))
                 .unwrap_err(),
             UnitError::SpawnLimit
+        );
+    }
+
+    /// A message cap that is clearly not the default, so a test proves it is in force.
+    const TEST_MAX_MESSAGE_BYTES: u32 = 64;
+
+    #[tokio::test]
+    async fn a_message_over_the_cap_is_refused_with_that_cap() {
+        let hub = hub_with(UnitLimits {
+            max_message_bytes: TEST_MAX_MESSAGE_BYTES,
+            ..UnitLimits::default()
+        });
+        let main = hub.main();
+        let child = hub.spawn(main, request(RunKind::Agent, "one")).unwrap();
+        let big = "x".repeat(TEST_MAX_MESSAGE_BYTES as usize + 1);
+        assert_eq!(
+            hub.send(child.id, main, big, DeliveryKind::Steer)
+                .unwrap_err()
+                .to_string(),
+            format!("TOO_LARGE max={TEST_MAX_MESSAGE_BYTES}")
+        );
+        assert!(
+            hub.send(
+                child.id,
+                main,
+                "x".repeat(TEST_MAX_MESSAGE_BYTES as usize),
+                DeliveryKind::Steer
+            )
+            .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_default_takes_a_message_far_over_the_old_cap() {
+        let hub = hub();
+        let main = hub.main();
+        let child = hub.spawn(main, request(RunKind::Agent, "one")).unwrap();
+        assert!(
+            hub.send(child.id, main, "x".repeat(64 * 1024), DeliveryKind::Steer)
+                .is_ok()
         );
     }
 

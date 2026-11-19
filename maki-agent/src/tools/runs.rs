@@ -338,7 +338,7 @@ impl Which {
                 "required": ["to", "message"],
                 "properties": {
                     "to": {"type": "string", "description": "Run id or name, or \"parent\" / \"main\"."},
-                    "message": {"type": "string", "description": "Up to 16 KiB. Be self-contained."},
+                    "message": {"type": "string", "description": "Not capped by default. Be self-contained."},
                     "mode": {"type": "string", "enum": ["steer", "followup", "quiet"], "description": "steer (default): next step of a running recipient, wakes an idle one. followup: after the recipient's current turn ends, as its own turn. quiet: delivered at the recipient's next model request, never wakes."}
                 }
             }),
@@ -1051,10 +1051,14 @@ mod tests {
     }
 
     fn ctx_with_clock() -> (ToolContext, Arc<ManualClock>) {
+        ctx_with_limits(UnitLimits::default())
+    }
+
+    fn ctx_with_limits(limits: UnitLimits) -> (ToolContext, Arc<ManualClock>) {
         let mut ctx = stub_ctx(&AgentMode::Build);
         ctx.provider = Arc::new(crate::test_support::StubStreamProvider::default());
         let clock = Arc::new(ManualClock::default());
-        let hub = UnitHub::new(UnitLimits::default(), ctx.event_tx.clone(), clock.clone());
+        let hub = UnitHub::new(limits, ctx.event_tx.clone(), clock.clone());
         let self_run = hub.main();
         ctx.runs = Some(RunsCtx { hub, self_run });
         (ctx, clock)
@@ -1091,9 +1095,16 @@ mod tests {
         assert!(err.contains(expected), "{err}");
     }
 
+    /// A message cap that is clearly not the default, so a test proves it is in force.
+    const TEST_MAX_MESSAGE_BYTES: u32 = 64;
+
     #[tokio::test]
     async fn send_oversize_is_counted_in_bytes_not_chars() {
-        let ctx = ctx();
+        let ctx = ctx_with_limits(UnitLimits {
+            max_message_bytes: TEST_MAX_MESSAGE_BYTES,
+            ..UnitLimits::default()
+        })
+        .0;
         call(
             Which::Spawn,
             &ctx,
@@ -1101,8 +1112,8 @@ mod tests {
         )
         .await
         .unwrap();
-        // 8193 chars of 2 bytes: fewer than 16384 chars, more than 16384 bytes.
-        let big = "\u{e9}".repeat(8193);
+        // 33 chars of 2 bytes: fewer than 64 chars, more than 64 bytes.
+        let big = "\u{e9}".repeat(33);
         let err = call(
             Which::Send,
             &ctx,
@@ -1110,8 +1121,8 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert_eq!(err, "TOO_LARGE max=16384");
-        let ok = "\u{e9}".repeat(8192);
+        assert_eq!(err, format!("TOO_LARGE max={TEST_MAX_MESSAGE_BYTES}"));
+        let ok = "\u{e9}".repeat(32);
         let queued = call(
             Which::Send,
             &ctx,
@@ -1128,6 +1139,27 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.contains("steer, followup, quiet"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn send_takes_a_message_far_over_the_old_cap_by_default() {
+        let ctx = ctx();
+        call(
+            Which::Spawn,
+            &ctx,
+            json!({"kind": "agent", "description": "Audit auth", "prompt": "look"}),
+        )
+        .await
+        .unwrap();
+        let big = "x".repeat(64 * 1024);
+        let queued = call(
+            Which::Send,
+            &ctx,
+            json!({"to": "audit-auth", "message": big}),
+        )
+        .await
+        .unwrap();
+        assert!(queued.contains("queued for"), "{queued}");
     }
 
     #[tokio::test]

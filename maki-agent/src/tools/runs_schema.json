@@ -37,7 +37,7 @@
   "send": {
     "properties": {
       "message": {
-        "description": "Up to 16 KiB. Be self-contained.",
+        "description": "Not capped by default. Be self-contained.",
         "type": "string"
       },
       "mode": {

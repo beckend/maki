@@ -16,6 +16,7 @@ pub struct UnitLimits {
     pub max_children_per_run: u32,
     pub max_queue: u32,
     pub spawn_per_minute: u32,
+    pub max_message_bytes: u32,
     pub session_max_runs: u32,
     pub default_timeout: Duration,
     pub max_timeout: Duration,
@@ -43,6 +44,7 @@ impl From<&RunsConfig> for UnitLimits {
             max_children_per_run: config.max_children_per_run,
             max_queue: config.max_queue,
             spawn_per_minute: config.spawn_per_minute,
+            max_message_bytes: config.max_message_bytes,
             session_max_runs: config.session_max_runs,
             default_timeout: Duration::from_secs(config.default_timeout_secs.min(MAX_TIMEOUT_SECS)),
             max_timeout: Duration::from_secs(config.max_timeout_secs.min(MAX_TIMEOUT_SECS)),
@@ -74,10 +76,12 @@ mod tests {
                 l.max_children_per_run,
                 l.max_queue,
                 l.spawn_per_minute,
+                l.max_message_bytes,
                 l.session_max_runs,
                 l.siblings
             ),
             (
+                u32::MAX,
                 u32::MAX,
                 u32::MAX,
                 u32::MAX,
