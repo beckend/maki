@@ -333,7 +333,7 @@ mod tests {
     #[test_case("zai/glm-5.3", LONG_CONTEXT ; "glm_5_3_1m_context")]
     #[test_case("zai/glm-5.3-flash", LONG_CONTEXT ; "glm_5_3_flash_1m_context")]
     #[test_case("zai/glm-5.1", GLM_5_CONTEXT ; "glm_5_1_keeps_200k")]
-    #[test_case("zai/glm-5.5", GLM_5_CONTEXT ; "unknown_glm_5_x_falls_back_to_glm_5_entry")]
+    #[test_case("zai/glm-5-unknown", GLM_5_CONTEXT ; "unknown_glm_5_x_falls_back_to_glm_5_entry")]
     fn model_entry_context_window(spec: &str, expected: u32) {
         assert_eq!(Model::from_spec(spec).unwrap().context_window, expected);
     }
