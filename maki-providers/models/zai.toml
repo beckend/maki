@@ -10,6 +10,20 @@
 # plan already paid for those models, so every row in it really is zero.
 slug = "zai"
 
+# GLM-5.4 ships on the coding plan only: docs.z.ai lists no pay as you go
+# price for it yet, so every rate is zero there. It reads images, the first
+# GLM flagship to, so it needs its own row: on the `glm-5` row it inherits
+# `vision = false` and maki drops every picture out of the request.
+[[model]]
+prefixes = ["glm-5.4"]
+tier = "strong"
+family = "glm"
+vision = true
+default = false
+max_output_tokens = 131072
+context_window = 1000000
+pricing = { input = 0.0, output = 0.0, cache_write = 0.0, cache_read = 0.0 }
+
 [[model]]
 prefixes = ["glm-5-code"]
 tier = "strong"

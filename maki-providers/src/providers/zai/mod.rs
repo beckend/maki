@@ -329,12 +329,24 @@ mod tests {
         assert_eq!(model.thinking_override, expected);
     }
 
+    #[test_case("zai/glm-5.4", LONG_CONTEXT ; "glm_5_4_1m_context")]
     #[test_case("zai/glm-5.3", LONG_CONTEXT ; "glm_5_3_1m_context")]
     #[test_case("zai/glm-5.3-flash", LONG_CONTEXT ; "glm_5_3_flash_1m_context")]
     #[test_case("zai/glm-5.1", GLM_5_CONTEXT ; "glm_5_1_keeps_200k")]
-    #[test_case("zai/glm-5.4", GLM_5_CONTEXT ; "unknown_glm_5_x_falls_back_to_glm_5_entry")]
+    #[test_case("zai/glm-5.5", GLM_5_CONTEXT ; "unknown_glm_5_x_falls_back_to_glm_5_entry")]
     fn model_entry_context_window(spec: &str, expected: u32) {
         assert_eq!(Model::from_spec(spec).unwrap().context_window, expected);
+    }
+
+    /// GLM-5.4 reads images and GLM-5.3 does not, so the pair must not answer
+    /// alike: on the shared `glm-5` row maki took every picture out of the
+    /// request and the model never saw it.
+    #[test_case("zai/glm-5.4", true ; "glm_5_4_reads_images")]
+    #[test_case("zai/glm-5.3-flash", true ; "glm_5_3_flash_reads_images")]
+    #[test_case("zai/glm-5.3", false ; "glm_5_3_is_text_only")]
+    #[test_case("zai/glm-5", false ; "glm_5_is_text_only")]
+    fn model_entry_vision_support(spec: &str, expected: bool) {
+        assert_eq!(Model::from_spec(spec).unwrap().supports_vision(), expected);
     }
 
     /// The longest prefix wins, so without its own entry the cheap flash model
