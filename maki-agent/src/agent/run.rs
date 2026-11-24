@@ -807,7 +807,7 @@ impl<'h> Agent<'h> {
                 opts: self.opts,
                 output_budget: self.config.max_turn_output,
                 session_id: self.session_id.as_ref(),
-                retry: self.timeouts.retry,
+                retry: self.retry_policy(),
             },
             Some(self.gauge),
             &self.event_tx,
@@ -1106,6 +1106,17 @@ impl<'h> Agent<'h> {
             text: THINKING_DROPPED.into(),
         })?;
         Ok(TurnOutcome::Continue)
+    }
+
+    /// The policy this request draws on. A rejection has already spent the
+    /// transient budget, so the agent's next try at a corrected request is one
+    /// attempt and not another round of the same one.
+    fn retry_policy(&self) -> maki_providers::retry::RetryPolicy {
+        let mut policy = self.timeouts.retry;
+        if self.rejections > 0 {
+            policy.max_transient_retries = 0;
+        }
+        policy
     }
 
     /// The provider refused the request the agent built, and kept refusing it
@@ -5948,17 +5959,24 @@ mod tests {
     /// what it sent is wrong, and the agent is the only one who can send
     /// something else. So the refusal reaches it, with the provider's own
     /// words, and it gets another turn.
+    ///
+    /// The budget is spent once: the first round retries, and every round after
+    /// the wake is a single try, so a payload the agent cannot fix costs one
+    /// round of retries and not one per wake.
     #[tokio::test]
     async fn a_refused_request_wakes_the_agent_with_the_error() {
+        const RETRIES: u32 = 3;
         let seen = Arc::default();
         let provider = RefusingProvider {
-            refusals: Mutex::new(1),
+            refusals: Mutex::new(RETRIES + 2),
             seen: Arc::clone(&seen),
         };
         let mut history = History::new(Vec::new());
         let (mut agent, mut event_rx) = make_agent(provider, &mut history);
         agent.timeouts.retry = maki_providers::retry::RetryPolicy {
-            max_transient_retries: 0,
+            base_delay: std::time::Duration::from_millis(1),
+            max_delay: std::time::Duration::from_millis(2),
+            max_transient_retries: RETRIES,
             ..maki_providers::retry::RetryPolicy::default()
         };
 
@@ -5967,8 +5985,14 @@ mod tests {
 
         assert_eq!(reason, DoneReason::EndTurn);
         let seen = seen.lock().unwrap();
-        assert_eq!(seen.len(), 2, "the agent was not woken up");
-        let second = seen[1]
+        assert_eq!(
+            seen.len(),
+            usize::try_from(RETRIES + 3).unwrap(),
+            "the first round retries, every round after the wake is one try"
+        );
+        let second = seen
+            .last()
+            .unwrap()
             .iter()
             .map(|message| serde_json::to_string(message).unwrap())
             .collect::<Vec<_>>()
