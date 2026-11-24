@@ -91,11 +91,12 @@ fn served_window_notice(model: &str, served: u32, planned: u32) -> String {
 
 /// What the agent reads when the provider refused the request it built. The
 /// provider's own words come first: they name what was wrong with the
-/// payload, and the agent can only put that right if it is told.
+/// payload, and the agent can only put that right if it is told. A normal
+/// chat message, so it sits in the conversation the agent reads.
 fn rejection_note(error: &AgentError) -> String {
     format!(
         "The provider refused the request you sent and said: {error}\n\n\
-         The request was yours, so check it and send a corrected one. The same request will be refused the same way."
+         That request was not sent again. It was yours, so check it and send a corrected one."
     )
 }
 
@@ -1120,8 +1121,9 @@ impl<'h> Agent<'h> {
     }
 
     /// The provider refused the request the agent built, and kept refusing it
-    /// until the budget ran out. The request is the suspect, so the agent gets
-    /// to hear what the provider said and gets a turn to send a corrected one.
+    /// until the budget ran out. The failed call is not sent again; the agent
+    /// gets the provider's own words as a normal chat message and a turn to
+    /// send something else.
     fn wake_after_rejection(&mut self, err: AgentError) -> Result<TurnOutcome, AgentError> {
         if self.rejections >= MAX_REJECTION_WAKES {
             error!(error = %err, model = %self.model.id, self.num_turns, "stream_message failed");
@@ -1130,7 +1132,8 @@ impl<'h> Agent<'h> {
         self.rejections += 1;
         warn!(session = ?self.session_id, model = %self.model.id, attempt = self.rejections, error = %err, "provider refused the request, waking the agent");
         let text = rejection_note(&err);
-        self.history.push(Message::synthetic(text.clone()));
+        self.history.push(Message::user(text.clone()));
+        self.tell_changes();
         self.event_tx.send(AgentEvent::Notice { text })?;
         Ok(TurnOutcome::Continue)
     }
@@ -6000,6 +6003,26 @@ mod tests {
         assert!(
             second.contains("the request was refused"),
             "the agent was not told what the provider said: {second}"
+        );
+        let note = seen
+            .last()
+            .unwrap()
+            .iter()
+            .find(|message| {
+                serde_json::to_string(message)
+                    .unwrap()
+                    .contains("the request was refused")
+            })
+            .unwrap();
+        assert_eq!(
+            note.get("role").and_then(|role| role.as_str()),
+            Some("user"),
+            "the note is not a chat message"
+        );
+        assert_ne!(
+            note.get("display_text").and_then(|text| text.as_str()),
+            Some(""),
+            "the note is hidden from the user, not a normal chat message"
         );
         assert!(
             drain_events(&mut event_rx)
