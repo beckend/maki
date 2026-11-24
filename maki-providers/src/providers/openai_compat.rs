@@ -366,12 +366,23 @@ pub fn convert_messages(messages: &[Message], system: &str) -> Vec<Value> {
                         ContentBlock::ToolUse {
                             id, name, input, ..
                         } => {
+                            // A tool call's input is an object by contract, and
+                            // a model that sent `null` has sent a malformed
+                            // call. maki refuses to run it either way, but the
+                            // wire never carries the odd shape: a backend that
+                            // reads the arguments can answer an error for every
+                            // later request that keeps them.
+                            let arguments = if input.is_object() {
+                                input.to_string()
+                            } else {
+                                json!({}).to_string()
+                            };
                             tool_calls.push(json!({
                                 "id": id,
                                 "type": "function",
                                 "function": {
                                     "name": name,
-                                    "arguments": input.to_string(),
+                                    "arguments": arguments,
                                 }
                             }));
                         }

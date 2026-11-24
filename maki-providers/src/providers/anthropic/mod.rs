@@ -1404,6 +1404,24 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n\n";
         );
     }
 
+    /// A model that answers a tool call with `null` for its input has sent a
+    /// malformed call, and maki refuses to run it — but a gateway that maps
+    /// the blocks onto its own types can answer 500 for every later request
+    /// that keeps the odd shape, so the wire carries an empty object instead.
+    #[test]
+    fn a_tool_call_with_no_input_goes_out_as_an_empty_object() {
+        let messages = vec![Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::tool_use("call_1", "multiedit", Value::Null)],
+            ..Default::default()
+        }];
+        let wire = build_wire_messages(&messages, &json!([]));
+        let json: Value = serde_json::to_value(&wire).unwrap();
+
+        assert_eq!(json[0]["content"][0]["type"], "tool_use");
+        assert_eq!(json[0]["content"][0]["input"], json!({}));
+    }
+
     const DEFERRED_TOOL: &str = "srv__fetch";
     const SEARCH_TEXT: &str = "Loaded 1 tool";
 

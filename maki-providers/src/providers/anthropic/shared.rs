@@ -231,6 +231,18 @@ fn wire_block<'a>(
     block: &'a ContentBlock,
     unreferenced: &mut HashSet<&str>,
 ) -> (WireBlock<'a>, Option<Value>) {
+    // A tool call's input is an object by contract. A model that sent `null`
+    // has sent a malformed call, and maki refuses to run it either way — but
+    // a gateway that maps the blocks onto its own types can answer 500 for
+    // every later request that carries the odd shape, so the wire never
+    // carries it.
+    if let ContentBlock::ToolUse { input, .. } = block
+        && !input.is_object()
+    {
+        let mut rebuilt = serde_json::to_value(block).unwrap_or(Value::Null);
+        rebuilt["input"] = json!({});
+        return (WireBlock::Rebuilt(rebuilt), None);
+    }
     let ContentBlock::ToolResult {
         tool_use_id,
         content,
