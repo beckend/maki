@@ -1263,12 +1263,14 @@ pub mod dialect {
             adaptive: Some(High),
             off: None
         },
-        /// Z.AI. GLM reasons by default, so Off sends "none" explicitly.
-        /// Only use behind `Model::supports_thinking`.
+        /// Z.AI. The documented levels are `max`, `high` and `low` (docs.z.ai,
+        /// "Core Parameters"): `xhigh` is a GLM-5.2 spelling that later models
+        /// do not take, and `none` is refused outright, because every GLM from
+        /// 5.2 up reasons whether or not it is asked to.
         GLM "glm" {
-            supported: [High, XHigh],
+            supported: [Low, High, Max],
             adaptive: Some(High),
-            off: Some(OFF)
+            off: None
         },
         /// DeepSeek accepts only "max"; Adaptive keeps the model's own default
         /// reasoning depth by sending no effort at all.
@@ -1414,6 +1416,13 @@ impl ThinkingConfig {
     /// adaptive knob plus `output_config.effort`; legacy models get a plain
     /// token budget.
     pub fn apply_to_body(self, body: &mut Value, model: &Model) {
+        // A model that names its own effort (GLM does, in `reasoning_effort`)
+        // wants that, not a budget: the budget is not the parameter it reads,
+        // so a request that carries one still reasons at its own default.
+        if let Some(dialect) = crate::model::family_effort_dialect(model.family) {
+            self.apply_reasoning_effort(body, dialect, model);
+            return;
+        }
         if requires_adaptive(&model.id) {
             if matches!(self, Self::Off) {
                 return;
@@ -2489,9 +2498,11 @@ mod tests {
     #[test_case(&dialect::PREFER_HIGH, ThinkingConfig::Adaptive,        Some("high") ; "prefer_high_adaptive")]
     #[test_case(&dialect::HIGH_ONLY, ThinkingConfig::Adaptive,        Some("high") ; "high_only_adaptive")]
     #[test_case(&dialect::HIGH_ONLY, ThinkingConfig::Effort(Minimal), Some("high") ; "high_only_minimal")]
-    #[test_case(&dialect::GLM, ThinkingConfig::Off,          Some("none")  ; "glm_off_explicit_none")]
+    #[test_case(&dialect::GLM, ThinkingConfig::Off,          None         ; "glm_off_sends_nothing")]
     #[test_case(&dialect::GLM, ThinkingConfig::Adaptive,     Some("high")  ; "glm_adaptive")]
-    #[test_case(&dialect::GLM, ThinkingConfig::Effort(Max),  Some("xhigh") ; "glm_max_snaps_to_xhigh")]
+    #[test_case(&dialect::GLM, ThinkingConfig::Effort(Max),  Some("max")   ; "glm_max_passes_through")]
+    #[test_case(&dialect::GLM, ThinkingConfig::Effort(Low),  Some("low")   ; "glm_low_passes_through")]
+    #[test_case(&dialect::GLM, ThinkingConfig::Effort(XHigh), Some("high") ; "glm_xhigh_snaps_to_high")]
     #[test_case(&dialect::DEEPSEEK, ThinkingConfig::Adaptive,        None        ; "deepseek_adaptive_uses_api_default")]
     #[test_case(&dialect::DEEPSEEK, ThinkingConfig::Effort(Minimal), Some("max") ; "deepseek_minimal")]
     #[test_case(&dialect::ANTHROPIC_ADAPTIVE, ThinkingConfig::Adaptive,      None         ; "anthropic_adaptive_is_native")]

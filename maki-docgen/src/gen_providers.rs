@@ -218,6 +218,7 @@ supports_vision = false
 | `requires_thinking` | bool | false | For APIs that reject requests with thinking disabled. Implies `supports_thinking` and raises thinking to minimal effort when off (including compaction). On generic `openai` entries without `thinking_fields` its only wire effect is that the `disabled` block is never sent |
 | `thinking_fields` | table | unset | How this model spells each thinking mode on the wire. The only thinking control on generic `openai` entries, and it implies `supports_thinking` |
 | `supports_vision` | bool | protocol default | When false, image input and `view_image` are off |
+| `family` | string | protocol default | The model family, when the provider serves more than one: `claude`, `generic`, `gemini`, `glm`, `gpt` or `synthetic`. It decides the effort vocabulary the model takes: `glm` names its levels in `reasoning_effort` and takes only `max`, `high` and `low` |
 | `pricing_input` / `pricing_output` | f64 | 0 | USD per 1M tokens |
 | `pricing_cache_write` / `pricing_cache_read` | f64 | 0 | USD per 1M tokens |
 | `pricing_fast_input` / `pricing_fast_output` | f64 | unset | Fast-mode pricing when the provider supports it |

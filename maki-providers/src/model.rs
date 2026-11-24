@@ -24,7 +24,7 @@ use crate::spec::{ProviderRegistry, ProviderSpec};
 use crate::types::{
     EffortDialect, FALLBACK_MAX_THINKING_BUDGET, ThinkingFallback, dialect, thinks_by_default,
 };
-pub use maki_config::providers::ModelTier;
+pub use maki_config::providers::{ModelFamily, ModelTier};
 use maki_config::providers::{
     ProviderDef, ProvidersConfig, ThinkingFields, base_url_override, builtin_provider,
 };
@@ -226,17 +226,6 @@ impl ModelPricing {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ModelFamily {
-    Claude,
-    Generic,
-    Gemini,
-    Glm,
-    Gpt,
-    Synthetic,
-}
-
 /// One model as a declaration states it, whoever declared it: a curated row
 /// of `models/<slug>.toml` (see [`crate::manifest`]), a row of a plugin's
 /// `models` table, or a `providers.toml` model. Keyed by prefix, see
@@ -405,18 +394,14 @@ impl<'a> ModelSources<'a> {
     }
 }
 
-impl ModelFamily {
-    pub fn supports_tool_examples(self) -> bool {
-        match self {
-            ModelFamily::Claude | ModelFamily::Gpt | ModelFamily::Synthetic => true,
-            ModelFamily::Generic | ModelFamily::Gemini | ModelFamily::Glm => false,
-        }
-    }
-
-    /// Fallback for models missing from the static tables; per-model truth
-    /// lives in `ModelEntry::supports_vision`.
-    pub fn supports_vision(self) -> bool {
-        matches!(self, Self::Claude | Self::Gpt | Self::Gemini)
+/// The dialect a model of this family speaks, where the family has one:
+/// GLM names its levels in `reasoning_effort` and takes only the levels its
+/// own documentation lists, so a protocol's generic ladder would send it one
+/// it refuses.
+pub fn family_effort_dialect(family: ModelFamily) -> Option<&'static EffortDialect<'static>> {
+    match family {
+        ModelFamily::Glm => Some(&dialect::GLM),
+        _ => None,
     }
 }
 
@@ -2175,8 +2160,8 @@ mod tests {
     }
 
     /// The badge follows a provider's fixed dialect too, not only discovery.
-    #[test_case("zai/glm-5.3", Effort::Low, Effort::High ; "below_the_lowest_takes_the_lowest")]
-    #[test_case("zai/glm-5.3", Effort::Max, Effort::XHigh ; "above_the_top_takes_the_top")]
+    #[test_case("zai/glm-5.3", Effort::Minimal, Effort::Low ; "below_the_lowest_takes_the_lowest")]
+    #[test_case("zai/glm-5.3", Effort::Max, Effort::Max ; "above_the_top_takes_the_top")]
     #[test_case("anthropic/claude-sonnet-4-5", Effort::Low, Effort::Low ; "an_api_that_takes_it_keeps_it")]
     fn shown_is_the_level_the_provider_sends(spec: &str, picked: Effort, sent: Effort) {
         let model = Model::from_spec(spec).unwrap();

@@ -28,7 +28,7 @@ use maki_storage::auth::load_provider_credentials;
 use maki_storage::id::SessionRef;
 
 use crate::headers::HeaderError;
-use crate::model::{Model, ModelInfo, ModelPricing};
+use crate::model::{Model, ModelEffort, ModelInfo, ModelPricing};
 use crate::provider::{BoxFuture, Provider};
 use crate::providers::anthropic::{self, shared};
 use crate::providers::codec::SessionCarrier;
@@ -40,7 +40,7 @@ use crate::providers::{
 };
 use crate::spec::ProviderRegistry;
 use crate::{
-    AgentError, EffortDialect, Message, ProviderEvent, ProviderUsage, RequestOptions,
+    AgentError, Effort, EffortDialect, Message, ProviderEvent, ProviderUsage, RequestOptions,
     StreamResponse, ThinkingConfig, dialect,
 };
 
@@ -319,6 +319,8 @@ pub struct CatalogMeta {
     pub pricing: Option<ModelPricing>,
     pub supports_thinking: Option<bool>,
     pub supports_vision: Option<bool>,
+    /// The levels the model itself named, from models.dev's `reasoning_options`.
+    pub effort: Option<ModelEffort>,
 }
 
 impl CatalogMeta {
@@ -341,7 +343,7 @@ impl CatalogMeta {
             tier: None,
             provider_info: None,
             extra: None,
-            effort: None,
+            effort: self.effort.clone(),
         }
     }
 }
@@ -732,7 +734,46 @@ fn parse_model(model: &schema::CatalogModel) -> CatalogMeta {
         }),
         supports_thinking: model.reasoning,
         supports_vision,
+        effort: model.reasoning_options.as_deref().and_then(catalog_effort),
     }
+}
+
+/// The levels a model takes, from models.dev's `reasoning_options`. A `null`
+/// among the values is the level that turns thinking off, so a model that
+/// lists none cannot be turned off — and maki must not ask.
+fn catalog_effort(options: &[schema::CatalogReasoningOption]) -> Option<ModelEffort> {
+    let mut supported = Vec::new();
+    let mut send_off = None;
+    for option in options {
+        match option {
+            schema::CatalogReasoningOption::Effort { values } => {
+                for value in values {
+                    match value {
+                        None => send_off = Some(true),
+                        Some(name) => {
+                            if let Ok(level) =
+                                serde_json::from_value::<Effort>(Value::String(name.clone()))
+                            {
+                                supported.push(level);
+                            }
+                        }
+                    }
+                }
+            }
+            schema::CatalogReasoningOption::Toggle => send_off = Some(true),
+            schema::CatalogReasoningOption::BudgetTokens { .. } => {}
+        }
+    }
+    if supported.is_empty() && send_off.is_none() {
+        return None;
+    }
+    // Levels without an off among them: the model reasons whether or not it is
+    // asked to, so an off would be refused rather than obeyed.
+    let send_off = send_off.unwrap_or(false);
+    Some(ModelEffort {
+        supported,
+        send_off: Some(send_off),
+    })
 }
 
 async fn fetch_catalog(state_dir: &StateDir) -> Result<CatalogData, AgentError> {
@@ -1092,6 +1133,14 @@ pub(crate) fn model_meta_if_available(slug: &str, model_id: &str) -> Option<Cata
     guard.model_meta(slug, model_id).cloned()
 }
 
+/// The same row as a [`ModelInfo`], for the request path: what the model said
+/// about itself, with the levels it takes among it. Never triggers a fetch.
+pub(crate) fn model_info_if_available(slug: &str, model_id: &str) -> Option<ModelInfo> {
+    let guard = SHARED_CATALOG.get()?.lock().ok()?;
+    let meta = guard.model_meta(slug, model_id)?;
+    Some(meta.model_info(model_id))
+}
+
 /// True when the model belongs to a provider with a [`FreeTier`] and is free
 /// by the same [`is_free_model`] definition gating `enable_free_models` (zero
 /// input and output price). Never triggers a fetch.
@@ -1114,7 +1163,8 @@ mod tests {
 
     use super::{
         Authentication, CatalogData, CatalogMeta, EndpointType, ProviderData, ProviderQuirks,
-        SessionRef, StateDir, available_if_warm, determine_catalog_format, parse_model, quirks_for,
+        SessionRef, StateDir, available_if_warm, catalog_effort, determine_catalog_format,
+        parse_model, quirks_for,
     };
     use crate::model::{Model, ModelEntry, ModelInfo, ModelPricing};
     use crate::provider::Provider;
@@ -1210,6 +1260,7 @@ mod tests {
             }),
             supports_thinking: Some(false),
             supports_vision: Some(false),
+            effort: None,
         }
     }
 
@@ -2675,6 +2726,45 @@ mod tests {
         );
     }
 
+    /// The levels a model takes, from models.dev's `reasoning_options`: the
+    /// ones it lists, and whether it can be turned off. A model that lists no
+    /// off cannot be turned off — maki must not ask, because the provider
+    /// refuses the request rather than obeying it.
+    #[test_case(
+        &["low", "high", "max"],
+        &[Effort::Low, Effort::High, Effort::Max],
+        Some(false) ;
+        "levels_without_an_off_cannot_be_turned_off"
+    )]
+    #[test_case(
+        &["low", "high", "max", "none"],
+        &[Effort::Low, Effort::High, Effort::Max],
+        Some(true) ;
+        "a_listed_none_is_the_off_level"
+    )]
+    #[test_case(&[], &[], None ; "no_options_say_nothing")]
+    fn reasoning_options_become_the_models_levels(
+        values: &[&str],
+        expected: &[Effort],
+        send_off: Option<bool>,
+    ) {
+        let options = vec![super::schema::CatalogReasoningOption::Effort {
+            values: values
+                .iter()
+                .map(|value| (*value != "none").then(|| (*value).to_owned()))
+                .collect(),
+        }];
+        let effort = catalog_effort(&options);
+
+        let levels = if expected.is_empty() {
+            None
+        } else {
+            Some(expected)
+        };
+        assert_eq!(effort.as_ref().map(|e| e.supported.as_slice()), levels);
+        assert_eq!(effort.and_then(|e| e.send_off), send_off);
+    }
+
     #[test]
     fn catalog_all_models_public_fallback_shows_only_free() {
         let (_tmp, state_dir) = temp_state_dir();
@@ -2880,6 +2970,30 @@ pub(crate) mod schema {
         pub reasoning: Option<bool>,
         #[serde(default)]
         pub modalities: Option<CatalogModalities>,
+        /// How the model says its reasoning: the levels it takes, whether it
+        /// can be turned off, or a budget range.
+        #[serde(default)]
+        pub reasoning_options: Option<Vec<CatalogReasoningOption>>,
+    }
+
+    /// One entry of models.dev's `reasoning_options`. The `type` picks the
+    /// shape: `effort` lists the levels the model takes, `toggle` says it can
+    /// be turned off, and `budget_tokens` gives a range.
+    #[derive(Deserialize, Serialize, Clone)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    pub enum CatalogReasoningOption {
+        Effort {
+            /// A `null` is the level that turns thinking off.
+            #[serde(default)]
+            values: Vec<Option<String>>,
+        },
+        Toggle,
+        BudgetTokens {
+            #[serde(default)]
+            min: Option<u32>,
+            #[serde(default)]
+            max: Option<u32>,
+        },
     }
 
     #[derive(Deserialize, Serialize, Clone)]

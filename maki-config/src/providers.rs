@@ -56,6 +56,35 @@ pub enum ModelTier {
     Compaction,
 }
 
+/// The model family, which decides the effort vocabulary the model
+/// takes: GLM names its levels in `reasoning_effort` and takes only the ones
+/// its own documentation lists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ModelFamily {
+    Claude,
+    Generic,
+    Gemini,
+    Glm,
+    Gpt,
+    Synthetic,
+}
+
+impl ModelFamily {
+    pub fn supports_tool_examples(self) -> bool {
+        match self {
+            Self::Claude | Self::Gpt | Self::Synthetic => true,
+            Self::Generic | Self::Gemini | Self::Glm => false,
+        }
+    }
+
+    /// Fallback for models missing from the static tables; per-model truth
+    /// lives in `ModelEntry::supports_vision`.
+    pub fn supports_vision(self) -> bool {
+        matches!(self, Self::Claude | Self::Gpt | Self::Gemini)
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error("invalid model tier '{0}' (expected: strong, medium, weak)")]
 pub struct InvalidTier(String);
@@ -143,6 +172,10 @@ pub struct ModelDef {
     pub thinking_fields: Option<ThinkingFields>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_vision: Option<bool>,
+    /// The model family, when the provider serves more than one: it decides
+    /// the effort vocabulary the model takes.
+    #[serde(default)]
+    pub family: Option<ModelFamily>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pricing_input: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1047,6 +1080,7 @@ tier = "{input}"
             requires_thinking: Some(true),
             thinking_fields: Some(ThinkingFields::default()),
             supports_vision: Some(true),
+            family: Some(ModelFamily::Glm),
             pricing_input: Some(1.0),
             pricing_output: Some(1.0),
             pricing_cache_write: Some(1.0),

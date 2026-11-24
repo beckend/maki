@@ -20,6 +20,7 @@ use crate::headers::{HeaderError, header_name, parse_headers};
 use crate::model::{Model, ModelEffort, ModelInfo, ThinkingSupport};
 use crate::model_registry;
 use crate::provider::{BoxFuture, Provider};
+use crate::providers::catalog;
 use crate::spec::ProviderSpec;
 use crate::types::{EffortDialect, ThinkingFallback, dialect, merge_body};
 use crate::{
@@ -250,10 +251,21 @@ impl OpenAiWire {
 }
 
 impl ThinkingWire {
-    fn dialect_for<'a>(&'a self, discovered: Option<&'a ModelInfo>) -> EffortDialect<'a> {
+    /// The dialect the request speaks. A model whose family has one of its
+    /// own speaks that: GLM takes its levels in `reasoning_effort` and only
+    /// the ones its own documentation lists, so a protocol's generic ladder
+    /// would send it one it refuses.
+    fn dialect_for<'a>(
+        &'a self,
+        discovered: Option<&'a ModelInfo>,
+        model: Option<&Model>,
+    ) -> EffortDialect<'a> {
+        let base = model
+            .and_then(|model| crate::model::family_effort_dialect(model.family))
+            .unwrap_or(self.dialect);
         let declared = match self.effort.as_ref() {
-            Some(effort) => effort.refine(self.dialect),
-            None => self.dialect.clone(),
+            Some(effort) => effort.refine(base),
+            None => base.clone(),
         };
         match discovered.and_then(|row| row.effort.as_ref()) {
             Some(effort) => effort.refine(&declared),
@@ -266,7 +278,7 @@ impl ThinkingWire {
         discovered: Option<&ModelInfo>,
         choice: ThinkingConfig,
     ) -> ThinkingConfig {
-        self.dialect_for(discovered).sends(choice)
+        self.dialect_for(discovered, None).sends(choice)
     }
 
     /// The declared dialect, refined by what discovery listed for the model,
@@ -275,7 +287,7 @@ impl ThinkingWire {
         if self.requires_support && !ctx.model.supports_thinking() {
             return;
         }
-        let dialect = self.dialect_for(ctx.discovered.as_ref());
+        let dialect = self.dialect_for(ctx.discovered.as_ref(), Some(ctx.model));
         if let Some(effort) = ctx.opts.thinking.effort_str(&dialect, ctx.model)
             && let Some(object) = body.as_object_mut()
         {
@@ -289,7 +301,7 @@ impl ThinkingWire {
         if self.requires_support && !ctx.model.supports_thinking() {
             return;
         }
-        let dialect = self.dialect_for(ctx.discovered.as_ref());
+        let dialect = self.dialect_for(ctx.discovered.as_ref(), Some(ctx.model));
         responses::apply_responses_reasoning(body, ctx.opts.thinking, ctx.model, &dialect);
     }
 }
@@ -621,7 +633,12 @@ impl Provider for CompatProvider {
             let ctx = RequestCtx {
                 model,
                 opts,
-                discovered: model_registry::discovered(&self.compat.config().slug, &model.id),
+                // Discovery first, then models.dev: a model the provider never
+                // listed still said what it takes, in the catalog.
+                discovered: model_registry::discovered(&self.compat.config().slug, &model.id)
+                    .or_else(|| {
+                        catalog::model_info_if_available(&self.compat.config().slug, &model.id)
+                    }),
             };
 
             if self.protocol == Protocol::OpenaiResponses {
