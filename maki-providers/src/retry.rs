@@ -22,6 +22,9 @@ pub enum RetryKind {
     /// 5xx and network failures on a connection that was made. Nothing came
     /// back, so trying again only costs time.
     Transient,
+    /// The service is busy and says so (a 529). The work is still queued
+    /// behind the model, so waiting it out is the answer.
+    Overloaded,
     /// A connection that was never established: refused, a host name that
     /// does not resolve, a handshake that failed, or a proxy that refused the
     /// tunnel.
@@ -42,6 +45,10 @@ enum Budget {
     /// having an outage. Retrying that for hours costs a night of the same
     /// answer.
     Transient,
+    /// Unbounded: the service says it is busy, which is the one server error
+    /// that clears on its own, so an agent left running overnight is still
+    /// there in the morning.
+    Overloaded,
     /// Unbounded: the server named the moment to come back, so waiting it out
     /// is what it asked for. Anthropic's Claude Code workspace limits arrive
     /// this way and clear on their own.
@@ -62,12 +69,13 @@ enum Budget {
     Connect,
 }
 
-const BUDGETS: usize = 5;
+const BUDGETS: usize = 6;
 
 impl Budget {
     fn of(kind: RetryKind, hint: Option<Duration>) -> Self {
         match kind {
             RetryKind::Transient => Self::Transient,
+            RetryKind::Overloaded => Self::Overloaded,
             RetryKind::Connect => Self::Connect,
             RetryKind::RateLimit if hint.is_some() => Self::HintedRateLimit,
             RetryKind::RateLimit => Self::RateLimit,
@@ -78,7 +86,7 @@ impl Budget {
     fn limit(self, policy: &RetryPolicy) -> Option<u32> {
         match self {
             Self::Transient => Some(policy.max_transient_retries),
-            Self::HintedRateLimit => None,
+            Self::Overloaded | Self::HintedRateLimit => None,
             Self::RateLimit | Self::Connect => Some(policy.max_retries),
             Self::Timeout => Some(policy.max_timeout_retries),
         }
@@ -269,6 +277,7 @@ mod tests {
     #[test_case(2, RetryKind::Timeout, 3, TRANSIENT ; "timeouts_have_their_own_budget")]
     #[test_case(0, RetryKind::Transient, 0, 0 ; "a_zero_budget_never_retries_a_5xx")]
     #[test_case(10, RetryKind::Transient, 10, TRANSIENT ; "a_5xx_stops_at_its_budget")]
+    #[test_case(10, RetryKind::Overloaded, MANY, TRANSIENT ; "a_busy_service_outlives_every_budget")]
     #[test_case(0, RetryKind::Connect, 0, TRANSIENT ; "zero_budget_never_retries_a_refused_connection")]
     #[test_case(2, RetryKind::Connect, 2, TRANSIENT ; "a_refused_connection_stops_at_its_budget")]
     fn budget_is_spent_then_exhausted(

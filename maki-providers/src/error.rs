@@ -216,6 +216,9 @@ impl AgentError {
         }
         match self {
             Self::Api { status: 429, .. } => Some(RetryKind::RateLimit),
+            // The service is busy, which clears on its own, so it keeps the
+            // patient budget a 5xx otherwise lost.
+            Self::Api { status: 529, .. } => Some(RetryKind::Overloaded),
             Self::Api { status, .. } if *status >= 500 => Some(RetryKind::Transient),
             Self::Http(e) if is_connect_failure(e) => Some(RetryKind::Connect),
             Self::Io(e) if e.kind() == io::ErrorKind::ConnectionRefused => Some(RetryKind::Connect),
@@ -515,7 +518,7 @@ fn parse_retry_after(value: &str) -> Option<Duration> {
 mod tests {
     use std::{collections::HashSet, mem::discriminant, sync::Arc};
 
-    use maki_config::DEFAULT_MAX_RETRIES;
+    use maki_config::{DEFAULT_MAX_RETRIES, DEFAULT_MAX_TRANSIENT_RETRIES};
     use reqwest::{
         Client, ClientBuilder,
         dns::{Name, Resolve, Resolving},
@@ -753,7 +756,7 @@ mod tests {
 
     #[test_case(429, RetryKind::RateLimit ; "rate_limit")]
     #[test_case(500, RetryKind::Transient  ; "server_error")]
-    #[test_case(529, RetryKind::Transient  ; "overloaded")]
+    #[test_case(529, RetryKind::Overloaded ; "overloaded")]
     fn api_retry_kind(status: u16, expected: RetryKind) {
         assert_eq!(api(status).retry_kind(), Some(expected));
     }
@@ -764,6 +767,20 @@ mod tests {
             AgentError::Timeout { secs: 30 }.retry_kind(),
             Some(RetryKind::Timeout)
         );
+    }
+
+    /// The service says it is busy, and a busy service clears on its own, so
+    /// it keeps the patient budget the other server errors lost.
+    #[test]
+    fn an_overloaded_service_keeps_retrying() {
+        assert_eq!(retries_granted(&api(529)), ROUNDS);
+    }
+
+    /// A server error that is not "busy" is refused, not overloaded, so it
+    /// runs out of budget instead of waiting the night out.
+    #[test]
+    fn a_refused_server_error_gives_up() {
+        assert_eq!(retries_granted(&api(500)), DEFAULT_MAX_TRANSIENT_RETRIES);
     }
 
     /// Retries this error is granted before the loop has to give up, stopping
