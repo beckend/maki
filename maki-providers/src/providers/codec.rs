@@ -261,7 +261,7 @@ impl ThinkingWire {
         model: Option<&Model>,
     ) -> EffortDialect<'a> {
         let base = model
-            .and_then(|model| crate::model::family_effort_dialect(model.family))
+            .and_then(crate::model::model_effort_dialect)
             .unwrap_or(self.dialect);
         let declared = match self.effort.as_ref() {
             Some(effort) => effort.refine(base),

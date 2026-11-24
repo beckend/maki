@@ -157,7 +157,7 @@ impl From<&ModelDef> for ModelEntry {
                 }),
             }),
             thinking_fields: def.thinking_fields.clone(),
-            family: def.family,
+            family: None,
             default: false,
         }
     }

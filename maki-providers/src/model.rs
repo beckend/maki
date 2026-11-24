@@ -24,7 +24,7 @@ use crate::spec::{ProviderRegistry, ProviderSpec};
 use crate::types::{
     EffortDialect, FALLBACK_MAX_THINKING_BUDGET, ThinkingFallback, dialect, thinks_by_default,
 };
-pub use maki_config::providers::{ModelFamily, ModelTier};
+pub use maki_config::providers::ModelTier;
 use maki_config::providers::{
     ProviderDef, ProvidersConfig, ThinkingFields, base_url_override, builtin_provider,
 };
@@ -226,6 +226,35 @@ impl ModelPricing {
     }
 }
 
+/// The model family, which decides the effort vocabulary the model
+/// takes: GLM names its levels in `reasoning_effort` and takes only the ones
+/// its own documentation lists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ModelFamily {
+    Claude,
+    Generic,
+    Gemini,
+    Glm,
+    Gpt,
+    Synthetic,
+}
+
+impl ModelFamily {
+    pub fn supports_tool_examples(self) -> bool {
+        match self {
+            Self::Claude | Self::Gpt | Self::Synthetic => true,
+            Self::Generic | Self::Gemini | Self::Glm => false,
+        }
+    }
+
+    /// Fallback for models missing from the static tables; per-model truth
+    /// lives in `ModelEntry::supports_vision`.
+    pub fn supports_vision(self) -> bool {
+        matches!(self, Self::Claude | Self::Gpt | Self::Gemini)
+    }
+}
+
 /// One model as a declaration states it, whoever declared it: a curated row
 /// of `models/<slug>.toml` (see [`crate::manifest`]), a row of a plugin's
 /// `models` table, or a `providers.toml` model. Keyed by prefix, see
@@ -405,7 +434,21 @@ pub fn family_effort_dialect(family: ModelFamily) -> Option<&'static EffortDiale
     }
 }
 
+/// The dialect a model speaks, when it names one. A model whose id names a
+/// family that has a dialect speaks that one wherever it is served: a GLM
+/// model behind a gateway still takes its levels in `reasoning_effort`, and a
+/// protocol that knows nothing of that would send a budget instead, which the
+/// model never reads.
+pub fn model_effort_dialect(model: &Model) -> Option<&'static EffortDialect<'static>> {
+    if model.id.starts_with(GLM_ID_PREFIX) {
+        return Some(&dialect::GLM);
+    }
+    family_effort_dialect(model.family)
+}
+
 const FAST_PROVIDER: &str = "anthropic";
+/// The id prefix a GLM model carries, wherever it is served.
+const GLM_ID_PREFIX: &str = "glm-";
 
 /// Who vouches that an endpoint loads deferred tools.
 #[derive(Debug, PartialEq, Eq)]

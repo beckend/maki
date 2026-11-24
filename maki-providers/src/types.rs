@@ -1419,7 +1419,7 @@ impl ThinkingConfig {
         // A model that names its own effort (GLM does, in `reasoning_effort`)
         // wants that, not a budget: the budget is not the parameter it reads,
         // so a request that carries one still reasons at its own default.
-        if let Some(dialect) = crate::model::family_effort_dialect(model.family) {
+        if let Some(dialect) = crate::model::model_effort_dialect(model) {
             self.apply_reasoning_effort(body, dialect, model);
             return;
         }
