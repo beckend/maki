@@ -68,6 +68,11 @@ pub const DEFAULT_MAX_TIMEOUT_RETRIES: u32 = 10;
 /// a spend cap reads, and that one does not clear for the rest of the billing
 /// period.
 pub const DEFAULT_MAX_RETRIES: u32 = 5;
+/// Spent on a server error (5xx) and on a connection that broke after it was
+/// made. Bounded, because a server that answers 500 for the very same request
+/// over and over is not having an outage, it is refusing the request, and an
+/// unbounded budget turns one refused turn into a night of the same failure.
+pub const DEFAULT_MAX_TRANSIENT_RETRIES: u32 = 10;
 
 pub const DEFAULT_MAX_LOG_BYTES_MB: u64 = 200;
 pub const DEFAULT_MAX_LOG_FILES: u32 = 10;
@@ -912,6 +917,7 @@ pub struct ProviderFileConfig {
     pub retry_max_ms: Option<u64>,
     pub max_retries: Option<u32>,
     pub max_timeout_retries: Option<u32>,
+    pub max_transient_retries: Option<u32>,
 }
 
 #[derive(Deserialize, Default, Debug, Merge)]
@@ -1745,6 +1751,10 @@ pub struct ProviderConfig {
     #[config(key = "max_timeout_retries", ty = "u32", default = DEFAULT_MAX_TIMEOUT_RETRIES,
              desc = "Max retries on stream timeouts")]
     pub max_timeout_retries: u32,
+
+    #[config(key = "max_transient_retries", ty = "u32", default = DEFAULT_MAX_TRANSIENT_RETRIES,
+             desc = "Max retries on a server error (5xx) or a broken connection, 0 to never retry them")]
+    pub max_transient_retries: u32,
 }
 
 impl Default for ProviderConfig {
@@ -1761,6 +1771,7 @@ impl Default for ProviderConfig {
             retry_max_ms: DEFAULT_RETRY_MAX_MS,
             max_retries: DEFAULT_MAX_RETRIES,
             max_timeout_retries: DEFAULT_MAX_TIMEOUT_RETRIES,
+            max_transient_retries: DEFAULT_MAX_TRANSIENT_RETRIES,
         }
     }
 }
@@ -1790,6 +1801,9 @@ impl ProviderConfig {
             retry_max_ms: f.retry_max_ms.unwrap_or(DEFAULT_RETRY_MAX_MS),
             max_retries: f.max_retries.unwrap_or(DEFAULT_MAX_RETRIES),
             max_timeout_retries: f.max_timeout_retries.unwrap_or(DEFAULT_MAX_TIMEOUT_RETRIES),
+            max_transient_retries: f
+                .max_transient_retries
+                .unwrap_or(DEFAULT_MAX_TRANSIENT_RETRIES),
         })
     }
 }

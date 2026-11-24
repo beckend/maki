@@ -48,6 +48,11 @@ use maki_config::{ModelPolicy, ToolOutputLines};
 use maki_storage::id::SessionRef;
 
 const MAX_REAUTH_ATTEMPTS: u32 = 2;
+/// A provider that refuses the same request over and over is not having an
+/// outage, it is refusing the payload, and the agent can only fix that if it
+/// hears what the provider said. Two wakes are enough: a third means the
+/// request is beyond what the agent can put right.
+const MAX_REJECTION_WAKES: u32 = 2;
 /// One compaction is the whole remedy for an overflowing prompt, so a second
 /// overflow in a row means it did not help and retrying only burns a summary.
 const MAX_OVERFLOW_RECOVERIES: u32 = 1;
@@ -81,6 +86,16 @@ const THINKING_DROPPED: &str =
 fn served_window_notice(model: &str, served: u32, planned: u32) -> String {
     format!(
         "The server runs {model} with a {served}-token context, below the {planned} tokens maki planned for. Compacting to fit from now on. Raise the server's context length for more room."
+    )
+}
+
+/// What the agent reads when the provider refused the request it built. The
+/// provider's own words come first: they name what was wrong with the
+/// payload, and the agent can only put that right if it is told.
+fn rejection_note(error: &AgentError) -> String {
+    format!(
+        "The provider refused the request you sent and said: {error}\n\n\
+         The request was yours, so check it and send a corrected one. The same request will be refused the same way."
     )
 }
 
@@ -193,6 +208,7 @@ pub struct Agent<'h> {
     reauth: bool,
     reauth_attempts: u32,
     overflow_recoveries: u32,
+    rejections: u32,
     permissions: Arc<PermissionManager>,
     opts: RequestOptions,
     session_id: Option<SessionRef>,
@@ -251,6 +267,7 @@ impl<'h> Agent<'h> {
             reauth: false,
             reauth_attempts: 0,
             overflow_recoveries: 0,
+            rejections: 0,
             opts: RequestOptions::default(),
             session_id: params.session_id,
             background_for: params.background_for,
@@ -802,6 +819,7 @@ impl<'h> Agent<'h> {
                 self.confirm_landed();
                 self.reauth_attempts = 0;
                 self.overflow_recoveries = 0;
+                self.rejections = 0;
                 r
             }
             Err(StreamError::Cancelled { streamed }) => {
@@ -826,6 +844,9 @@ impl<'h> Agent<'h> {
             }
             Err(StreamError::Other(e)) if e.is_thinking_unbound() => {
                 return self.recover_unbound_thinking(e);
+            }
+            Err(StreamError::Rejected(e)) => {
+                return self.wake_after_rejection(e);
             }
             Err(StreamError::Other(e)) => {
                 error!(error = %e, model = %self.model.id, self.num_turns, "stream_message failed");
@@ -1084,6 +1105,22 @@ impl<'h> Agent<'h> {
         self.event_tx.send(AgentEvent::Notice {
             text: THINKING_DROPPED.into(),
         })?;
+        Ok(TurnOutcome::Continue)
+    }
+
+    /// The provider refused the request the agent built, and kept refusing it
+    /// until the budget ran out. The request is the suspect, so the agent gets
+    /// to hear what the provider said and gets a turn to send a corrected one.
+    fn wake_after_rejection(&mut self, err: AgentError) -> Result<TurnOutcome, AgentError> {
+        if self.rejections >= MAX_REJECTION_WAKES {
+            error!(error = %err, model = %self.model.id, self.num_turns, "stream_message failed");
+            return Err(err);
+        }
+        self.rejections += 1;
+        warn!(session = ?self.session_id, model = %self.model.id, attempt = self.rejections, error = %err, "provider refused the request, waking the agent");
+        let text = rejection_note(&err);
+        self.history.push(Message::synthetic(text.clone()));
+        self.event_tx.send(AgentEvent::Notice { text })?;
         Ok(TurnOutcome::Continue)
     }
 
@@ -5866,5 +5903,85 @@ mod tests {
 
         assert_eq!(reason, DoneReason::EndTurn);
         assert_continued(&drain_events(&mut event_rx), &history, allowed);
+    }
+
+    /// Refuses the first requests and then answers, so the agent gets a turn
+    /// after the provider rejected what it sent.
+    struct RefusingProvider {
+        refusals: Mutex<u32>,
+        seen: Arc<Mutex<Vec<Vec<Value>>>>,
+    }
+
+    impl Provider for RefusingProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            messages: &'a [Message],
+            _: &'a str,
+            _: &'a Value,
+            _: &'a UnboundedSender<ProviderEvent>,
+            _: RequestOptions,
+            _: Option<&'a SessionRef>,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            Box::pin(async move {
+                self.seen.lock().unwrap().push(
+                    messages
+                        .iter()
+                        .map(|m| serde_json::to_value(m).unwrap())
+                        .collect(),
+                );
+                let mut refusals = self.refusals.lock().unwrap();
+                if *refusals > 0 {
+                    *refusals -= 1;
+                    return Err(AgentError::api(500, "the request was refused"));
+                }
+                Ok(text_response(StopReason::EndTurn))
+            })
+        }
+
+        fn list_models(&self) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, AgentError>> {
+            Box::pin(async { unimplemented!() })
+        }
+    }
+
+    /// A provider that keeps refusing the request is telling the agent that
+    /// what it sent is wrong, and the agent is the only one who can send
+    /// something else. So the refusal reaches it, with the provider's own
+    /// words, and it gets another turn.
+    #[tokio::test]
+    async fn a_refused_request_wakes_the_agent_with_the_error() {
+        let seen = Arc::default();
+        let provider = RefusingProvider {
+            refusals: Mutex::new(1),
+            seen: Arc::clone(&seen),
+        };
+        let mut history = History::new(Vec::new());
+        let (mut agent, mut event_rx) = make_agent(provider, &mut history);
+        agent.timeouts.retry = maki_providers::retry::RetryPolicy {
+            max_transient_retries: 0,
+            ..maki_providers::retry::RetryPolicy::default()
+        };
+
+        let reason = agent.run(default_input()).await.unwrap();
+        drop(agent);
+
+        assert_eq!(reason, DoneReason::EndTurn);
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "the agent was not woken up");
+        let second = seen[1]
+            .iter()
+            .map(|message| serde_json::to_string(message).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            second.contains("the request was refused"),
+            "the agent was not told what the provider said: {second}"
+        );
+        assert!(
+            drain_events(&mut event_rx)
+                .iter()
+                .any(|event| matches!(&event.event, AgentEvent::Notice { text } if text.contains("the request was refused"))),
+            "the user was not shown the refusal"
+        );
     }
 }

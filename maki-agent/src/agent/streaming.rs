@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
 use maki_providers::provider::Provider;
-use maki_providers::retry::{RetryPolicy, RetryState};
+use maki_providers::retry::{RetryKind, RetryPolicy, RetryState};
 use maki_providers::{
     ContentBlock, ContextGauge, Message, Model, Overflow, ProviderEvent, RequestOptions,
     StreamResponse, estimate_prompt_tokens,
@@ -84,7 +84,12 @@ async fn forward_provider_events(
 /// attempt's text (`stream_reset`), and history must agree with the view.
 #[derive(Debug)]
 pub(crate) enum StreamError {
-    Cancelled { streamed: String },
+    Cancelled {
+        streamed: String,
+    },
+    /// The provider refused the same request over and over, so the payload is
+    /// the suspect and the agent gets to hear what the provider said.
+    Rejected(AgentError),
     Other(AgentError),
 }
 
@@ -98,7 +103,7 @@ impl From<StreamError> for AgentError {
     fn from(e: StreamError) -> Self {
         match e {
             StreamError::Cancelled { .. } => Self::Cancelled,
-            StreamError::Other(e) => e,
+            StreamError::Rejected(e) | StreamError::Other(e) => e,
         }
     }
 }
@@ -276,7 +281,15 @@ pub(crate) async fn stream_with_retry(
                     (e.retry_message(), Duration::ZERO)
                 } else if let Some(kind) = e.retry_kind() {
                     let Some(delay) = retry.next_delay(kind, e.retry_after()) else {
-                        return Err(e.into());
+                        // A server error that outlived its budget is the one
+                        // failure the request itself may have caused, so it
+                        // goes to the agent as a rejection rather than as a
+                        // dead run.
+                        return Err(if kind == RetryKind::Transient {
+                            StreamError::Rejected(e)
+                        } else {
+                            StreamError::Other(e)
+                        });
                     };
                     (e.retry_message(), delay)
                 } else {
@@ -703,6 +716,86 @@ mod tests {
 
     const FIRST_ATTEMPT: u32 = 1;
     const NO_WAIT: u64 = 0;
+
+    /// A server that says the same thing about every request, which is what a
+    /// provider that refuses a payload does.
+    struct RefusingServer {
+        status: u16,
+        requests: Mutex<usize>,
+    }
+
+    impl Provider for RefusingServer {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            _: &'a [Message],
+            _: &'a str,
+            _: &'a Value,
+            _: &'a UnboundedSender<ProviderEvent>,
+            _: RequestOptions,
+            _: Option<&'a SessionRef>,
+        ) -> maki_providers::provider::BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            Box::pin(async move {
+                *self.requests.lock().unwrap() += 1;
+                Err(AgentError::api(self.status, "the request was refused"))
+            })
+        }
+
+        fn list_models(
+            &self,
+        ) -> maki_providers::provider::BoxFuture<
+            '_,
+            Result<Vec<maki_providers::ModelInfo>, AgentError>,
+        > {
+            Box::pin(async { unimplemented!() })
+        }
+    }
+
+    /// A server error that outlived its budget is the provider refusing the
+    /// request, and the caller is told so: the request is the agent's to fix.
+    #[tokio::test]
+    async fn a_server_error_that_outlives_its_budget_is_a_rejection() {
+        let server = RefusingServer {
+            status: 500,
+            requests: Mutex::default(),
+        };
+        let (result, events) = send(
+            &server,
+            &model_with(None),
+            None,
+            RetryPolicy {
+                max_transient_retries: 2,
+                ..RetryPolicy::default()
+            },
+        )
+        .await;
+
+        assert!(matches!(result, Err(StreamError::Rejected(_))));
+        assert_eq!(retries_of(&events).len(), 2);
+        assert_eq!(*server.requests.lock().unwrap(), 3);
+    }
+
+    /// A rate limit that outlives its budget is the account, not the request,
+    /// so it stays the plain failure it was.
+    #[tokio::test]
+    async fn a_rate_limit_that_outlives_its_budget_is_not_a_rejection() {
+        let server = RefusingServer {
+            status: 429,
+            requests: Mutex::default(),
+        };
+        let (result, _) = send(
+            &server,
+            &model_with(None),
+            None,
+            RetryPolicy {
+                max_retries: 1,
+                ..RetryPolicy::default()
+            },
+        )
+        .await;
+
+        assert!(matches!(result, Err(StreamError::Other(_))));
+    }
 
     /// A race wakes from whichever side gets there first, so racing the token
     /// against the request still sent it about half the time. `race` checks the
